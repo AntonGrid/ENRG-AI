@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+
+ENRG/
+enrg-landing/
+
+.vscode/
+.idea/
+
+.env
+
+*.log
+ENRG_AGENT.md
+ENRG_AGENT.md
