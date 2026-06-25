@@ -1,23 +1,54 @@
+from agent.config import PROJECTS
 from agent.index.search import search
+from agent.reader.files import read_file
+from agent.llm import ask
+
+
+print("=" * 60)
+print("ENRG AI")
+print("=" * 60)
+
 
 while True:
 
-    q = input("\nSearch: ")
+    command = input("\nENRG AI > ").strip()
 
-    if q == "exit":
+    if command in ("exit", "quit"):
         break
 
-    result = search(q)
+    if command.startswith("analyze "):
 
-    print()
+        query = command.replace("analyze ", "")
 
-    for item in result[:15]:
+        files = search(query)
 
-        print(
-            f"[{item['score']:3}] "
-            f"{item['project']:8} "
-            f"{item['path']}"
+        if not files:
+            print("Nothing found.")
+            continue
+
+        file = files[0]
+
+        text = read_file(
+            PROJECTS[file["project"]],
+            file["path"]
         )
 
-        if item["symbols"]:
-            print("     ", ", ".join(item["symbols"]))
+        prompt = f"""
+You are senior software architect.
+
+Analyze this file.
+
+File:
+{file["path"]}
+
+Code:
+
+{text[:12000]}
+"""
+
+        print("\nThinking...\n")
+
+        print(ask(prompt))
+
+    else:
+        print("Unknown command.")
