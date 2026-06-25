@@ -1,4 +1,5 @@
 from agent.index.builder import build_index
+from agent.index.rank import score
 from agent.config import PROJECTS
 
 INDEX = {}
@@ -8,46 +9,26 @@ for project, path in PROJECTS.items():
     INDEX[project] = build_index(path)
 
 
-def search(query: str):
+def search(query):
 
-    query = query.lower()
-
-    scored = []
+    result = []
 
     for project, files in INDEX.items():
 
         for file in files:
 
-            score = 0
+            s = score(file, query.lower())
 
-            # имя файла
-            if query in file["name"].lower():
-                score += 100
+            if s > 0:
 
-            # путь
-            if query in file["path"].lower():
-                score += 50
+                file["project"] = project
+                file["score"] = s
 
-            # функции / классы
-            for symbol in file["symbols"]:
-                if query == symbol.lower():
-                    score += 200
-                elif query in symbol.lower():
-                    score += 120
+                result.append(file)
 
-            # содержимое
-            if query in file["content"]:
-                score += 10
+    result.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
 
-            if score > 0:
-
-                scored.append({
-                    "project": project,
-                    "path": file["path"],
-                    "score": score,
-                    "symbols": file["symbols"]
-                })
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-
-    return scored
+    return result
