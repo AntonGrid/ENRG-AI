@@ -18,23 +18,23 @@ IGNORE = {
 }
 
 PATTERNS = [
-    r"fn\s+([a-zA-Z0-9_]+)",          # Rust
-    r"pub\s+fn\s+([a-zA-Z0-9_]+)",    # Rust pub
-    r"function\s+([a-zA-Z0-9_]+)",    # JS
-    r"const\s+([a-zA-Z0-9_]+)\s*=",   # JS const
-    r"class\s+([a-zA-Z0-9_]+)",       # Class
+    r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)",          # Python
+    r"class\s+([a-zA-Z_][a-zA-Z0-9_]*)",        # Python class
+    r"pub\s+fn\s+([a-zA-Z_][a-zA-Z0-9_]*)",     # Rust pub
+    r"fn\s+([a-zA-Z_][a-zA-Z0-9_]*)",           # Rust
+    r"function\s+([a-zA-Z_][a-zA-Z0-9_]*)",     # JS
+    r"const\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=",    # JS
 ]
 
 
 def extract_symbols(text):
 
-    symbols = []
+    symbols = set()
 
     for pattern in PATTERNS:
+        symbols.update(re.findall(pattern, text))
 
-        symbols += re.findall(pattern, text)
-
-    return list(set(symbols))
+    return sorted(symbols)
 
 
 def build_index(root):
@@ -59,7 +59,7 @@ def build_index(root):
                 encoding="utf-8",
                 errors="ignore"
             )
-        except:
+        except Exception:
             content = ""
 
         files.append({

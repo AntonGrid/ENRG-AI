@@ -11,20 +11,42 @@ for project, path in PROJECTS.items():
 
 def search(query):
 
+    query = query.lower().strip()
+
     result = []
 
     for project, files in INDEX.items():
 
         for file in files:
 
-            s = score(file, query.lower())
+            s = score(file, query)
 
-            if s > 0:
+            matched_symbol = None
 
-                file["project"] = project
-                file["score"] = s
+            symbols = file.get("symbols", [])
 
-                result.append(file)
+            for symbol in symbols:
+
+                symbol_lower = symbol.lower()
+
+                if query == symbol_lower:
+                    matched_symbol = symbol
+                    s += 10000
+                    break
+
+                if query in symbol_lower:
+                    matched_symbol = symbol
+                    s += 5000
+
+            if s <= 0:
+                continue
+
+            item = file.copy()
+            item["project"] = project
+            item["score"] = s
+            item["matched_symbol"] = matched_symbol
+
+            result.append(item)
 
     result.sort(
         key=lambda x: x["score"],

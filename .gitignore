@@ -1,15 +1,25 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
 
-ENRG/
-enrg-landing/
-
+# IDE
 .vscode/
 .idea/
 
+# Environment
 .env
 
+# Logs
 *.log
-ENRG_AGENT.md
-ENRG_AGENT.md
+
+# Runtime data
+knowledge.db
+memory/
+
+# Cache
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
