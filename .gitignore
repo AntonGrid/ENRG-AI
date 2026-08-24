@@ -20,6 +20,10 @@ memory/
 # Cache
 .pytest_cache/
 
+# Connected projects (symlinks to the workspace, see scripts/link_projects.sh)
+projects/*
+!projects/.gitkeep
+
 # OS
 .DS_Store
 Thumbs.db

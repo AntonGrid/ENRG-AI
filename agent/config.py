@@ -3,9 +3,9 @@ MODEL = "qwen2.5-coder:7b"
 
 PROJECTS = {
     "agent": "agent",
-    "protocol": "projects/ENRG",
-    "website": "projects/enrg-landing",
-    "web": "projects/web",
+    "enrg": "projects/ENRG",
+    "enrg-landing": "projects/enrg-landing",
+    "axis-core": "projects/Axis-core",
 }
 
 SYSTEM_PROMPT = """

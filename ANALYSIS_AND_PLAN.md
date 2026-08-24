@@ -148,12 +148,14 @@
 - [x] `axis_core/ai/` каркас в Axis Core: `SignalProvider` (нейтральная заглушка), `anomaly`/`forecast`/`market` плейсхолдеры + тесты (4 passed).
 - [ ] `projects/` — подключить ENRG, enrg-landing, Axis-core (заполнить `agent/config.py` PROJECTS).
 
-### Фаза 1 — Гибридный ИИ-оракул (недели 2–4)
-- `anomaly.py`: статистические + ML-сигналы по истории устройства (история из реестра).
-- `forecast.py`: прогноз выработки (персистентная модель + фиды погоды на будущее).
-- Политики: `enforce_ai_anomaly`, `ai_anomaly_threshold` в `axis_core.policy.config`.
-- Тесты: `test_anomaly.py`, `test_signal_provider.py`, mirror-тесты политик.
-- **Выход:** оракул помечает аномалии (влияют на ERS/quarantine через политику).
+### Фаза 1 — Гибридный ИИ-оракул (недели 2–4) — ✅ ВЫПОЛНЕНА
+- [x] `anomaly.py`: статистические сигналы по истории устройства (spike по энергии/мощности vs медиана, nonce-прыжки).
+- [x] `forecast.py`: прогноз выработки (линейная модель по истории, без внешних зависимостей).
+- [x] `SignalProvider` объединяет anomaly + forecast в один `Signal` (нет истории → neutral no-op).
+- [x] Политики: `enforce_ai_anomaly`, `ai_anomaly_threshold` в `axis_core.policy` (config/models/engine).
+- [x] Интеграция в оракул: `_ai_history` + opt-in гейт `ai_anomaly_flagged` (только при включённой политике).
+- [x] Тесты: `test_anomaly.py`, `test_forecast.py`, `test_signal_provider.py`, `test_oracle_ai.py` (E2E через API), mirror-тесты политик — Axis Core: 120 passed.
+- **Выход:** оракул помечает/отклоняет аномалии через политику, поведение по умолчанию не меняется.
 
 ### Фаза 2 — Федеративное обучение (недели 5–8)
 - `fed/protocol.py`: формат подписанного обновления весов (Ed25519).

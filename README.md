@@ -40,11 +40,19 @@ python -m agent.main
 pytest
 ```
 
-## Roadmap (Phase 0 — foundation)
+## Roadmap (Phase 0–1)
 
+### Phase 0 — foundation ✅
 - [x] Packaging: `pyproject.toml`, `requirements.txt`
 - [x] Tests migrated to pytest (`tests/`)
-- [ ] `axis_core/ai/` scaffold — `SignalProvider` neutral stub (in Axis Core)
-- [ ] `projects/` — wire ENRG, enrg-landing, Axis-core
+- [x] `axis_core/ai/` scaffold — `SignalProvider` neutral stub (in Axis Core)
+- [x] `projects/` — wired ENRG, enrg-landing, Axis-core (symlinks, see `scripts/link_projects.sh`)
 
-See `ANALYSIS_AND_PLAN.md` for the full plan (phases 0–3).
+### Phase 1 — hybrid AI oracle ✅ (in Axis Core)
+- [x] Anomaly detection over device history (energy/power spikes, nonce jumps)
+- [x] Production forecast (dependency-free linear model)
+- [x] Policy gate `enforce_ai_anomaly` / `ai_anomaly_threshold` (opt-in)
+- [x] Oracle integration — `ai_anomaly_flagged` reason, default behavior unchanged
+
+See `ANALYSIS_AND_PLAN.md` for the full plan (phases 2–3).
+
