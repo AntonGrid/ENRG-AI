@@ -1,9 +1,14 @@
 import sqlite3
 
 
-def connect():
+def connect(path: str = "knowledge.db"):
+    """Open (or create) the knowledge SQLite database.
 
-    db = sqlite3.connect("knowledge.db")
+    ``path`` is overridable so tests can use a temporary file instead of
+    polluting the repository root with ``knowledge.db``.
+    """
+
+    db = sqlite3.connect(path)
 
     db.execute("""
     CREATE TABLE IF NOT EXISTS files (

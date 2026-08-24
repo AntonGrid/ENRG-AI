@@ -142,9 +142,11 @@
 
 ## 5. Дорожная карта
 
-### Фаза 0 — Фундамент (неделя 1)
-- Упаковать ENRG-AI (pyproject/requirements), перевести тесты в pytest, подключить `projects/`.
-- Создать `axis_core/ai/` каркас: `SignalProvider` с «заглушкой» (всегда neutral) — интеграция в оракул без изменения поведения.
+### Фаза 0 — Фундамент (неделя 1) — ✅ ВЫПОЛНЕНА
+- [x] Упаковать ENRG-AI: `pyproject.toml`, `requirements.txt`, `README.md`, `main` entry guard.
+- [x] Тесты переведены в pytest (`tests/`) — 21 passed; `db.connect`/`indexer.rebuild` параметризованы (путь БД).
+- [x] `axis_core/ai/` каркас в Axis Core: `SignalProvider` (нейтральная заглушка), `anomaly`/`forecast`/`market` плейсхолдеры + тесты (4 passed).
+- [ ] `projects/` — подключить ENRG, enrg-landing, Axis-core (заполнить `agent/config.py` PROJECTS).
 
 ### Фаза 1 — Гибридный ИИ-оракул (недели 2–4)
 - `anomaly.py`: статистические + ML-сигналы по истории устройства (история из реестра).

@@ -1,0 +1,8 @@
+# ENRG-AI — intelligence layer of the AXIS ecosystem
+# (hybrid AI oracle, federated learning, market signals)
+ollama
+numpy>=1.24
+httpx>=0.24
+
+# dev / tests
+pytest>=7.0

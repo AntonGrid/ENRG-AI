@@ -1,3 +1,9 @@
 from agent.cli.shell import run
 
-run()
+
+def main():
+    run()
+
+
+if __name__ == "__main__":
+    main()

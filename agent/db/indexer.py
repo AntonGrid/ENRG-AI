@@ -3,15 +3,23 @@ from agent.knowledge.build import build
 from agent.config import PROJECTS
 
 
-def rebuild():
+def rebuild(paths: dict = None, db_path: str = "knowledge.db"):
+    """Rebuild the knowledge base from ``paths`` (default: config.PROJECTS).
 
-    db = connect()
+    ``paths`` and ``db_path`` are overridable so tests can run against a
+    temporary database and a temporary set of projects.
+    """
+
+    if paths is None:
+        paths = PROJECTS
+
+    db = connect(db_path)
 
     db.execute("DELETE FROM files")
     db.execute("DELETE FROM symbols")
     db.execute("DELETE FROM imports")
 
-    for project, root in PROJECTS.items():
+    for project, root in paths.items():
 
         nodes = build(project, root)
 
