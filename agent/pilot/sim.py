@@ -52,6 +52,8 @@ class PilotConfig:
     price_base: float = 0.10  # USD/kWh
     price_amplitude: float = 0.05  # daily cycle amplitude
     retrain_every: int = 24  # hours between forecast-model retrains
+    #: Overrides for ``axis_core.ai.recommend`` (used by A/B experiments).
+    recommend_params: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -176,6 +178,7 @@ def _run_strategy(config: PilotConfig, use_ai: bool) -> PilotResult:
                     price_now=price_now,
                     price_forecast=price_next,
                     avg_price=avg_price,
+                    **config.recommend_params,
                 )
                 decision = PolicyEngine.evaluate_trade(
                     policy=None,

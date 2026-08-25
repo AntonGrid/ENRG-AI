@@ -28,6 +28,8 @@ agent/
 ├── digital_train/     # domain-agnostic self-training (trends/anomalies/links)
 ├── market/            # normalized price feeds (USD/kWh) + price×time model
 ├── pilot/             # closed-loop DePIN simulation (device→model→action→reward)
+├── multidomain/       # shared backbone + per-domain heads (transfer learning)
+├── evolution/         # DAO-driven self-evolution (propose→vote→A/B→canonicalize)
 └── llm.py             # Ollama client (qwen2.5-coder:7b)
 tests/                 # pytest suite
 ```
@@ -108,5 +110,16 @@ pytest
 - [x] `python -m agent.pilot.sim` — 50 devices × 168 h demo
 - [x] Tests: ENRG-AI **91 passed**, Axis Core **144 passed**
 
-See `ANALYSIS_AND_PLAN.md` for the remaining plan (multi-domain, DAO evolution).
+### Phase 3 — multi-domain + DAO evolution (step D) ✅
+- [x] `agent/multidomain/` — `MultiDomainModel`: shared temporal backbone +
+      per-domain heads; transfer learning (new domain fits only its head,
+      few-shot) and failure isolation
+- [x] `agent/evolution/` — staked DAO voting (quorum/majority, append-only
+      ledger) → A/B arena on the pilot → canonicalize / roll back
+- [x] Demo: `python -m agent.evolution.loop` — the system improved itself
+      (canonicalized `min_sell_storage_ratio 0.1`, +2.2%) and rejected a bad
+      experiment (aggressive premium, rolled back)
+- [x] Tests: ENRG-AI **104 passed**
+
+See `GLOBAL_AI_ARCHITECTURE.md` for the full vision.
 
