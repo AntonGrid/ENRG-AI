@@ -26,6 +26,7 @@ agent/
 ├── hfl/               # hierarchical FL: regions → global (axis-fed/2)
 ├── digital_feeds/     # universal open-world data feeds
 ├── digital_train/     # domain-agnostic self-training (trends/anomalies/links)
+├── market/            # normalized price feeds (USD/kWh) + price×time model
 └── llm.py             # Ollama client (qwen2.5-coder:7b)
 tests/                 # pytest suite
 ```
@@ -89,5 +90,13 @@ pytest
 - [x] `agent/hfl/simulate.py` — gateways → regions → world demo (`python -m agent.hfl.simulate`)
 - [x] Tests: `tests/test_hfl.py` — ENRG-AI: 78 passed
 
-See `ANALYSIS_AND_PLAN.md` for the full plan (phase 3).
+### Phase 3 — market & action (step B) ✅
+- [x] `agent/market/feeds.py` — normalized USD/kWh feeds (dayahead/p2p/spot/macro) + TTL cache + offline generators
+- [x] `agent/market/model.py` — price×time matrix
+- [x] `axis_core/ai/recommender.py` — SELL/STORE/BUY/HOLD ranking (confidence + rationale)
+- [x] `PolicyEngine.evaluate_trade` — trade right / volume limits / DAO gate (Axis Core)
+- [x] `POST /market/recommend` — end-to-end API (Axis Core)
+- [x] Tests: ENRG-AI **84 passed**, Axis Core **141 passed**
+
+See `ANALYSIS_AND_PLAN.md` for the remaining plan (pilot, multi-domain, DAO evolution).
 

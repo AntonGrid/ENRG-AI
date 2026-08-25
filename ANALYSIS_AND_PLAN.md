@@ -135,7 +135,7 @@
 | `agent/oracle/` | `signal_provider.py`, `anomaly.py`, `forecast.py` |
 | `agent/fed/` | федеративное обучение (local_train, aggregate, protocol) |
 | `agent/hfl/` | иерархическое FL: `RegionAggregator` (verify+MAD+репутация→подписанный региональный вклад `axis-fed/2`), `GlobalAggregator` (регионы→глобальная модель), `weights` (ERS-множители), `simulate` (шлюзы→регионы→мир) |
-| `agent/market/` | рыночные фиды |
+| `agent/market/` | рыночные фиды: нормализованные цены USD/kWh (dayahead/p2p/spot/macro), TTL-кэш, offline-генераторы; `model.py` — «цена×время» матрица |
 | `agent/core/ai_oracle.py` | фасад «гибридного ИИ-оракула» |
 | `agent/digital_feeds/` | универсальные цифровые фиды: погода, финансы, макро, новости (RSS), блокчейн (Solana RPC), наука (World Bank) — каждый с offline-генератором |
 | `agent/digital_train/` | домен-агностичное самообучение: тренды + аномалии (MAD) + кросс-доменные связи (корреляции по приращениям); веса → подписанный fed-вклад; фоновый цикл `--loop` |
