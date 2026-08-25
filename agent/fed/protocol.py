@@ -80,6 +80,12 @@ def generate_keypair() -> tuple:
     )
 
 
+def public_key_from_secret(secret_key_b64: str) -> str:
+    """Derive the Base64 public key from a Base64 secret seed."""
+    secret = nacl.signing.SigningKey(base64.b64decode(secret_key_b64))
+    return base64.b64encode(bytes(secret.verify_key)).decode("ascii")
+
+
 def sign_contribution(
     secret_key_b64: str,
     contribution: Dict[str, Any],

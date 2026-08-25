@@ -22,9 +22,28 @@ agent/
 ├── context/           # building LLM context from search results
 ├── db/                # SQLite knowledge base (files / symbols / imports)
 ├── reader/            # raw file reading
+├── fed/               # federated learning (signed contributions, FedAvg)
+├── digital_feeds/     # universal open-world data feeds
+├── digital_train/     # domain-agnostic self-training (trends/anomalies/links)
 └── llm.py             # Ollama client (qwen2.5-coder:7b)
 tests/                 # pytest suite
 ```
+
+## Digital self-training (background)
+
+The digital layer learns on open-world signals — weather, finance, macro,
+news, blockchain, science — with no domain hardcoding:
+
+```bash
+# one training cycle on deterministic series (no network)
+python -m agent.digital_train.pipeline --once --offline --points 48
+
+# background loop (online: real APIs/RSS/RPC, history accumulates in state)
+python -m agent.digital_train.pipeline --loop --interval 3600 --state digital_state.json
+```
+
+The trained weights are shaped as a signed federated contribution
+(`agent.fed`), ready to join the global model.
 
 ## Install & run
 
