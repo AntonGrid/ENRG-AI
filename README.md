@@ -54,5 +54,12 @@ pytest
 - [x] Policy gate `enforce_ai_anomaly` / `ai_anomaly_threshold` (opt-in)
 - [x] Oracle integration — `ai_anomaly_flagged` reason, default behavior unchanged
 
-See `ANALYSIS_AND_PLAN.md` for the full plan (phases 2–3).
+### Phase 2 — federated learning ✅
+- [x] `agent/fed/protocol.py` — Ed25519-signed contribution format (canonical JSON)
+- [x] `agent/fed/local_train.py` — light model trained on the gateway
+- [x] `agent/fed/aggregate.py` — FedAvg + signature verification + MAD outlier removal
+- [x] `agent/fed/simulate.py` — N-gateway demo (`python -m agent.fed.simulate`)
+- [x] Tests: `tests/test_fed_*.py` — ENRG-AI: 45 passed
+
+See `ANALYSIS_AND_PLAN.md` for the full plan (phase 3).
 
