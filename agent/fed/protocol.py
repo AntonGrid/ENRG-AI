@@ -29,6 +29,9 @@ import nacl.signing
 SCHEMA = "axis-fed/1"
 
 #: Contribution fields covered by the device signature (canonical order).
+#: ``axis-fed/2`` fields (level/domain/region/version/quality) are included
+#: from the start: absent fields are simply not part of the signed message,
+#: so v1 contributions stay byte-compatible.
 SIGNED_FIELDS = (
     "schema",
     "round",
@@ -37,6 +40,11 @@ SIGNED_FIELDS = (
     "samples",
     "loss",
     "nonce",
+    "level",
+    "domain",
+    "region",
+    "version",
+    "quality",
 )
 
 

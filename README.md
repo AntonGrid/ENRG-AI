@@ -23,6 +23,7 @@ agent/
 ├── db/                # SQLite knowledge base (files / symbols / imports)
 ├── reader/            # raw file reading
 ├── fed/               # federated learning (signed contributions, FedAvg)
+├── hfl/               # hierarchical FL: regions → global (axis-fed/2)
 ├── digital_feeds/     # universal open-world data feeds
 ├── digital_train/     # domain-agnostic self-training (trends/anomalies/links)
 └── llm.py             # Ollama client (qwen2.5-coder:7b)
@@ -79,6 +80,14 @@ pytest
 - [x] `agent/fed/aggregate.py` — FedAvg + signature verification + MAD outlier removal
 - [x] `agent/fed/simulate.py` — N-gateway demo (`python -m agent.fed.simulate`)
 - [x] Tests: `tests/test_fed_*.py` — ENRG-AI: 45 passed
+
+### Phase 2.5 — hierarchical FL (HFL) ✅
+- [x] `agent/hfl/protocol.py` — `axis-fed/2` (level/domain/region/version/quality signed)
+- [x] `agent/hfl/region.py` — `RegionAggregator`: verify + MAD + reputation-weighted FedAvg → signed regional contribution
+- [x] `agent/hfl/global_aggregator.py` — `GlobalAggregator`: regions → read-only global model
+- [x] `agent/hfl/weights.py` — ERS reputation multipliers (floor for new devices)
+- [x] `agent/hfl/simulate.py` — gateways → regions → world demo (`python -m agent.hfl.simulate`)
+- [x] Tests: `tests/test_hfl.py` — ENRG-AI: 78 passed
 
 See `ANALYSIS_AND_PLAN.md` for the full plan (phase 3).
 

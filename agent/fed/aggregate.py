@@ -70,6 +70,7 @@ def fed_avg(
     verify: bool = True,
     min_samples: int = 1,
     z_threshold: float = 3.0,
+    extra_weight: Optional[Dict[str, float]] = None,
 ) -> FedResult:
     """Aggregate signed contributions into a global model (FedAvg).
 
@@ -78,7 +79,12 @@ def fed_avg(
             ``public_key`` when ``verify`` is enabled).
         verify: require a valid Ed25519 signature per contribution.
         min_samples: drop contributions trained on fewer local samples.
-        z_threshold: outlier cutoff in standard deviations (loss & weights).
+        z_threshold: outlier cutoff (MAD-based) for loss & weights.
+        extra_weight: optional ``{device_id: multiplier}`` reputation map.
+            The effective sample weight of a contribution becomes
+            ``samples * extra_weight[device_id]`` (default multiplier 1.0),
+            letting reputation (ERS) shape aggregation without changing the
+            wire format.
 
     Returns:
         ``FedResult`` with the global ``weights`` (empty when nothing was
@@ -86,6 +92,12 @@ def fed_avg(
     """
     if not contributions:
         return FedResult(round=None, weights=[], loss=None, n_contributions=0)
+
+    def _sample_weight(contribution: Dict[str, Any]) -> float:
+        base = float(contribution.get("samples", 0))
+        if not extra_weight:
+            return base
+        return base * extra_weight.get(contribution.get("device_id"), 1.0)
 
     accepted: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
@@ -129,15 +141,15 @@ def fed_avg(
         rnd = contributions[0].get("round")
         return FedResult(round=rnd, weights=[], loss=None, n_contributions=len(contributions), rejected=rejected)
 
-    # 3. Sample-weighted average (FedAvg).
+    # 3. Sample-weighted average (FedAvg), with reputation multipliers.
     dim = _weights_dim(accepted)
-    total_samples = sum(c["samples"] for c in accepted)
+    total_samples = sum(_sample_weight(c) for c in accepted)
     weights: List[float] = []
     for j in range(dim):
-        weighted = sum(c["weights"][j] * c["samples"] for c in accepted)
+        weighted = sum(c["weights"][j] * _sample_weight(c) for c in accepted)
         weights.append(round(weighted / total_samples, 6))
 
-    global_loss = sum(c["loss"] * c["samples"] for c in accepted) / total_samples
+    global_loss = sum(c["loss"] * _sample_weight(c) for c in accepted) / total_samples
 
     return FedResult(
         round=accepted[0].get("round"),

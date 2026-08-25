@@ -134,6 +134,7 @@
 | тесты | перевести `test_*.py` в pytest (`tests/`) |
 | `agent/oracle/` | `signal_provider.py`, `anomaly.py`, `forecast.py` |
 | `agent/fed/` | федеративное обучение (local_train, aggregate, protocol) |
+| `agent/hfl/` | иерархическое FL: `RegionAggregator` (verify+MAD+репутация→подписанный региональный вклад `axis-fed/2`), `GlobalAggregator` (регионы→глобальная модель), `weights` (ERS-множители), `simulate` (шлюзы→регионы→мир) |
 | `agent/market/` | рыночные фиды |
 | `agent/core/ai_oracle.py` | фасад «гибридного ИИ-оракула» |
 | `agent/digital_feeds/` | универсальные цифровые фиды: погода, финансы, макро, новости (RSS), блокчейн (Solana RPC), наука (World Bank) — каждый с offline-генератором |
