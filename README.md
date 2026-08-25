@@ -27,6 +27,7 @@ agent/
 ├── digital_feeds/     # universal open-world data feeds
 ├── digital_train/     # domain-agnostic self-training (trends/anomalies/links)
 ├── market/            # normalized price feeds (USD/kWh) + price×time model
+├── pilot/             # closed-loop DePIN simulation (device→model→action→reward)
 └── llm.py             # Ollama client (qwen2.5-coder:7b)
 tests/                 # pytest suite
 ```
@@ -98,5 +99,14 @@ pytest
 - [x] `POST /market/recommend` — end-to-end API (Axis Core)
 - [x] Tests: ENRG-AI **84 passed**, Axis Core **141 passed**
 
-See `ANALYSIS_AND_PLAN.md` for the remaining plan (pilot, multi-domain, DAO evolution).
+### Phase 3 — closed-loop pilot (step C) ✅
+- [x] `agent/pilot/sim.py` — full loop: device (solar + storage) → seasonal forecast
+      (retrained in-loop) → market price → Recommender → `evaluate_trade` →
+      action → USD reward → ERS/forecast feedback
+- [x] Recommender learned to sell stored energy above the average price
+      (premium SELL rule, Axis Core)
+- [x] `python -m agent.pilot.sim` — 50 devices × 168 h demo
+- [x] Tests: ENRG-AI **91 passed**, Axis Core **144 passed**
+
+See `ANALYSIS_AND_PLAN.md` for the remaining plan (multi-domain, DAO evolution).
 
