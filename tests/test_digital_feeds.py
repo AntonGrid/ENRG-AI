@@ -9,7 +9,7 @@ from agent.digital_feeds import (
 )
 
 
-def test_registry_covers_six_domains():
+def test_registry_covers_seven_domains():
     assert set(FEED_SOURCES) == {
         "weather",
         "finance",
@@ -17,9 +17,10 @@ def test_registry_covers_six_domains():
         "news",
         "blockchain",
         "science",
+        "pilot",
     }
     assert set(OFFLINE_SOURCES) == set(FEED_SOURCES)
-    assert len(DEFAULT_FEEDS) == 6
+    assert len(DEFAULT_FEEDS) == 7
 
 
 def test_collect_offline_returns_all_domains():
@@ -56,12 +57,13 @@ def test_news_offline_has_event_metrics():
 
 def test_collect_series_offline_builds_chronological_series():
     series = collect_series(points=24, offline=True)
-    assert len(series) == 24 * 6
+    assert len(series) == 24 * len(FEED_SOURCES)
     from collections import Counter
 
     per_domain = Counter(s.domain for s in series)
     assert per_domain["weather"] == 24
     assert per_domain["finance"] == 24
+    assert per_domain["pilot"] == 24
 
     timestamps = sorted(s.ts for s in series)
     assert timestamps == [s.ts for s in series] or True  # sorted by construction
@@ -77,3 +79,46 @@ def test_collect_unknown_feed_is_skipped():
     results = collect(feeds=["weather", "nonexistent"], offline=True)
     assert len(results) == 1
     assert results[0].domain == "weather"
+
+
+def test_pilot_offline_has_proof_metrics():
+    results = collect(feeds=["pilot"], offline=True)
+    assert len(results) == 1
+    assert results[0].domain == "pilot"
+    m = results[0].metrics
+    assert "energy_wh" in m and "nonce" in m and "hour_of_day" in m
+    assert m["avg_interval_sec"] == 60.0
+
+
+def test_pilot_decode_mint_report():
+    from agent.digital_feeds.pilot import _b58encode, decode_mint_report
+
+    raw = bytearray(232)
+    raw[8:40] = bytes(32)  # oracle placeholder
+    raw[40:72] = bytes.fromhex(
+        "cbec5afc382549012faf845ab25f593fe8f119d2ceb93f34ed308c283521584a"
+    )
+    raw[72:80] = (42).to_bytes(8, "little")
+    raw[80:88] = (1700000000).to_bytes(8, "little", signed=True)
+    raw[88:96] = (1700000060).to_bytes(8, "little", signed=True)
+    raw[96:104] = (1).to_bytes(8, "little")
+    rep = decode_mint_report(_b58encode(bytes(raw)))
+    assert rep is not None
+    assert rep["device_id"] == "cbec5afc382549012faf845ab25f593fe8f119d2ceb93f34ed308c283521584a"
+    assert rep["nonce"] == 42
+    assert rep["energy_wh"] == 1
+    assert rep["timestamp"] == 1700000000
+
+
+def test_pilot_assess_constant_energy_flags():
+    from agent.digital_feeds.pilot import assess
+
+    base = 1700000000
+    hist = [
+        {"timestamp": base + i * 60, "energy_wh": 1}
+        for i in range(10)
+    ]
+    res = assess(hist)
+    assert "constant_energy" in res["flags"]
+    assert 0.0 <= res["score"] <= 1.0
+

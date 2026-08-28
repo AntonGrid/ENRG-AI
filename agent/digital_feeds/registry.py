@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from agent.digital_feeds import blockchain, finance, macro, news, science, weather
+from agent.digital_feeds import blockchain, finance, macro, news, pilot, science, weather
 
 #: Online fetchers (real public APIs/RPC/RSS).
 FEED_SOURCES = {
@@ -25,6 +25,7 @@ FEED_SOURCES = {
     "news": news.fetch,
     "blockchain": blockchain.fetch,
     "science": science.fetch,
+    "pilot": pilot.fetch,
 }
 
 #: Offline generators (deterministic synthetic series for tests/training).
@@ -35,6 +36,7 @@ OFFLINE_SOURCES = {
     "news": news.fetch_offline,
     "blockchain": blockchain.fetch_offline,
     "science": science.fetch_offline,
+    "pilot": pilot.fetch_offline,
 }
 
 DEFAULT_FEEDS = list(FEED_SOURCES)
