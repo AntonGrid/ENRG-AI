@@ -1,0 +1,147 @@
+"""CLI — live energy forecast from the oracle proof stream.
+
+Usage:
+    python -m agent.forecast                          # live oracle, 15-min buckets, 8 steps
+    python -m agent.forecast --bucket-minutes 10 --horizon 12
+    python -m agent.forecast --source offline --horizon 6 --output /tmp/forecast.json
+    python -m agent.forecast --csv out.csv            # same CSV contract as the TimesFM skill
+
+The ``offline`` source is a deterministic daily-cycle generator used for
+tests and for running without network access.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import sys
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from agent.forecast.energy import (
+    Proof,
+    ProofSeries,
+    aggregate_proofs,
+    fetch_oracle_proofs,
+)
+from agent.forecast.model import ForecastResult, forecast_energy
+
+
+def offline_series(
+    bucket_minutes: int = 15,
+    n_buckets: int = 24,
+    seed: int = 7,
+) -> ProofSeries:
+    """Deterministic solar-ish daily cycle (Wh per bucket) for tests/demos."""
+    rng = np.random.default_rng(seed)
+    now = dt.datetime.now(dt.timezone.utc)
+    step_sec = bucket_minutes * 60
+    # Align the end of the series to the current bucket boundary.
+    end_idx = int(now.timestamp()) // step_sec
+    starts: List[dt.datetime] = []
+    values: List[float] = []
+    for i in range(n_buckets):
+        bucket_idx = end_idx - (n_buckets - 1 - i)
+        t = bucket_idx * step_sec
+        dt_local = dt.datetime.fromtimestamp(t, dt.timezone.utc)
+        hour = dt_local.hour + dt_local.minute / 60.0
+        daylight = max(0.0, np.sin(np.pi * (hour - 6.0) / 12.0))  # 06:00–18:00
+        base = 6.0 * daylight * (bucket_minutes / 15.0)  # ~24 Wh per 15m at noon
+        noise = rng.normal(0.0, max(0.3, 0.1 * base))
+        starts.append(dt.datetime.fromtimestamp(t, dt.timezone.utc))
+        values.append(max(0.0, base + noise))
+    return ProofSeries(
+        bucket_minutes=int(bucket_minutes),
+        starts=starts,
+        values=np.array(values, dtype=float),
+        device_id="offline-sim",
+        source="offline",
+        raw_proof_count=len(values),
+    )
+
+
+def build_series(
+    bucket_minutes: int,
+    source: str,
+    limit: int,
+) -> ProofSeries:
+    if source == "offline":
+        return offline_series(bucket_minutes=bucket_minutes, n_buckets=24)
+    proofs: List[Proof] = fetch_oracle_proofs(limit=limit)
+    if not proofs:
+        raise RuntimeError("oracle returned no proofs")
+    return aggregate_proofs(proofs, bucket_minutes=bucket_minutes)
+
+
+def print_table(series: ProofSeries, forecast: ForecastResult) -> None:
+    print(f"source            : {forecast.source}")
+    print(f"bucket            : {forecast.bucket_minutes} min")
+    print(f"observed buckets  : {len(series.values)} ({len(series.values) * series.bucket_minutes} min)")
+    print(f"total observed    : {series.total_wh:.1f} Wh")
+    m = forecast.meta
+    print(
+        f"model             : {m['model']} (alpha={m['alpha']}, beta={m['beta']}, "
+        f"rmse={m['residual_rmse_wh']} Wh)"
+    )
+    print(f"interval          : {m['interval']} (q10–q90)")
+    print(f"forecast horizon  : {len(forecast.point_wh)} x {forecast.bucket_minutes} min")
+    print()
+    header = f"{'bucket start (UTC)':<20} {'Wh':>7} {'point':>8} {'q10':>8} {'q90':>8}"
+    print(header)
+    print("-" * len(header))
+    # Observed tail (last 3 buckets) for context.
+    for label, value in zip(series.labels[-3:], series.values[-3:]):
+        print(f"{label:<20} {value:>7.1f} {'—':>8} {'—':>8} {'—':>8}")
+    print(f"{'— forecast —':<20} {'':>7} {'':>8} {'':>8} {'':>8}")
+    for label, point, lo, hi in zip(
+        forecast.labels, forecast.point_wh, forecast.low_wh, forecast.high_wh
+    ):
+        print(f"{label:<20} {'':>7} {point:>8.1f} {lo:>8.1f} {hi:>8.1f}")
+
+
+def write_csv(forecast: ForecastResult, path: str) -> None:
+    """Write the forecast in the same CSV contract as the TimesFM skill."""
+    import csv
+
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["time", "forecast_wh", "q10_wh", "q90_wh"])
+        for label, point, lo, hi in zip(
+            forecast.labels, forecast.point_wh, forecast.low_wh, forecast.high_wh
+        ):
+            writer.writerow([label, f"{point:.3f}", f"{lo:.3f}", f"{hi:.3f}"])
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bucket-minutes", type=int, default=15)
+    parser.add_argument("--horizon", type=int, default=8)
+    parser.add_argument("--interval", choices=["p80", "p95"], default="p80")
+    parser.add_argument("--source", choices=["oracle", "offline"], default="oracle")
+    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--output", type=str, default=None, help="JSON file")
+    parser.add_argument("--csv", type=str, default=None, help="CSV file (TimesFM contract)")
+    args = parser.parse_args(argv)
+
+    try:
+        series = build_series(args.bucket_minutes, args.source, args.limit)
+    except Exception as exc:  # noqa: BLE001 — CLI boundary
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    result = forecast_energy(series, horizon_steps=args.horizon, interval=args.interval)
+    print_table(series, result)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(result.to_dict(), fh, ensure_ascii=False, indent=2)
+        print(f"\nwrote JSON → {args.output}")
+    if args.csv:
+        write_csv(result, args.csv)
+        print(f"wrote CSV  → {args.csv}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

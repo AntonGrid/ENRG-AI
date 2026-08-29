@@ -34,6 +34,22 @@ agent/
 tests/                 # pytest suite
 ```
 
+## Energy generation forecasting
+
+Live forecast from the real oracle proof stream (Wh per bucket, Holt linear
+trend with horizon-widening prediction intervals, numpy only):
+
+```bash
+python -m agent.forecast                        # live oracle, 15-min buckets, 8 steps
+python -m agent.forecast --bucket-minutes 10 --horizon 12
+python -m agent.forecast --source offline --horizon 6 --output forecast.json
+python -m agent.forecast --csv out.csv          # same CSV contract as the TimesFM skill
+```
+
+The CLI writes JSON + CSV; the CSV follows the `timesfm-forecasting` skill
+contract (`../../skills/`), so the engine can be swapped to TimesFM / aeon on
+a beefier machine without changing callers. Unit tests: `tests/test_forecast.py`.
+
 ## Digital self-training (background)
 
 The digital layer learns on open-world signals — weather, finance, macro,
