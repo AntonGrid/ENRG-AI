@@ -376,6 +376,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--anomaly-z", type=float, default=ANOMALY_Z)
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--output", type=str, default=None, help="JSON file")
+    parser.add_argument(
+        "--sign",
+        action="store_true",
+        help="Ed25519-sign the bundle with AXIS_AI_SIGNING_KEY (base64 secret)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -391,11 +396,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if args.sign:
+        import os
+
+        from agent.fed.protocol import public_key_from_secret
+
+        secret = os.environ.get("AXIS_AI_SIGNING_KEY", "")
+        if not secret:
+            print(
+                "error: --sign requires AXIS_AI_SIGNING_KEY (base64 Ed25519 seed) in env",
+                file=sys.stderr,
+            )
+            return 2
+        payload = sign_bundle(bundle, secret)
+        payload["public_key"] = public_key_from_secret(secret)
+    else:
+        payload = bundle.to_dict()
+
     print_bundle(bundle)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
-            json.dump(bundle.to_dict(), fh, ensure_ascii=False, indent=2)
-        print(f"\nwrote JSON → {args.output}")
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        print(
+            f"\nwrote {'signed ' if args.sign else ''}JSON → {args.output}"
+        )
     return 0
 
 

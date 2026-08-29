@@ -144,3 +144,49 @@ def test_online_fallback_when_oracle_unreachable(monkeypatch):
     assert bundle.meta["source"] == "offline-fallback"
     assert bundle.meta["requested_source"] == "online"
     assert len(bundle.by_kind("generation_forecast")) == 3
+
+
+def test_cli_sign_requires_key():
+    from agent.signals import main
+
+    assert main(["--source", "offline", "--sign"]) == 2
+
+
+def test_cli_sign_produces_verifiable_attestation(monkeypatch, tmp_path):
+    import agent.fed.protocol as proto
+    from agent.signals import main, verify_bundle_signature
+
+    secret, pub = proto.generate_keypair()
+    monkeypatch.setenv("AXIS_AI_SIGNING_KEY", secret)
+    out = tmp_path / "assessments.json"
+    rc = main(
+        [
+            "--source",
+            "offline",
+            "--horizon",
+            "3",
+            "--sign",
+            "--output",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    assert payload["public_key"] == pub
+    assert payload["signature"]
+    assert verify_bundle_signature(payload["public_key"], payload)
+
+
+def test_publish_script_roundtrip(monkeypatch, tmp_path):
+    import agent.fed.protocol as proto
+    from agent.signals import verify_bundle_signature
+    from scripts.publish_signals import main as publish_main
+
+    secret, pub = proto.generate_keypair()
+    monkeypatch.setenv("AXIS_AI_SIGNING_KEY", secret)
+    out = tmp_path / "ai" / "assessments.json"
+    rc = publish_main(["--source", "offline", "--horizon", "3", "--output", str(out)])
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    assert payload["public_key"] == pub
+    assert verify_bundle_signature(pub, payload)
