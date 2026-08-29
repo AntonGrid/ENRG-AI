@@ -52,6 +52,23 @@ agent/
 tests/                 # pytest suite
 ```
 
+## Proof-of-Intelligence (ERS economy & leaderboard)
+
+PoI is the second earning channel of the ecosystem: reputation (ERS) and
+influence for **quality federated contributions**, screened by MAD and weighted
+by ERS (constitution C-6 — *quality has a price*).
+
+```bash
+python -m agent.leaderboard --rounds 5 --gateways 5   # ERS loop simulation
+```
+
+- `agent/fed/ers.py` — ERS update after each round: accepted gain, rejected
+  outliers decay to a floor; ERS feeds back as the next round's sample weight.
+- `agent/fed/digest.py` — contribution SHA-256 digest (base58) + signed
+  `axis-fed-commit/1` commitment contract; the on-chain write stays
+  oracle-only (ADR-0010).
+- Tests: `tests/test_ers.py`, `tests/test_leaderboard.py`.
+
 ## Hybrid AI oracle (signals)
 
 The AI oracle is a **source of signals, not decisions** (ADR-0003 / C-1). One
