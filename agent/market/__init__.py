@@ -10,7 +10,12 @@ belongs to the Policy Engine with limits and DAO gates.
 """
 
 from agent.market.feeds import PROVIDERS, UNITS, MarketCache, PriceFeed, fetch_prices
-from agent.market.model import PricePoint, forecast_price_series, price_matrix
+from agent.market.model import (
+    PricePoint,
+    forecast_price_series,
+    forecast_price_with_intervals,
+    price_matrix,
+)
 
 __all__ = [
     "PROVIDERS",
@@ -20,5 +25,6 @@ __all__ = [
     "PricePoint",
     "fetch_prices",
     "forecast_price_series",
+    "forecast_price_with_intervals",
     "price_matrix",
 ]

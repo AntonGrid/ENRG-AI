@@ -34,6 +34,25 @@ agent/
 tests/                 # pytest suite
 ```
 
+## Hybrid AI oracle (signals)
+
+The AI oracle is a **source of signals, not decisions** (ADR-0003 / C-1). One
+heartbeat collects uncertainty-aware observations across the ecosystem:
+
+- `generation_forecast` — Wh per bucket + 80% interval (Holt trend, `agent.forecast`);
+- `generation_anomaly` — last point outside the model's MAD band;
+- `market_forecast` — USD/kWh next steps for dayahead/p2p/spot + 80% intervals.
+
+```bash
+python -m agent.signals --source offline --horizon 8            # deterministic demo
+python -m agent.signals --source online  --horizon 6            # live oracle, graceful fallback
+python -m agent.signals --output signals.json                   # JSON output
+```
+
+Bundles are Ed25519-signable (`sign_bundle` / `verify_bundle_signature`,
+canonical JSON per `agent.fed.protocol`) so a Policy Engine can verify the
+signal source. Tests: `tests/test_signals.py`.
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear

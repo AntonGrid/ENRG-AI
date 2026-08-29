@@ -11,8 +11,9 @@ from agent.forecast import (
     ProofSeries,
     aggregate_proofs,
     forecast_energy,
+    synthetic_solar_series,
 )
-from agent.forecast.__main__ import build_series, main, offline_series
+from agent.forecast.__main__ import build_series, main
 
 
 def _proofs_for_buckets(bucket_minutes: int, wh_per_bucket) -> list[Proof]:
@@ -117,7 +118,7 @@ def test_forecast_energy_clips_lower_bound_at_zero():
 
 
 def test_offline_series_shape_and_positive():
-    series = offline_series(bucket_minutes=15, n_buckets=24)
+    series = synthetic_solar_series(bucket_minutes=15, n_buckets=24)
     assert len(series.values) == 24
     assert np.all(series.values >= 0)
     assert series.source == "offline"

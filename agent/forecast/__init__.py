@@ -15,12 +15,9 @@ from agent.forecast.energy import (
     ProofSeries,
     aggregate_proofs,
     fetch_oracle_proofs,
+    synthetic_solar_series,
 )
-from agent.forecast.model import (
-    ForecastResult,
-    HoltTrend,
-    forecast_energy,
-)
+from agent.forecast.model import ForecastResult, HoltTrend, forecast_energy
 
 __all__ = [
     "Proof",
@@ -30,4 +27,5 @@ __all__ = [
     "aggregate_proofs",
     "fetch_oracle_proofs",
     "forecast_energy",
+    "synthetic_solar_series",
 ]

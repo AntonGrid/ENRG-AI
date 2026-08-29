@@ -2,7 +2,13 @@
 
 import numpy as np
 
-from agent.market import MarketCache, fetch_prices, forecast_price_series, price_matrix
+from agent.market import (
+    MarketCache,
+    fetch_prices,
+    forecast_price_series,
+    forecast_price_with_intervals,
+    price_matrix,
+)
 
 
 def test_fetch_prices_offline_has_all_providers():
@@ -51,8 +57,28 @@ def test_price_matrix_builds_chronological_rows():
     assert matrix[0].tolist() == [0.10, 0.0]  # spot forward-filled as zero
 
 
-def test_forecast_price_series_repeats_last_value():
+def test_forecast_price_series_keeps_shape_contract():
     series = np.array([[0.10, 0.12], [0.14, 0.11]])
     forecast = forecast_price_series(series, steps=3)
     assert forecast.shape == (3, 2)
-    assert (forecast == series[-1]).all()
+
+
+def test_forecast_price_series_continues_linear_trend():
+    series = np.array([[0.10], [0.14], [0.18]])  # slope +0.04
+    forecast = forecast_price_series(series, steps=3)
+    assert forecast.shape == (3, 1)
+    # Holt should keep the learned slope, not repeat the last value.
+    assert np.allclose(forecast[:, 0], [0.22, 0.26, 0.30], atol=0.02)
+
+
+def test_forecast_price_with_intervals_orders_band():
+    series = np.linspace(0.10, 0.16, 7).reshape(-1, 1)
+    spec = forecast_price_with_intervals(series, steps=4)
+    assert len(spec) == 1
+    band = spec[0]
+    assert len(band["point"]) == 4
+    assert len(band["low"]) == 4
+    assert len(band["high"]) == 4
+    for lo, pt, hi in zip(band["low"], band["point"], band["high"]):
+        assert lo <= pt <= hi
+    assert band["rmse"] >= 0

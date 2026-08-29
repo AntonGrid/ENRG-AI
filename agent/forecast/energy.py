@@ -159,3 +159,40 @@ def forward_fill(series: ProofSeries) -> ProofSeries:
         source=series.source,
         raw_proof_count=series.raw_proof_count,
     )
+
+
+def synthetic_solar_series(
+    bucket_minutes: int = 15,
+    n_buckets: int = 24,
+    seed: int = 7,
+) -> ProofSeries:
+    """Deterministic solar-ish daily cycle (Wh per bucket) for tests/demos.
+
+    Anchors the series *end* at the current bucket boundary, models a
+    daylight window between 06:00–18:00 (local solar peak ~12:00), and adds
+    gaussian noise. Deterministic per ``seed`` so tests never flake.
+    """
+    rng = np.random.default_rng(seed)
+    now = dt.datetime.now(dt.timezone.utc)
+    step_sec = bucket_minutes * 60
+    end_idx = int(now.timestamp()) // step_sec
+    starts: List[dt.datetime] = []
+    values: List[float] = []
+    for i in range(n_buckets):
+        bucket_idx = end_idx - (n_buckets - 1 - i)
+        t = bucket_idx * step_sec
+        hour = dt.datetime.fromtimestamp(t, dt.timezone.utc).hour
+        hour += dt.datetime.fromtimestamp(t, dt.timezone.utc).minute / 60.0
+        daylight = max(0.0, np.sin(np.pi * (hour - 6.0) / 12.0))  # 06:00–18:00
+        base = 6.0 * daylight * (bucket_minutes / 15.0)  # ~24 Wh/15m at noon
+        noise = rng.normal(0.0, max(0.3, 0.1 * base))
+        starts.append(dt.datetime.fromtimestamp(t, dt.timezone.utc))
+        values.append(max(0.0, base + noise))
+    return ProofSeries(
+        bucket_minutes=int(bucket_minutes),
+        starts=starts,
+        values=np.array(values, dtype=float),
+        device_id="offline-sim",
+        source="offline",
+        raw_proof_count=len(values),
+    )

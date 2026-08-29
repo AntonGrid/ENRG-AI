@@ -102,6 +102,27 @@ class HoltTrend:
         horizon = np.arange(1, steps + 1, dtype=float)
         return self.level + self.trend * horizon
 
+    def in_sample_residuals(self, y: np.ndarray) -> np.ndarray:
+        """One-step-ahead residuals over the fitted series (same recursion).
+
+        Uses the *fitted* smoothing weights, so callers can build their own
+        anomaly detector (MAD / thresholds) without re-fitting.
+        """
+        y = np.asarray(y, dtype=float).reshape(-1)
+        n = len(y)
+        if n < 2:
+            return np.array([], dtype=float)
+        level = float(y[0])
+        trend = float(y[1]) - float(y[0])
+        residuals: List[float] = []
+        for t in range(1, n):
+            forecast = level + trend
+            residuals.append(float(y[t]) - forecast)
+            prev_level = level
+            level = self.alpha * float(y[t]) + (1.0 - self.alpha) * forecast
+            trend = self.beta * (level - prev_level) + (1.0 - self.beta) * trend
+        return np.array(residuals, dtype=float)
+
     def interval(self, steps: int, quantile: float = _Z_90) -> np.ndarray:
         """Half-width of the prediction interval at ``quantile`` z-score.
 
