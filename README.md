@@ -87,6 +87,21 @@ python -m agent.leaderboard --rounds 5 --gateways 5   # ERS loop simulation
   oracle-only (ADR-0010).
 - Tests: `tests/test_ers.py`, `tests/test_ers_loop.py`, `tests/test_leaderboard.py`.
 
+### Live AI-oracle attestation (setup)
+
+The landing widget reads a **signed** attestation from
+`https://antongrid.github.io/ENRG-AI/ai/assessments.json`. To make it LIVE:
+
+```bash
+# 1. One-time: enable Pages + create the signing secret (needs a token):
+GITHUB_TOKEN=ghp_xxx .venv/bin/python scripts/setup_pages.py --key <base64-seed>
+# 2. Then run the workflow once, or let the cron (30 min) do it:
+#    https://github.com/AntonGrid/ENRG-AI/actions/workflows/signals.yml
+```
+
+Manual path: Settings → Pages → branch `gh-pages`; Settings → Secrets →
+Actions → `AXIS_AI_SIGNING_KEY` (base64 Ed25519 seed).
+
 ## Hybrid AI oracle (signals)
 
 The AI oracle is a **source of signals, not decisions** (ADR-0003 / C-1). One
