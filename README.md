@@ -64,10 +64,12 @@ python -m agent.leaderboard --rounds 5 --gateways 5   # ERS loop simulation
 
 - `agent/fed/ers.py` — ERS update after each round: accepted gain, rejected
   outliers decay to a floor; ERS feeds back as the next round's sample weight.
+- `agent/fed/ers_loop.py` — AI anomaly signals → on-chain `report_anomaly`
+  severity (mirrors the ENRG program's `apply_anomaly_penalty`).
 - `agent/fed/digest.py` — contribution SHA-256 digest (base58) + signed
   `axis-fed-commit/1` commitment contract; the on-chain write stays
   oracle-only (ADR-0010).
-- Tests: `tests/test_ers.py`, `tests/test_leaderboard.py`.
+- Tests: `tests/test_ers.py`, `tests/test_ers_loop.py`, `tests/test_leaderboard.py`.
 
 ## Hybrid AI oracle (signals)
 
