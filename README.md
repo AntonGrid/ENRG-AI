@@ -52,6 +52,22 @@ agent/
 tests/                 # pytest suite
 ```
 
+## Closed economic loop (Phase 3)
+
+The loop connects the layers that already exist: `agent.signals` (forecast +
+market price) → `axis_core.ai.recommender` (SELL/STORE/BUY/HOLD ranking) →
+`axis_core.policy.engine.evaluate_trade` (trading right, volume limits, DAO
+gate) → simulated reward → ERS / experience.
+
+```bash
+python -m agent.trade --rounds 4                      # default loop
+python -m agent.trade --dao-gated                     # DAO gate blocks every action
+python -m agent.trade --capacity-wh 500 --storage-init-wh 495
+```
+
+Requires the `axis-core` reference implementation on `PYTHONPATH`
+(`pip install -e ../Axis-core`). Tests: `tests/test_trade.py`.
+
 ## Proof-of-Intelligence (ERS economy & leaderboard)
 
 PoI is the second earning channel of the ecosystem: reputation (ERS) and
