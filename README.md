@@ -85,6 +85,11 @@ python -m agent.leaderboard --rounds 5 --gateways 5   # ERS loop simulation
 - `agent/fed/digest.py` — contribution SHA-256 digest (base58) + signed
   `axis-fed-commit/1` commitment contract; the on-chain write stays
   oracle-only (ADR-0010).
+- `agent/fed/transport.py` — **real FL transport** (audit P3-4): a stdlib HTTP
+  aggregator that verifies every Ed25519-signed contribution, collects the
+  round, runs FedAvg + MAD screening and serves the global weights; an httpx
+  client (`submit_contribution` / `close_round` / `fetch_weights`). Tests:
+  `tests/test_fed_transport.py`.
 - Tests: `tests/test_ers.py`, `tests/test_ers_loop.py`, `tests/test_leaderboard.py`.
 
 ### Live AI-oracle attestation (setup)
