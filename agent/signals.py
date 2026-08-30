@@ -125,6 +125,9 @@ def _anomaly_signal(series: ProofSeries, model: HoltTrend, z: float) -> Optional
             "threshold_wh": round(z * scale, 3),
             "residual_wh": round(last_res, 3),
             "z": z,
+            # P1-4 (audit 2026-08-30): bind the signal to the producing device
+            # so the ERS collector can call report_anomaly on the right producer.
+            "device_id": series.device_id,
         },
     )
 

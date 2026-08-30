@@ -54,6 +54,17 @@ def test_generation_anomaly_flags_spike():
     assert anomalies[0].meta["observed_wh"] == 25.0
 
 
+def test_anomaly_carries_device_id_for_ers_collector():
+    # P1-4 (audit 2026-08-30): the ERS collector targets the producer from the
+    # anomaly signal's meta.device_id — it must be present and round-tripped.
+    series = _series([5.0] * 6 + [25.0])
+    assert series.device_id == "offline-sim" or series.device_id  # non-empty
+    signals = generation_signals(series, horizon_steps=2)
+    anomalies = [s for s in signals if s.kind == "generation_anomaly"]
+    assert len(anomalies) == 1
+    assert anomalies[0].meta.get("device_id") == series.device_id
+
+
 def test_generation_anomaly_absent_on_steady_series():
     series = _series([5.0] * 8)
     signals = generation_signals(series, horizon_steps=2)
