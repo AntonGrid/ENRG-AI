@@ -103,3 +103,19 @@ def test_commitment_tamper_detected():
     signed = sign_commitment(commit, secret)
     signed["digest"] = "tampered"
     assert not verify_commitment(pub, signed)
+
+
+def test_onchain_commit_message_layout():
+    """P1-4 (audit 2026-08-30): the message a device signs for the on-chain
+    commit_contribution PDA must match programs/enrg-mvp/src/state/poi.rs
+    (b"enrg:poi:commit" || round(8 LE) || device_id(32) || digest(32))."""
+    from agent.fed.digest import ONCHAIN_COMMIT_MSG_LEN, onchain_commit_message
+
+    device = bytes(range(32))
+    digest = bytes(range(32, 64))
+    msg = onchain_commit_message(round_no=7, device_id_pubkey=device, digest_sha256=digest)
+    assert len(msg) == ONCHAIN_COMMIT_MSG_LEN == 87
+    assert msg[:15] == b"enrg:poi:commit"
+    assert msg[15:23] == (7).to_bytes(8, "little")
+    assert msg[23:55] == device
+    assert msg[55:87] == digest

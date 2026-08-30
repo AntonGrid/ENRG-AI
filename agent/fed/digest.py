@@ -22,6 +22,27 @@ from agent.fed.protocol import canonical_json_bytes
 #: Commitment schema marker (bump when the wire format changes).
 COMMIT_SCHEMA = "axis-fed-commit/1"
 
+#: On-chain commit message layout (programs/enrg-mvp/src/state/poi.rs):
+#:   b"enrg:poi:commit" || round(8 LE) || device_id(32) || digest(32)
+#: Length = 15 + 8 + 32 + 32 = 87 bytes. The device Ed25519-signs EXACTLY
+#: these bytes for the on-chain `commit_contribution` instruction (PDA
+#: [b"poi-commit", round, device_id]).
+POI_COMMIT_PREFIX = b"enrg:poi:commit"
+ONCHAIN_COMMIT_MSG_LEN = 87
+
+
+def onchain_commit_message(round_no: int, device_id_pubkey: bytes, digest_sha256: bytes) -> bytes:
+    """Build the on-chain commit message a device must sign (87 bytes).
+
+    ``device_id_pubkey`` — 32-byte Ed25519 public key (raw);
+    ``digest_sha256``   — 32-byte SHA-256 of the canonical contribution JSON.
+    """
+    if len(device_id_pubkey) != 32 or len(digest_sha256) != 32:
+        raise ValueError("device_id_pubkey and digest_sha256 must both be 32 bytes")
+    msg = POI_COMMIT_PREFIX + round_no.to_bytes(8, "little") + device_id_pubkey + digest_sha256
+    assert len(msg) == ONCHAIN_COMMIT_MSG_LEN
+    return msg
+
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
