@@ -1,6 +1,6 @@
 {
   "message": {
-    "generated_at": "2026-09-01T06:34:19+00:00",
+    "generated_at": "2026-09-01T12:22:49+00:00",
     "meta": {
       "source": "offline-fallback",
       "requested_source": "online",
@@ -10,18 +10,18 @@
       "generation_unit": "Wh",
       "market_unit": "usd_per_kwh",
       "anomaly_z": 3.0,
-      "observed_generation_wh": 1.881,
+      "observed_generation_wh": 95.195,
       "observed_buckets": 24
     },
     "signals": [
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T06:45+00:00",
+        "ts": "2026-09-01T12:30+00:00",
         "source": "offline",
-        "value": 0.414521,
-        "interval_low": 0.129217,
-        "interval_high": 0.699825,
+        "value": 5.925628,
+        "interval_low": 5.32664,
+        "interval_high": 6.524617,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -31,11 +31,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T07:00+00:00",
+        "ts": "2026-09-01T12:45+00:00",
         "source": "offline",
-        "value": 0.534547,
-        "interval_low": 0.131066,
-        "interval_high": 0.938027,
+        "value": 6.122097,
+        "interval_low": 5.274999,
+        "interval_high": 6.969194,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -45,11 +45,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T07:15+00:00",
+        "ts": "2026-09-01T13:00+00:00",
         "source": "offline",
-        "value": 0.654572,
-        "interval_low": 0.160411,
-        "interval_high": 1.148733,
+        "value": 6.318565,
+        "interval_low": 5.281087,
+        "interval_high": 7.356044,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -59,11 +59,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T07:30+00:00",
+        "ts": "2026-09-01T13:15+00:00",
         "source": "offline",
-        "value": 0.774598,
-        "interval_low": 0.20399,
-        "interval_high": 1.345206,
+        "value": 6.515034,
+        "interval_low": 5.317057,
+        "interval_high": 7.713011,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -73,11 +73,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T07:45+00:00",
+        "ts": "2026-09-01T13:30+00:00",
         "source": "offline",
-        "value": 0.894623,
-        "interval_low": 0.256664,
-        "interval_high": 1.532583,
+        "value": 6.711503,
+        "interval_low": 5.372124,
+        "interval_high": 8.050881,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -87,11 +87,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T08:00+00:00",
+        "ts": "2026-09-01T13:45+00:00",
         "source": "offline",
-        "value": 1.014649,
-        "interval_low": 0.3158,
-        "interval_high": 1.713498,
+        "value": 6.907971,
+        "interval_low": 5.440755,
+        "interval_high": 8.375187,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -101,11 +101,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T08:15+00:00",
+        "ts": "2026-09-01T14:00+00:00",
         "source": "offline",
-        "value": 1.134675,
-        "interval_low": 0.379831,
-        "interval_high": 1.889518,
+        "value": 7.10444,
+        "interval_low": 5.519665,
+        "interval_high": 8.689214,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -115,11 +115,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-09-01T08:30+00:00",
+        "ts": "2026-09-01T14:15+00:00",
         "source": "offline",
-        "value": 1.2547,
-        "interval_low": 0.447739,
-        "interval_high": 2.061662,
+        "value": 7.300908,
+        "interval_low": 5.606713,
+        "interval_high": 8.995103,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -127,27 +127,9 @@
         }
       },
       {
-        "kind": "generation_anomaly",
-        "domain": "pilot",
-        "ts": "2026-09-01T06:30+00:00",
-        "source": "offline",
-        "value": 0.876986,
-        "interval_low": 0.0,
-        "interval_high": 0.0,
-        "unit": "Wh",
-        "meta": {
-          "observed_wh": 0.865,
-          "expected_wh": -0.012,
-          "threshold_wh": 0.303,
-          "residual_wh": 0.877,
-          "z": 3.0,
-          "device_id": "offline-sim"
-        }
-      },
-      {
         "kind": "market_forecast",
         "domain": "market",
-        "ts": "2026-09-01T06:34+00:00",
+        "ts": "2026-09-01T12:22+00:00",
         "source": "market-offline",
         "value": 0.125695,
         "interval_low": 0.11486,
@@ -186,7 +168,7 @@
       {
         "kind": "market_forecast",
         "domain": "market",
-        "ts": "2026-09-01T06:34+00:00",
+        "ts": "2026-09-01T12:22+00:00",
         "source": "market-offline",
         "value": 0.106359,
         "interval_low": 0.096369,
@@ -225,7 +207,7 @@
       {
         "kind": "market_forecast",
         "domain": "market",
-        "ts": "2026-09-01T06:34+00:00",
+        "ts": "2026-09-01T12:22+00:00",
         "source": "market-offline",
         "value": 0.095031,
         "interval_low": 0.083281,
@@ -263,6 +245,6 @@
       }
     ]
   },
-  "signature": "ebG7dEZeIYNDiLf6MiacE3G6ynoM5yLZBaYiY7fx+3z4rZz8zUrEUCFtDHRxSkATlIecr7S8e9CldhqlMb1CCw==",
+  "signature": "J5NGka/hWvJw0PiI7XkG9bNCiAuCqov8wSpkExrNIjndIIT7wynqVwl05Qlpnm3V3eKx24OBWWdIwtfdeZiKBA==",
   "public_key": "mvHbZFlWqd2wvWFZMPGO1pk4AvzdK1lch26DgTw8F0s="
 }
