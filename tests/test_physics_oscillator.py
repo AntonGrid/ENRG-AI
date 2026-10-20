@@ -1,7 +1,8 @@
 """Entrain's arithmetic: the port against entrain's own Julia run.
 
 The fixture is the output of ``julia 1.10.12`` reading
-``entrain/julia/kuramoto/basic.jl``; the port must agree to the last bit on
+``entrain/julia/kuramoto/basic.jl``; regenerate it with
+``tests/fixtures/entrain_reference.jl``. The port must agree to the last bit on
 every reading and on three steps of the full law — not merely on the order
 parameter. The invariants below are the same criteria the book's own
 ``consistency.jl`` states, restated so a regression names the property it
