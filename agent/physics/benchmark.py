@@ -21,14 +21,13 @@ journal — a criterion declared before the run, and the false positives named.
 from __future__ import annotations
 
 import argparse
-import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from agent.forecast.energy import ProofSeries
-from agent.physics.park import ParkConfig, ParkObservation, observe_park
+from agent.physics.park import ParkConfig, observe_park
 from agent.physics.synthetic import CLEAN, Scenario, build_scenario
 from agent.signals import generation_signals
 
