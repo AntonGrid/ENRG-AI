@@ -126,6 +126,40 @@ Bundles are Ed25519-signable (`sign_bundle` / `verify_bundle_signature`,
 canonical JSON per `agent.fed.protocol`) so a Policy Engine can verify the
 signal source. Tests: `tests/test_signals.py`.
 
+## Coherence physics (entrain, L3)
+
+A park of producers is read as one medium: each producer is an oscillator whose
+state is a frequency, and what two producers have in common is written into the
+link between them. The maths is a bit-exact port of the oscillator book's
+reference implementation (`entrain/julia/kuramoto/basic.jl`), so every number can
+be compared with Julia one by one.
+
+```bash
+python -m agent.physics --scenario mixed --output coherence.json  # a week with 4 declared changes
+python -m agent.physics --scenario clean                          # a park that is fine
+python -m agent.physics --source online --output coherence.json   # live oracle, graceful fallback
+python -m agent.physics.benchmark                                 # this layer vs the MAD rules
+```
+
+Four readings per producer — `silence`, `resonance` (`S(Δω)`), `phase` (`Δθ`
+against the park's own drift), `memory` (the written link `W`) — combine into a
+`score ∈ [0, 1]`. The reading is a day's reading: a phase is demodulated over
+exactly one revolution, so a value at `t` is what the last day sounded like.
+
+Signals leave in the oracle's own `SignalBundle` (`kind="coherence"`), so
+`sign_bundle` / `verify_bundle_signature` work unchanged, and `CoherenceSignal`
+fits the existing opt-in gate `PolicyEngine.evaluate_ai_anomaly` — no new flag,
+no new reason code, no protocol change.
+
+The layer is **blind to level by construction** (a factor does not move a phase)
+and quiet in a quiet park; the measured matrix against the MAD rules is in
+`tests/test_physics_benchmark.py`. The boundary with the protocol is written
+down in `../entrain/docs/ENTRAIN-BOUNDARY.md`.
+
+Tests: `tests/test_physics_oscillator.py` (the port against a Julia fixture),
+`tests/test_physics_park.py`, `tests/test_physics_signal.py`,
+`tests/test_physics_benchmark.py`.
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear
