@@ -156,6 +156,10 @@ and quiet in a quiet park; the measured matrix against the MAD rules is in
 `tests/test_physics_benchmark.py`. The boundary with the protocol is written
 down in `../entrain/docs/ENTRAIN-BOUNDARY.md`.
 
+How to run it, what the 11 functions are and what is inside `coherence.json`:
+[`agent/physics/README.md`](agent/physics/README.md). For an outside reader
+(investor, partner, auditor): [`docs/PHYSICS_INTEGRATION_SUCCESS.md`](docs/PHYSICS_INTEGRATION_SUCCESS.md).
+
 Tests: `tests/test_physics_oscillator.py` (the port against a Julia fixture),
 `tests/test_physics_park.py`, `tests/test_physics_signal.py`,
 `tests/test_physics_benchmark.py`.
