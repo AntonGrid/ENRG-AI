@@ -1,6 +1,6 @@
 {
   "message": {
-    "generated_at": "2026-10-28T18:59:03+00:00",
+    "generated_at": "2026-10-28T23:05:23+00:00",
     "meta": {
       "source": "offline-fallback",
       "requested_source": "online",
@@ -10,18 +10,18 @@
       "generation_unit": "Wh",
       "market_unit": "usd_per_kwh",
       "anomaly_z": 3.0,
-      "observed_generation_wh": 68.641,
+      "observed_generation_wh": 3.35,
       "observed_buckets": 24
     },
     "signals": [
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T19:00+00:00",
+        "ts": "2026-10-28T23:15+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.098301,
         "interval_low": 0.0,
-        "interval_high": 0.525973,
+        "interval_high": 0.355622,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -31,11 +31,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T19:15+00:00",
+        "ts": "2026-10-28T23:30+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.119474,
         "interval_low": 0.0,
-        "interval_high": 0.743838,
+        "interval_high": 0.483381,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -45,11 +45,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T19:30+00:00",
+        "ts": "2026-10-28T23:45+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.140647,
         "interval_low": 0.0,
-        "interval_high": 0.911012,
+        "interval_high": 0.586341,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -59,11 +59,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T19:45+00:00",
+        "ts": "2026-10-29T00:00+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.161821,
         "interval_low": 0.0,
-        "interval_high": 1.051946,
+        "interval_high": 0.676463,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -73,11 +73,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T20:00+00:00",
+        "ts": "2026-10-29T00:15+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.182994,
         "interval_low": 0.0,
-        "interval_high": 1.176111,
+        "interval_high": 0.758381,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -87,11 +87,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T20:15+00:00",
+        "ts": "2026-10-29T00:30+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.204167,
         "interval_low": 0.0,
-        "interval_high": 1.288365,
+        "interval_high": 0.834472,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -101,11 +101,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T20:30+00:00",
+        "ts": "2026-10-29T00:45+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.22534,
         "interval_low": 0.0,
-        "interval_high": 1.391594,
+        "interval_high": 0.906148,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -115,11 +115,11 @@
       {
         "kind": "generation_forecast",
         "domain": "pilot",
-        "ts": "2026-10-28T20:45+00:00",
+        "ts": "2026-10-29T01:00+00:00",
         "source": "offline",
-        "value": 0.0,
+        "value": 0.246513,
         "interval_low": 0.0,
-        "interval_high": 1.487676,
+        "interval_high": 0.974327,
         "unit": "Wh",
         "meta": {
           "bucket_minutes": 15,
@@ -129,7 +129,7 @@
       {
         "kind": "market_forecast",
         "domain": "market",
-        "ts": "2026-10-28T18:59+00:00",
+        "ts": "2026-10-28T23:05+00:00",
         "source": "market-offline",
         "value": 0.125695,
         "interval_low": 0.11486,
@@ -168,7 +168,7 @@
       {
         "kind": "market_forecast",
         "domain": "market",
-        "ts": "2026-10-28T18:59+00:00",
+        "ts": "2026-10-28T23:05+00:00",
         "source": "market-offline",
         "value": 0.106359,
         "interval_low": 0.096369,
@@ -207,7 +207,7 @@
       {
         "kind": "market_forecast",
         "domain": "market",
-        "ts": "2026-10-28T18:59+00:00",
+        "ts": "2026-10-28T23:05+00:00",
         "source": "market-offline",
         "value": 0.095031,
         "interval_low": 0.083281,
@@ -245,6 +245,6 @@
       }
     ]
   },
-  "signature": "daOM1cKL8c18cTOFV5JRjpl66jTlkZSXqUKpG11EXUA4QW6r+SyNO9xB5V4h9GhxByu0nmeIlqA9iDULvHNJDA==",
+  "signature": "sLhEOwu2WPBwNhBg2ex7tKiyDINk0/0ja+Lni71K5w6sw4O44hvvjZSTdk0wmgxH/Pek99CwzZIwDyZk6fWsCQ==",
   "public_key": "mvHbZFlWqd2wvWFZMPGO1pk4AvzdK1lch26DgTw8F0s="
 }
