@@ -164,6 +164,38 @@ Tests: `tests/test_physics_oscillator.py` (the port against a Julia fixture),
 `tests/test_physics_park.py`, `tests/test_physics_signal.py`,
 `tests/test_physics_benchmark.py`.
 
+## Statement #87: is the relief too perfect? (sterility index)
+
+`agent.physics.sterility` ports Statements #87 and #88 of the book
+(`entrain/julia/kuramoto/consistency.jl`) and compares with the Julia run in
+`tests/fixtures/sterility_reference.json`:
+
+- **#87 — the sterility index.** Residuals of a memory relief against the
+  theoretical decay, `δ_t = relief(t) − R₀·e^(−εt)`, are normalised and read
+  two ways: Anderson–Darling `A²` (a lived relief leaves non-normal residuals,
+  a formula leaves none, so `A² = 0` is *caught*) and `CV(relief)` (below 0.5 %
+  the spread is under the physical floor the written 1 % miss puts there). Fail
+  — `A² < 0.1` or `CV < 0.005` — and the reading is
+  `synthetic_collusion_detected`; the Axis-core Policy Engine can block a mint
+  on that reading (`enforce_sterility`, opt-in, see
+  `Axis-core/docs/policy-engine.md`).
+- **#88 — why the λ\* iteration has a limit.** `smooth_max` is the LogSumExp
+  smoothing of the binding requirement, `banach_iteration` is the iteration
+  with Banach's estimate read next to the limit.
+
+The picture Anton asked for — counter, coherence and relief against
+`e^(−εt)` on one page:
+
+```python
+from agent.physics import plot_depin_dynamics
+
+plot_depin_dynamics(timestamps, energy_wh, R, share_spread, relief_trace,
+                    memory=1e-3, path="depin_test_plot.png")
+```
+
+`matplotlib` is optional: `pip install 'enrg-ai[plot]'`. Tests:
+`tests/test_physics_sterility.py`, `tests/test_physics_plots.py`.
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear

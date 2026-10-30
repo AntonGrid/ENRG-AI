@@ -19,6 +19,8 @@
 | `series.py` | пруфы оракула → матрица «производители × часы» (единственный ввод) |
 | `synthetic.py` | детерминированный парк + четыре объявленных изменения |
 | `signal.py` | `CoherenceSignal` и `SignalBundle` (`kind="coherence"`) |
+| `sterility.py` | Утверждения №87/#88 книги: индекс стерильности (`A²`, `CV`), LogSumExp и итерация Банаха |
+| `plots.py` | `plot_depin_dynamics` — счётчик, `R` и рельеф против `e^(−εt)` одной картинкой |
 | `benchmark.py` | сравнение с MAD-правилами на объявленной истине |
 | `__main__.py` | CLI: читает парк и пишет `coherence.json` |
 
@@ -252,6 +254,8 @@ python -m pytest tests/test_physics_oscillator.py   # порт против эт
 python -m pytest tests/test_physics_park.py         # демодуляция, частоты, связи
 python -m pytest tests/test_physics_signal.py       # сигналы, подпись, гейт
 python -m pytest tests/test_physics_benchmark.py    # физика против MAD
+python -m pytest tests/test_physics_sterility.py    # утверждения №87/#88 против Julia
+python -m pytest tests/test_physics_plots.py        # картинка: три панели, один PNG
 ```
 
 Тесты бенчмарка и гейта помечены `pytest.importorskip("axis_core...")`: без
@@ -269,6 +273,16 @@ ENTRAIN_JL=/path/to/basic.jl julia --startup-file=no tests/fixtures/entrain_refe
 `tests/test_physics_oscillator.py` сравнивает **все** одиннадцать функций и три
 шага закона с расхождением `0.0`, а не «в пределах допуска»: порт должен
 совпадать побитово, иначе это уже не порт.
+
+`tests/test_physics_sterility.py` сверяет `A²` и `CV` с прогоном
+`consistency.jl` из `tests/fixtures/sterility_reference.json` (расхождение
+~1e-11 — порядок суммирования: numpy складывает попарно, цикл книги — по
+порядку). Перегенерировать:
+
+```bash
+julia --startup-file=no tests/fixtures/sterility_reference.jl \
+      > tests/fixtures/sterility_reference.json
+```
 
 ## Что слой не делает
 

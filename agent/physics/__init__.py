@@ -1,11 +1,13 @@
 """Physics layer of the AI oracle (ENRG-AI, L3): a park read as one medium.
 
 Entrain's arithmetic (``oscillator``), the park reading built on it (``park``),
-the proof-stream adapter (``series``), deterministic scenarios (``synthetic``)
-and the translation into oracle signals (``signal``). The boundary with the
-protocol is written down where it belongs — ``entrain/docs/ENTRAIN-BOUNDARY.md``:
-Axis keeps provenance and cryptography; this layer adds an observation about
-coherence and never replaces a signature.
+the proof-stream adapter (``series``), deterministic scenarios (``synthetic``),
+the translation into oracle signals (``signal``), Statement #87/#88 — the
+sterility index and the smoothed λ* operator (``sterility``) — and the picture
+Anton asked for (``plots``). The boundary with the protocol is written down
+where it belongs — ``entrain/docs/ENTRAIN-BOUNDARY.md``: Axis keeps provenance
+and cryptography; this layer adds an observation about coherence and never
+replaces a signature.
 
 Quick start::
 
@@ -37,6 +39,7 @@ from agent.physics.park import (
     demodulate,
     observe_park,
 )
+from agent.physics.plots import DEFAULT_PATH, plot_depin_dynamics
 from agent.physics.series import ParkMatrix, park_matrix
 from agent.physics.signal import (
     ENGINE,
@@ -46,6 +49,19 @@ from agent.physics.signal import (
     CoherenceSignal,
     coherence_bundle,
     park_signals,
+)
+from agent.physics.sterility import (
+    FAILED,
+    STERILE_A2,
+    STERILE_CV,
+    BanachResult,
+    SterilitySignal,
+    SterilityVerdict,
+    anderson_darling,
+    banach_iteration,
+    smooth_max,
+    sterility_index,
+    variation,
 )
 from agent.physics.synthetic import (
     CLEAN,
@@ -71,12 +87,21 @@ __all__ = [
     "PEAK_SHIFT",
     "CLOCK_OFFSET",
     "LEVEL_SCALE",
+    "FAILED",
+    "STERILE_A2",
+    "STERILE_CV",
+    "DEFAULT_PATH",
     "Injection",
     "Scenario",
     "ParkMatrix",
     "ParkConfig",
     "ParkObservation",
     "CoherenceSignal",
+    "SterilitySignal",
+    "SterilityVerdict",
+    "BanachResult",
+    "anderson_darling",
+    "banach_iteration",
     "chord",
     "coincidence",
     "coherence",
@@ -89,10 +114,14 @@ __all__ = [
     "park_matrix",
     "park_signals",
     "partial_coherence",
+    "plot_depin_dynamics",
     "resonance",
+    "smooth_max",
     "spread",
     "step_state",
+    "sterility_index",
     "unison",
+    "variation",
     "wave",
     "build_scenario",
     "clean_park",
