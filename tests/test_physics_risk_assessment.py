@@ -303,6 +303,11 @@ def test_a_jackpot_is_not_a_regime_change():
     """One protocol's payout must not trip a market-wide switch."""
     market = P.ProtocolMarket.mock(steps=720, seed=7)
     empire = P.Empire.launch(market=market)
+    # The clock belongs to the venue: the arm measures what the provider publishes at
+    # *its* step, so asking about step 301 means letting 301 steps happen first. Before
+    # the adapter this was ``empire.step = 301`` alone; the number the arm returns is the
+    # same one, because in a real run the two clocks move together.
+    empire.provider.advance(301)
     empire.step = 301
     before = empire.market_volatility()
     market.protocol("BountyBoard").returns[300] = 0.25

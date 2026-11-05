@@ -122,6 +122,15 @@ SYNTHETIC_COLLUSION = "SYNTHETIC_COLLUSION"
 SCAM_TRAP = "SCAM_TRAP"
 VERDICTS = (HONEST, UNMEASURED, SUSPECT, SYNTHETIC_COLLUSION, SCAM_TRAP)
 
+#: The verdicts that are a *conviction* — the two that say the record is not what the
+#: protocol claims it is. ``SUSPECT`` is not here on purpose: it says the protocol
+#: stopped paying, which is a fact about the past and not evidence of a lie, and
+#: ``UNMEASURED`` is not here because refusing to have an opinion is not one. These are
+#: the verdicts worth publishing to a venue
+#: (:meth:`agent.physics.interfaces.IWeb3Provider.submit_validation_proof`), because
+#: they are the only ones that accuse somebody of something checkable.
+CONVICTIONS = (SCAM_TRAP, SYNTHETIC_COLLUSION)
+
 #: The highest APY whose *sterile* curve is still a plausible contract, per bucket.
 #: Declared policy, not a measurement: a hundred percent a year is impossible in a
 #: staking vault and unremarkable in a farm, and the bucket is where the empire has
@@ -588,18 +597,42 @@ def evaluate_opportunity(
     return replace(draft, verdict=verdict, reason=reason)
 
 
+def _published(source: Any) -> List[Any]:
+    """The protocols a venue publishes, from a provider or from a market.
+
+    One seam, two spellings, and the provider's is the one that matters:
+    :meth:`agent.physics.interfaces.IWeb3Provider.get_protocol_list` is what a real
+    adapter answers. ``ProtocolMarket.protocols`` is accepted because it is the same
+    list published by the same object before the interface existed, and dropping it
+    would mean rewriting every caller for no gain in honesty.
+    """
+    getter = getattr(source, "get_protocol_list", None)
+    if callable(getter):
+        return list(getter())
+    return list(getattr(source, "protocols", ()))
+
+
 def review(
-    market: Any, *, oracle: Any = None, min_record: int = MIN_RECORD
+    source: Any, *, oracle: Any = None, min_record: int = MIN_RECORD
 ) -> Dict[str, Assessment]:
-    """Assess every protocol in a market's *published* state, by name."""
-    step = int(getattr(market, "step", 0))
+    """Assess every protocol a venue *publishes*, by name.
+
+    ``source`` is anything that answers ``get_protocol_list()`` — an
+    :class:`agent.physics.interfaces.IWeb3Provider` — or a market whose
+    ``protocols`` are the same list. Nothing else is asked of it: not a network, not a
+    block height, not a signature. That is what makes this function runnable against a
+    testnet without a change, and it is why the two failure modes a real feed has —
+    *nothing published* and *a record shorter than the minimum* — are answered here and
+    not by an exception.
+    """
+    step = int(getattr(source, "step", 0))
     return {
         protocol.name: evaluate_opportunity(
             protocol.as_opportunity(step),
             oracle=oracle,
             min_record=min_record,
         )
-        for protocol in market.protocols
+        for protocol in _published(source)
     }
 
 
@@ -841,6 +874,7 @@ __all__ = [
     "ARMS",
     "Assessment",
     "CLAIM_RATIO_MAX",
+    "CONVICTIONS",
     "HONEST",
     "KILL_DRAWDOWN",
     "KILL_VOLATILITY",

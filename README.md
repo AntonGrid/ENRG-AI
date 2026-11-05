@@ -314,8 +314,38 @@ Demo: `notebooks/digital_entrepreneur.ipynb` (capital against two credulous poli
 the moment of truth, and the switch working; the acceptance rule is asserted in the
 last cell). Tests: `tests/test_physics_portfolio.py`,
 `tests/test_physics_risk_assessment.py`. No key, no signature, no RPC: an address is
-`0x` plus forty hex digits of a SHA-256 of the protocol's name, and the venue is
-swappable for a real Web3 adapter behind `ProtocolMarket`.
+`0x` plus forty hex digits of a SHA-256 of the protocol's name.
+
+### The adapter: one line between the logic and the source (Phase 4)
+
+`agent/physics/interfaces.py` is the seam. `IWeb3Provider` is five operations —
+`get_protocol_list`, `fetch_protocol_history`, `submit_validation_proof`,
+`execute_stake`, `withdraw` — and three facts: `name`, `step` (the venue's clock, and
+therefore the frontier of what may be read) and `whitelist`. The assessment, the cap and
+the switch are written against those eight things and nothing else, so the source of the
+numbers is a constructor argument:
+
+```python
+from agent.physics.interfaces import MockWeb3Provider
+
+provider = MockWeb3Provider()                       # the declared market, unchanged
+empire = Empire.launch(body=body, provider=provider)
+```
+
+`MockWeb3Provider` *is* that market behind the interface — the same seven protocols, the
+same seeds, the same two traps at steps 300 and 350 — and `tests/test_physics_interfaces.py`
+asserts the parity rather than claiming it: a run through the adapter and a run through
+the market end on the same credit, to twelve digits. Capital moves through the interface
+too (`Portfolio.deposit` → `execute_stake`, `liquidate` → `withdraw`), and a venue that
+refuses a transfer raises `StakeRefused` instead of recording a position the venue never
+accepted. A bare `Portfolio` is handed a `NoVenueProvider`, which is a venue that says
+"there is no venue" — so there is no code path in which a credit moves by some other
+route.
+
+What the layer does *not* contain is any ability to reach a network: no endpoint, no ABI,
+no signer, no key. The test parses the module's imports and checks them, and the notebook
+carries a commented `RealTestnetProvider` so the size of the remaining step is visible —
+five operations, three facts, and `provider =` in one line.
 
 
 ## Energy generation forecasting

@@ -47,23 +47,42 @@ given does not contain it — the same rule the contract market plays by.
 Nothing here has a key, a signature, an RPC endpoint or an address that exists. A
 protocol address is ``0x`` plus the first forty hex digits of a SHA-256 of its name
 (:func:`sim_address`), which makes it stable, unique, checkable, and provably not a
-wallet. The seam for a real adapter is :class:`ProtocolFeed`: ``history(address)``
-returns the record, ``quote(address)`` the claim and ``balance(address)`` the position,
-and an implementation over Web3 would need an RPC endpoint, an ABI, and a signer — three
-things this file must never have, because a simulation that can move real money is not a
-simulation. Swapping in such an adapter changes
-:class:`ProtocolMarket` and nothing else: the portfolio, the assessment and the kill
-switch are written against the record and the claim, and neither of those cares where
-the numbers came from.
+wallet. The seam for a real adapter is ``interfaces.IWeb3Provider``:
+``get_protocol_list()`` says what is on offer, ``fetch_protocol_history(address)``
+gives the record, ``submit_validation_proof()`` takes the evidence behind a verdict,
+and ``execute_stake()`` / ``withdraw()`` move capital. An implementation over Web3
+would need an RPC endpoint, an ABI and a signer — three things this package must never
+have, because a simulation that can move real money is not a simulation — and swapping
+one in changes *which provider is constructed*, not the portfolio, the assessment or
+the kill switch.
+
+That is why :class:`Portfolio` is handed a provider rather than a market: every credit
+it moves is a call through the interface
+(:class:`~agent.physics.interfaces.MockWeb3Provider` for the declared market,
+:class:`~agent.physics.interfaces.NoVenueProvider` for the bare book the tests build),
+and the answer that comes back decides whether anything moved at all. This file keeps
+no second path for "no venue": the absence of one is itself a provider that says so.
 """
 from __future__ import annotations
 
 import hashlib
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
+
+if TYPE_CHECKING:  # pragma: no cover - for the type checker, never imported at runtime
+    from agent.physics.interfaces import IWeb3Provider
 
 #: The three buckets, in the order a report prints them: safest first.
 BUCKET_SAFE = "safe"
@@ -116,6 +135,18 @@ class NotWhitelisted(PortfolioError):
 
 class DeadProtocol(PortfolioError):
     """A protocol that has stopped paying is not an investment."""
+
+
+class StakeRefused(PortfolioError):
+    """The venue said no to a stake the book had already decided to place.
+
+    An error and never a decision, in the same sense as :class:`NotWhitelisted`: the
+    cap and the assessment decide *where* capital goes, and a venue that then declines
+    the transfer has broken an invariant rather than made a choice. It is a separate
+    class because the fix is different — the whitelist is the operator's list being
+    wrong, this is the venue and the book disagreeing about what is allowed, which on a
+    real chain means the ABI, the balance or the allowance.
+    """
 
 
 # ── addresses, rates and the conversion between them ─────────────────────────
@@ -441,6 +472,13 @@ class Portfolio:
     has to be modelled *right*, and a wrong cost would hide a wrong decision. What this
     portfolio does model is the only cost that matters to the argument: a protocol that
     goes to zero, and how much of the empire it was allowed to hold.
+
+    ``provider`` is the venue the credits actually move through: every stake is a call
+    to :meth:`IWeb3Provider.execute_stake` and every sale one to ``withdraw``. Built
+    without one, the book gets a
+    :class:`~agent.physics.interfaces.NoVenueProvider` — the same code path, a venue
+    that is only the ledger — so there is no configuration in which capital moves by
+    some other route.
     """
 
     whitelist: WhiteList
@@ -449,8 +487,13 @@ class Portfolio:
     holdings: Dict[str, Holding] = field(default_factory=dict)
     events: List[Dict[str, Any]] = field(default_factory=list)
     trace: List[Dict[str, Any]] = field(default_factory=list)
+    provider: Optional["IWeb3Provider"] = None
 
     def __post_init__(self) -> None:
+        if self.provider is None:
+            from agent.physics.interfaces import NoVenueProvider
+
+            self.provider = NoVenueProvider(self.whitelist)
         self.cash = float(self.cash)
         missing = [bucket for bucket in BUCKETS if bucket not in self.targets]
         if missing:
@@ -500,6 +543,11 @@ class Portfolio:
         paying (:class:`DeadProtocol`), and a non-positive amount. A short balance is
         not an error — it clamps, because a top-up that cannot be filled should fill
         what it can instead of failing a cycle.
+
+        The transfer itself goes to the venue (:meth:`IWeb3Provider.execute_stake`) and
+        the book only moves what the venue accepted: if the answer is ``False`` the
+        holding is untouched and :class:`StakeRefused` is raised, so a stake the book
+        believes in and the venue does not can never be recorded as a position.
         """
         self.whitelist.require(protocol.address)
         if not protocol.alive:
@@ -510,6 +558,11 @@ class Portfolio:
         placed = min(want, max(self.cash, 0.0))
         if placed <= 0.0:
             return 0.0
+        if not self.provider.execute_stake(protocol.address, placed):
+            raise StakeRefused(
+                f"{self.provider.name} refused a stake of {placed!r} credits in "
+                f"{protocol.name} ({protocol.address})"
+            )
         holding = self.holdings.get(protocol.address)
         if holding is None:
             holding = Holding(protocol=protocol)
@@ -522,12 +575,23 @@ class Portfolio:
     def withdraw(
         self, address: str, amount: float, *, step: int = 0, reason: str = ""
     ) -> float:
-        """Take credits out of one position, back to cash; returns what came out."""
+        """Take credits out of one position, back to cash; returns what came out.
+
+        Routed like every other movement: the venue is asked first
+        (:meth:`IWeb3Provider.withdraw`) and the book follows the answer.
+        """
         key = str(address).lower()
         holding = self.holdings.get(key)
         if holding is None or float(amount) <= 0.0:
             return 0.0
         taken = min(float(amount), float(holding.credits))
+        if taken <= 0.0:
+            return 0.0
+        if not self.provider.withdraw(key, taken):
+            raise StakeRefused(
+                f"{self.provider.name} refused a withdrawal of {taken!r} credits from "
+                f"{holding.protocol.name} ({key})"
+            )
         holding.credits = float(holding.credits) - taken
         self.cash += taken
         self._log(step, "withdraw", holding.protocol, taken, reason=reason)
@@ -542,16 +606,27 @@ class Portfolio:
         step: int = 0,
         reason: str = "liquidated",
     ) -> float:
-        """Sell everything in these buckets back to cash; returns the credits raised."""
+        """Sell everything in these buckets back to cash; returns the credits raised.
+
+        A sale is a withdrawal from the venue, position by position, so the kill
+        switch's exit is the same call a rebalance makes — there is no "sell everything"
+        shortcut that could skip the interface on the one path where it matters most.
+        """
         wanted = set(buckets)
         raised = 0.0
         for key in list(self.holdings):
             holding = self.holdings[key]
             if holding.protocol.bucket not in wanted:
                 continue
-            raised += float(holding.credits)
-            self.cash += float(holding.credits)
-            self._close(key, step, reason, taken=float(holding.credits))
+            credits = float(holding.credits)
+            if credits > 0.0 and not self.provider.withdraw(key, credits):
+                raise StakeRefused(
+                    f"{self.provider.name} refused to release {credits!r} credits from "
+                    f"{holding.protocol.name} ({key})"
+                )
+            raised += credits
+            self.cash += credits
+            self._close(key, step, reason, taken=credits)
         return float(raised)
 
     def rebalance(
@@ -669,6 +744,7 @@ class Portfolio:
         return {
             "cash": round(float(self.cash), 6),
             "equity": round(float(self.equity), 6),
+            "provider": str(self.provider.name),
             "targets": {key: float(value) for key, value in self.targets.items()},
             "buckets": {
                 bucket: round(self.bucket_value(bucket), 6) for bucket in BUCKETS
@@ -921,11 +997,20 @@ class Empire:
     about; the **switch** says when no answer should be trusted at all. None of the
     three is allowed to do another's job: the switch never chooses a protocol, the
     assessment never sizes a position, and the cap never decides what is honest.
+
+    The fourth party is the **venue**
+    (:class:`~agent.physics.interfaces.IWeb3Provider`): it publishes what is on offer,
+    keeps the clock, and is the only thing that moves a credit. The empire never holds a
+    market's numbers in its own hands — it asks the provider, and the portfolio moves
+    capital through the same one — so replacing the simulation with a testnet is a
+    change of constructor argument in
+    :meth:`launch`, not a change in this class.
     """
 
     market: ProtocolMarket
     portfolio: Portfolio
     kill_switch: Any
+    provider: Optional["IWeb3Provider"] = None
     oracle: Any = None
     review_every: int = CYCLE
     min_record: int = MIN_RECORD
@@ -934,8 +1019,30 @@ class Empire:
     decisions: List[Dict[str, Any]] = field(default_factory=list)
     trace: List[Dict[str, Any]] = field(default_factory=list)
     log: List[Dict[str, Any]] = field(default_factory=list)
+    proofs: List[Dict[str, Any]] = field(default_factory=list)
     volatility: Optional[float] = None
     resonance: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        """Hand the one venue to the book, or refuse two of them.
+
+        A run that assessed one market and moved capital through another would be a run
+        whose numbers mean nothing, so the disagreement is an error rather than a
+        preference: a book with no venue attached adopts the empire's, and a book with a
+        *different* one is a bug.
+        """
+        from agent.physics.interfaces import MockWeb3Provider, NoVenueProvider
+
+        if self.provider is None:
+            self.provider = MockWeb3Provider(self.market)
+        book = self.portfolio.provider
+        if isinstance(book, NoVenueProvider) or book is None:
+            self.portfolio.provider = self.provider
+        elif book is not self.provider:
+            raise PortfolioError(
+                "the portfolio and the empire must trade through the same provider"
+            )
+        self.step = int(self.step)
 
     # -- birth -------------------------------------------------------------- #
 
@@ -945,13 +1052,22 @@ class Empire:
         *,
         body: Any = None,
         market: Optional[ProtocolMarket] = None,
+        provider: Optional["IWeb3Provider"] = None,
         capital: float = START_CAPITAL,
         steps: int = 720,
         seed: int = 7,
         review_every: int = CYCLE,
         kill_switch: Any = None,
     ) -> "Empire":
-        """Open for business: a market, a wallet, and (if given) a body's own oracle.
+        """Open for business: a venue, a wallet, and (if given) a body's own oracle.
+
+        ``provider`` is the whole of the dependency injection: give it a
+        :class:`~agent.physics.interfaces.MockWeb3Provider` and the empire trades the
+        simulated chain, give it anything else that answers
+        :class:`~agent.physics.interfaces.IWeb3Provider` and the same assessment, cap
+        and switch run against that instead. Omitted, one is built over ``market`` — or
+        over the declared market of ``steps`` and ``seed`` — so every existing entry
+        point keeps its behaviour and still moves capital through the interface.
 
         ``body`` is an :class:`~agent.physics.organism.Organism`. Without one the empire
         still trades — the sterility and claim arms need no body — but the structural
@@ -959,10 +1075,25 @@ class Empire:
         ``details["measured"]``. That is the honest way to run a cheaper simulation: the
         absence of a measurement is recorded, not filled in.
         """
+        from agent.physics.interfaces import MockWeb3Provider
         from agent.physics.risk_assessment import KillSwitch
 
+        venue = getattr(provider, "market", None)
         if market is None:
-            market = ProtocolMarket.mock(steps=int(steps), seed=int(seed))
+            market = (
+                venue
+                if venue is not None
+                else ProtocolMarket.mock(steps=int(steps), seed=int(seed))
+            )
+        elif venue is not None and venue is not market:
+            # The provider publishes a clock and a record list, and both are the
+            # market's: two different markets in one run would mean assessing one and
+            # trading the other, which is the failure mode this file is written against.
+            raise PortfolioError(
+                "the provider publishes a different market than the one given"
+            )
+        if provider is None:
+            provider = MockWeb3Provider(market)
         oracle = None
         if body is not None:
             from agent.physics.curiosity import Curiosity
@@ -975,11 +1106,14 @@ class Empire:
                 engine=engine,
                 seed=int(seed),
             )
-        portfolio = Portfolio(whitelist=market.whitelist, cash=float(capital))
+        portfolio = Portfolio(
+            whitelist=market.whitelist, cash=float(capital), provider=provider
+        )
         return cls(
             market=market,
             portfolio=portfolio,
             kill_switch=kill_switch if kill_switch is not None else KillSwitch(),
+            provider=provider,
             oracle=oracle,
             review_every=int(review_every),
         )
@@ -995,10 +1129,19 @@ class Empire:
         risky buckets are forced to ``None`` whatever the assessment says, because the
         switch's whole purpose is to be the rule that is obeyed on the day the
         measurement is wrong.
+
+        Everything read here comes from the provider and everything moved here goes
+        through it: the assessment is handed the venue, the protocols in the plan are
+        fetched *by name from the venue*, and each stake is one ``execute_stake`` call.
+        A different provider therefore changes what the empire can see and touch without
+        changing a line of the decision.
         """
+        from agent.physics.risk_assessment import CONVICTIONS
         from agent.physics.risk_assessment import review as assess_all
 
-        found = assess_all(self.market, oracle=self.oracle, min_record=self.min_record)
+        found = assess_all(
+            self.provider, oracle=self.oracle, min_record=self.min_record
+        )
         plan: Dict[str, Optional[Protocol]] = {}
         for bucket in BUCKETS:
             if bucket != BUCKET_SAFE and bool(getattr(self.kill_switch, "engaged")):
@@ -1013,11 +1156,12 @@ class Empire:
                 plan[bucket] = None
                 continue
             best = max(admissible, key=lambda item: (item.implied_apy, item.name))
-            plan[bucket] = self.market.protocol(best.name)
+            plan[bucket] = self.provider.protocol(best.name)
         placed = self.portfolio.rebalance(plan, step=self.step)
         measured = {name: item.as_dict() for name, item in found.items()}
         self.resonance = self._resonance_of(plan, measured)
         self.assessments[self.step] = measured
+        submitted = self._submit_proofs(found, CONVICTIONS)
         decision = {
             "step": int(self.step),
             "equity": round(float(self.portfolio.equity), 6),
@@ -1035,11 +1179,43 @@ class Empire:
                 for name, item in sorted(found.items())
                 if not item.admissible
             ],
+            "proofs": int(submitted),
             "resonance": None if self.resonance is None else round(self.resonance, 4),
         }
         self.decisions.append(decision)
         self.log.append({"step": int(self.step), "action": "review", **decision})
         return decision
+
+    def _submit_proofs(
+        self, found: Mapping[str, Any], convictions: Sequence[str]
+    ) -> int:
+        """Hand the venue the evidence behind a conviction; returns how many it took.
+
+        A conviction is the one thing this layer knows that the venue does not: the
+        record says one thing and the advertisement says another, and *why* is a
+        measurement, not an opinion. Publishing it is a call to
+        :meth:`IWeb3Provider.submit_validation_proof` — the one operation that
+        publishes instead of moving — so the step a real deployment would charge for is
+        never quietly skipped in the simulation. ``False`` is recorded as a refusal and
+        never as a success: a proof the venue did not take did not travel.
+        """
+        taken = 0
+        for _, item in sorted(found.items()):
+            if item.verdict not in convictions:
+                continue
+            proof = {
+                "protocol": item.name,
+                "address": item.address,
+                "verdict": item.verdict,
+                "reason": item.reason,
+                "claim_apy": round(float(item.claim_apy), 6),
+                "implied_apy": round(float(item.implied_apy), 6),
+                "points": int(item.points),
+            }
+            if self.provider.submit_validation_proof(item.address, proof):
+                taken += 1
+                self.proofs.append({"step": int(self.step), **proof})
+        return taken
 
     def _resonance_of(
         self, plan: Mapping[str, Optional[Protocol]], measured: Mapping[str, Any]
@@ -1072,16 +1248,27 @@ class Empire:
         the middle one too, while one bounty board landing a payout moves only itself.
         Measured on this market, a single jackpot lifts one protocol's ratio to about
         2.3 and the median stays at 1.0.
+
+        The record is fetched through the venue
+        (:meth:`IWeb3Provider.fetch_protocol_history`), not read off a local array: a
+        provider that publishes a shorter or later record therefore moves this number,
+        which is the point — the arm has to be able to fire on what the venue says, not
+        on what the simulation knows.
         """
         from agent.physics.risk_assessment import volatility_ratio
 
-        ratios = [
-            float(volatility_ratio(protocol.record(self.step)))
-            for protocol in self.market.protocols
-            if protocol.alive
-            and protocol.bucket in (BUCKET_ACTIVE, BUCKET_EXPERIMENTAL)
-            and protocol.record(self.step).size >= 4
-        ]
+        ratios: List[float] = []
+        for protocol in self.provider.get_protocol_list():
+            if not protocol.alive:
+                continue
+            if protocol.bucket not in (BUCKET_ACTIVE, BUCKET_EXPERIMENTAL):
+                continue
+            record = np.asarray(
+                self.provider.fetch_protocol_history(protocol.address), dtype=float
+            )
+            if record.size < 4:
+                continue
+            ratios.append(float(volatility_ratio(record)))
         return float(np.median(ratios)) if ratios else None
 
     def equity_ago(self, steps: int = CYCLE) -> float:
@@ -1102,8 +1289,8 @@ class Empire:
             row["volatility"] = -1.0 if self.volatility is None else self.volatility
             row["engaged"] = float(bool(getattr(self.kill_switch, "engaged")))
             self.trace.append(dict(row))
-            self.market.advance()
-            self.step = int(self.market.step)
+            self.provider.advance()
+            self.step = int(self.provider.step)
             if (
                 self.step >= int(self.min_record)
                 and int(self.review_every) > 0
@@ -1170,12 +1357,14 @@ class Empire:
         }
 
     def report(self) -> Dict[str, Any]:
-        """Everything a report prints: market, wallet, switch, verdicts, log."""
+        """Everything a report prints: venue, wallet, switch, verdicts, proofs, log."""
         return {
             "step": int(self.step),
+            "provider": self.provider.describe(),
             "market": self.market.summary(),
             "portfolio": self.portfolio.report(),
             "kill_switch": self.kill_switch.as_dict(),
+            "proofs": list(self.proofs),
             "equity": {
                 "start": (
                     round(float(self.trace[0]["equity"]), 6)
@@ -1206,6 +1395,8 @@ class Empire:
         lines = [
             f"life: {self.step} steps, equity {start:.0f} -> {end:.0f} "
             f"({(end / max(start, 1e-9) - 1.0) * 100:+.1f}%)",
+            f"venue: {self.provider.name}, {len(self.proofs)} proofs accepted, "
+            f"{int(self.provider.describe().get('stakes', 0))} stakes executed",
             f"wallet: {len(self.portfolio.holdings)} positions, cash "
             f"{self.portfolio.cash:.0f}, targets "
             + ", ".join(f"{bucket} {share:.0%}" for bucket, share in TARGETS.items()),
@@ -1276,11 +1467,23 @@ class NaiveInvestor:
         policy: str = NAIVE_SPLIT,
         capital: float = START_CAPITAL,
         review_every: int = CYCLE,
+        provider: Optional["IWeb3Provider"] = None,
     ) -> "NaiveInvestor":
-        """The same wallet and the same whitelist; only the book differs."""
+        """The same wallet and the same whitelist; only the book differs.
+
+        The control group moves its capital through the same venue as the empire — a
+        foil that traded by some other route would be comparing two things, not one,
+        and the figure exists to compare exactly one: whether the record was measured.
+        """
+        from agent.physics.interfaces import MockWeb3Provider
+
         return cls(
             market=market,
-            portfolio=Portfolio(whitelist=market.whitelist, cash=float(capital)),
+            portfolio=Portfolio(
+                whitelist=market.whitelist,
+                cash=float(capital),
+                provider=provider if provider is not None else MockWeb3Provider(market),
+            ),
             policy=str(policy),
             review_every=int(review_every),
         )
@@ -1403,6 +1606,7 @@ __all__ = [
     "ProtocolMarket",
     "START_CAPITAL",
     "STEPS_PER_YEAR",
+    "StakeRefused",
     "TARGETS",
     "TRACE_FIELDS",
     "TRAP_RUGS",

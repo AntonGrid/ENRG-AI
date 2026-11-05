@@ -30,6 +30,7 @@ The autopoietic layer sits on the same arithmetic and never re-derives any of it
 ``worker``                 the body that bids, refuses, and remembers why
 ``portfolio``              capital: three buckets, a cap, a whitelist, a switch
 ``risk_assessment``        the verdict on somebody else's yield curve
+``interfaces``             the seam: what a venue must answer, and the mock that does
 =========================  ==================================================
 
 Quick start of the organism::
@@ -47,6 +48,12 @@ Quick start of the worker (the same body, now earning its rent)::
 Quick start of the empire (the same body, now managing capital)::
 
     python -m agent.physics.portfolio --steps 720 --body --against --plot empire.png
+
+Capital is handed its venue through ``interfaces.IWeb3Provider`` rather than reaching
+for one, so the same run can be pointed at a different source with one line::
+
+    provider = MockWeb3Provider()                  # the declared market
+    empire = Empire.launch(body=body, provider=provider)
 """
 from agent.physics.oscillator import (
     MEMORY_REFERENCE,
@@ -188,13 +195,16 @@ from agent.physics.portfolio import (
     PortfolioError,
     Protocol,
     ProtocolMarket,
+    StakeRefused,
     WhiteList,
     annualise,
     implied_apy,
     per_step_rate,
     sim_address,
 )
+from agent.physics.interfaces import IWeb3Provider, MockWeb3Provider, NoVenueProvider
 from agent.physics.risk_assessment import (
+    CONVICTIONS,
     HONEST,
     KILL_DRAWDOWN,
     KILL_VOLATILITY,
@@ -335,11 +345,16 @@ __all__ = [
     "PortfolioError",
     "Protocol",
     "ProtocolMarket",
+    "StakeRefused",
     "WhiteList",
     "annualise",
     "implied_apy",
     "per_step_rate",
     "sim_address",
+    "IWeb3Provider",
+    "MockWeb3Provider",
+    "NoVenueProvider",
+    "CONVICTIONS",
     "HONEST",
     "KILL_DRAWDOWN",
     "KILL_VOLATILITY",
