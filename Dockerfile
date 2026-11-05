@@ -1,9 +1,9 @@
 # ENRG-AI — runtime image.
 #
 # One image, every entry point the repository has: the self-training loop (the
-# default command), the coherence CLI, the forecast CLI, the whole test suite.
-# Nothing in the image holds a key. A venue is configured from the environment
-# at run time and nowhere else — see README, "Production Readiness".
+# default command), the coherence CLI, the forecast CLI, and the suite the host
+# runs — so the image can be measured rather than believed. Nothing in it holds
+# a key: a venue is configured from the environment at run time, nowhere else.
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
@@ -21,8 +21,8 @@ COPY agent/ ./agent/
 
 # The extras a deploy actually uses: `testnet` is web3.py (a chain), `market`
 # is requests (DeFiLlama), `plot` is matplotlib (the figures the CLI can print),
-# and `dev` is pytest — the base deps (numpy, httpx, PyNaCl, ollama) come with the
-# project itself. `dev` is here because the image claims the suite runs inside it.
+# and `dev` is pytest, so the suite in this image can be run at all. The base
+# deps (numpy, httpx, PyNaCl, ollama) come with the project itself.
 RUN python -m pip install --upgrade pip setuptools wheel \
  && python -m pip install --no-cache-dir ".[testnet,market,plot,dev]"
 

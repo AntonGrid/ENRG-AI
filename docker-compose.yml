@@ -1,6 +1,7 @@
 # ENRG-AI on a single VPS.
 #
 #   cp .env.example .env      # fill in only what the workload needs
+#   mkdir -p data && sudo chown 10001:10001 data   # the image runs as uid 10001
 #   docker compose up -d --build
 #   docker compose logs -f trainer
 #

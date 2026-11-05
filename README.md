@@ -830,11 +830,18 @@ job.
 
 ```bash
 cp .env.example .env && chmod 600 .env
+mkdir -p data && sudo chown 10001:10001 data   # see below: the image is not root
 docker compose up -d --build
 docker compose logs -f trainer
 docker compose run --rm coherence            # one-shot job, behind the `jobs` profile
 docker compose exec trainer pytest -q        # the suite, as far as it ships in the image
 ```
+
+The `mkdir`/`chown` is not decoration: `data/` is gitignored and `.dockerignore`d,
+so on a fresh box compose creates it as `root:root` and the container — uid
+`10001`, on purpose — cannot write its state file. The symptom is a loop that
+dies with `PermissionError: [Errno 13] ... /data/digital_state.json` on the first
+cycle; the fix is the line above, once.
 
 The image is `python:3.12-slim` plus the package's extras, runs as uid `10001`,
 and holds **no key, no `.env` and no address** — both are `.dockerignore`d, so
