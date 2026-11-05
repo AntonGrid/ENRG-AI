@@ -94,6 +94,7 @@ from agent.physics.discovery import EXECUTION_LIMIT, DiscoveryReport, Watchlist
 
 if TYPE_CHECKING:  # pragma: no cover - for the type checker, never imported at runtime
     from agent.physics.interfaces import IWeb3Provider
+    from agent.physics.transaction_cost_analyzer import CostReport, TransactionCostAnalyzer
 
 #: The three buckets, in the order a report prints them: safest first.
 BUCKET_SAFE = "safe"
@@ -354,6 +355,13 @@ class Protocol:
     cannot be asked for a step that has not happened — the future is not in the object
     the agent holds, which is the same honesty ``economy_sim.Contract`` keeps about the
     answer.
+
+    ``depth_usd`` is the one number here that is about *exiting* rather than about
+    earning: the pool's published depth in dollars, or ``None`` when the venue publishes
+    none. It is what
+    :class:`~agent.physics.transaction_cost_analyzer.TransactionCostAnalyzer` prices
+    slippage against, and ``None`` is not zero — an unmeasured pool is not a bottomless
+    one, and the cost model reports the difference rather than filling it in.
     """
 
     name: str
@@ -364,6 +372,7 @@ class Protocol:
     alive: bool = True
     rug_step: Optional[int] = None
     turnover: Optional[float] = None
+    depth_usd: Optional[float] = None
     note: str = ""
 
     def __post_init__(self) -> None:
@@ -436,6 +445,7 @@ class Protocol:
             "alive": bool(self.alive),
             "rug_step": None if self.rug_step is None else int(self.rug_step),
             "turnover": None if self.turnover is None else float(self.turnover),
+            "depth_usd": None if self.depth_usd is None else float(self.depth_usd),
             "note": self.note,
         }
 
@@ -569,11 +579,14 @@ class Portfolio:
     """Capital, three buckets, and the arithmetic that keeps them in proportion.
 
     Every number in here is checkable by hand: ``equity = cash + Σ holdings``, a deposit
-    moves credits between two of those terms, and a return multiplies one holding. There
-    is no fee, no slippage and no gas — deliberately, because a cost that is modelled
-    has to be modelled *right*, and a wrong cost would hide a wrong decision. What this
-    portfolio does model is the only cost that matters to the argument: a protocol that
-    goes to zero, and how much of the empire it was allowed to hold.
+    moves credits between two of those terms, and a return multiplies one holding. The
+    book models one cost of its own — a protocol that goes to zero, and how much of the
+    empire it was allowed to hold — and it charges the cost of *trading* only when it is
+    handed a model for it: ``friction`` is an optional
+    :class:`~agent.physics.transaction_cost_analyzer.TransactionCostAnalyzer`, and with
+    one the book asks it before any credit moves. Left as ``None`` the arithmetic is
+    exactly what it always was, because a cost that is modelled has to be modelled
+    *right*, and a wrong cost would hide a wrong decision.
 
     ``provider`` is the venue the credits actually move through: every stake is a call
     to :meth:`IWeb3Provider.execute_stake` and every sale one to ``withdraw``. Built
@@ -598,6 +611,31 @@ class Portfolio:
     never from a proposal. Left as ``None`` the book behaves as it always did and the
     operator's ``whitelist`` is the whole of the permission, which is what every existing
     caller and test gets.
+
+    What friction does, when there is one
+    -------------------------------------
+
+    ``friction`` prices the **entry**, because that is where a cost is paid and where a
+    trade can still be declined: :meth:`assess_entry` asks the model for a
+    :class:`~agent.physics.transaction_cost_analyzer.CostReport` on the amount about to be
+    placed, against the depth the protocol publishes (:attr:`Protocol.depth_usd`; ``None``
+    is *unmeasured*, and the report says so rather than inventing a slippage). A refused
+    entry places nothing, keeps the credits in cash and is logged as ``skip`` with the
+    model's own reason
+    (:data:`~agent.physics.transaction_cost_analyzer.UNPROFITABLE_AFTER_FEES`) instead of
+    raising: an entry that cannot pay for itself is a *decision*, not a bug, and a
+    rebalance that raised on every thin pool would spend the cycle apologising. An
+    accepted entry is charged — the position is credited ``amount − slippage − gas``, so
+    ``equity`` reports what survived the trade rather than what the trade was advertised
+    at. Every report is kept in :attr:`Portfolio.cost_log`, refusals included, which is
+    what lets the notebook put the naive balance next to the realistic one.
+
+    The **exit** is priced differently on purpose: it is not refused, and it is not
+    charged. It cannot be refused because leaving a position is the risk-reducing move —
+    the kill switch's own liquidation would then be held hostage by a gas estimate — and
+    it is not charged because a cost that cannot change a decision belongs in a report and
+    not in the accounting. :meth:`assess_entry` still prices one on request, so the cost of
+    an exit is a number the caller may read before taking it.
     """
 
     whitelist: WhiteList
@@ -611,6 +649,8 @@ class Portfolio:
     execution_whitelist: Optional[WhiteList] = None
     execution_limit: int = EXECUTION_LIMIT
     alpha_log: List[Dict[str, Any]] = field(default_factory=list)
+    friction: Optional["TransactionCostAnalyzer"] = None
+    cost_log: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.provider is None:
@@ -618,6 +658,10 @@ class Portfolio:
 
             self.provider = NoVenueProvider(self.whitelist)
         self.cash = float(self.cash)
+        if self.friction is not None and not hasattr(self.friction, "assess"):
+            raise PortfolioError(
+                f"friction {self.friction!r} cannot price a trade: it has no assess()"
+            )
         missing = [bucket for bucket in BUCKETS if bucket not in self.targets]
         if missing:
             raise PortfolioError(f"targets must name every bucket, missing {missing}")
@@ -655,6 +699,59 @@ class Portfolio:
 
     def addresses(self) -> List[str]:
         return sorted(self.holdings)
+
+
+    # -- what an entry costs ----------------------------------------------- #
+
+    def liquidity_of(self, protocol: Protocol) -> Optional[float]:
+        """The depth a trade into ``protocol`` is priced against, or ``None``.
+
+        Read from :attr:`Protocol.depth_usd` and from nothing else. ``turnover`` is *not*
+        a substitute: it is what the pool moves in a step, and a book that priced slippage
+        against flow would call every honest pool a desert. A venue that publishes no depth
+        leaves this ``None``, which the cost model reports as unmeasured.
+        """
+        depth = getattr(protocol, "depth_usd", None)
+        return None if depth is None else float(depth)
+
+    def assess_entry(
+        self, protocol: Protocol, amount: float
+    ) -> Optional["CostReport"]:
+        """Price one entry, or ``None`` when the book has no model to price it with.
+
+        A *question*, and therefore pure: nothing is logged, nothing is charged, and no
+        credit moves, which is what lets a review ask what an entry would cost without
+        making it. :meth:`deposit` is the caller that acts on the answer, and it is the
+        one that writes the :attr:`cost_log` row — a decision is recorded, a question is
+        not.
+
+        The rate handed to the model is the protocol's **measured** APY
+        (:attr:`Protocol.implied_apy`), not its ``claim_apy``: a cost is subtracted from
+        what the record paid, and subtracting it from what a protocol promised would
+        flatter every liar in the market.
+        """
+        if self.friction is None:
+            return None
+        return self.friction.assess(
+            float(protocol.implied_apy),
+            float(amount),
+            tvl_usd=self.liquidity_of(protocol),
+            stable=protocol.bucket == BUCKET_SAFE,
+        )
+
+    def _log_cost(
+        self, step: int, action: str, protocol: Protocol, report: "CostReport"
+    ) -> Dict[str, Any]:
+        """One row of friction history: the report, and which protocol it was about."""
+        row = {
+            "step": int(step),
+            "action": action,
+            "protocol": protocol.name,
+            "address": protocol.address,
+            **report.as_dict(),
+        }
+        self.cost_log.append(row)
+        return row
 
 
     # -- what may be funded, and who decides ------------------------------- #
@@ -817,6 +914,16 @@ class Portfolio:
         the book only moves what the venue accepted: if the answer is ``False`` the
         holding is untouched and :class:`StakeRefused` is raised, so a stake the book
         believes in and the venue does not can never be recorded as a position.
+
+        The fifth gate is *friction*, and it is the only one that is a decision rather than
+        an error: with a ``friction`` model (:meth:`assess_entry`) an entry that cannot pay
+        for its own gas and slippage places nothing, logs ``skip`` with the model's reason,
+        and returns ``0.0`` — the credits stay in cash and the bucket stays unfilled. An
+        entry that clears the model is **charged**: of the ``placed`` credits taken out of
+        cash, the slippage and the gas never reach the position, so the holding is credited
+        ``placed − total_cost_usd``. That is the whole point of the gate — ``equity`` after
+        a trade is what survived it, and a book that only refuses the worst trades but
+        banks the costs of the rest would still be measuring a market that does not exist.
         """
         self.whitelist.require(protocol.address)
         if not self.is_executable(protocol.address):
@@ -832,18 +939,39 @@ class Portfolio:
         placed = min(want, max(self.cash, 0.0))
         if placed <= 0.0:
             return 0.0
+        report = self.assess_entry(protocol, placed)
+        if report is not None and report.refused:
+            self._log_cost(step, "skip", protocol, report)
+            self._log(step, "skip", protocol, placed, reason=report.reason)
+            return 0.0
+        charged = placed if report is None else max(placed - float(report.total_cost_usd), 0.0)
+        if charged <= 0.0:
+            # A trade whose friction eats the whole stake is not a stake: nothing is sent,
+            # because a position of zero credits would be a line in the book that paid for
+            # the privilege of being empty.
+            self._log_cost(step, "skip", protocol, report)
+            self._log(
+                step,
+                "skip",
+                protocol,
+                placed,
+                reason=report.reason or "friction consumed the trade",
+            )
+            return 0.0
         if not self.provider.execute_stake(protocol.address, placed):
             raise StakeRefused(
                 f"{self.provider.name} refused a stake of {placed!r} credits in "
                 f"{protocol.name} ({protocol.address})"
             )
+        if report is not None:
+            self._log_cost(step, "deposit", protocol, report)
         holding = self.holdings.get(protocol.address)
         if holding is None:
             holding = Holding(protocol=protocol)
             self.holdings[protocol.address] = holding
-        holding.credits = float(holding.credits) + placed
+        holding.credits = float(holding.credits) + charged
         self.cash -= placed
-        self._log(step, "deposit", protocol, placed)
+        self._log(step, "deposit", protocol, charged)
         return float(placed)
 
     def withdraw(
@@ -1119,6 +1247,33 @@ class Portfolio:
             }
         )
 
+    def friction_summary(self) -> Optional[Dict[str, Any]]:
+        """What the cost model charged and what it refused, as one row.
+
+        ``None`` when the book has no model, because the absence of a measurement is
+        reported as absent rather than as a row of zeros that would read like a very cheap
+        venue — the same discipline a ``CostReport`` keeps about an unmeasured depth.
+
+        ``paid_usd`` is what the entries actually cost and ``refused_usd`` is the capital
+        the model kept in cash. Those two numbers are the whole distance between the naive
+        balance and the realistic one, so a reader does not have to sweep
+        :attr:`cost_log` to find them.
+        """
+        if self.friction is None:
+            return None
+        taken = [row for row in self.cost_log if row["action"] == "deposit"]
+        skipped = [row for row in self.cost_log if row["action"] == "skip"]
+        return {
+            "entries": len(taken),
+            "refused": len(skipped),
+            "paid_usd": round(sum(float(row["total_cost_usd"]) for row in taken), 6),
+            "refused_usd": round(
+                sum(float(row["trade_size_usd"]) for row in skipped), 6
+            ),
+            "horizon_days": float(getattr(self.friction, "horizon_days", 0.0)),
+            "eth_price_usd": float(getattr(self.friction, "eth_price_usd", 0.0)),
+        }
+
     def report(self) -> Dict[str, Any]:
         """The wallet, bucket by bucket, with the weights it ended the run at."""
         return {
@@ -1157,6 +1312,7 @@ class Portfolio:
                 else self.execution_whitelist.as_list()
             ),
             "execution_limit": int(self.execution_limit),
+            "friction": self.friction_summary(),
         }
 
 
@@ -1484,6 +1640,7 @@ class Empire:
         kill_switch: Any = None,
         scanner: Any = None,
         execution_limit: int = EXECUTION_LIMIT,
+        friction: Optional["TransactionCostAnalyzer"] = None,
     ) -> "Empire":
         """Open for business: a venue, a wallet, and (if given) a body's own oracle.
 
@@ -1513,6 +1670,13 @@ class Empire:
         of on the whole market. ``execution_limit`` is the cap on the resulting
         whitelist, and it belongs to the wallet — the thing that spends — so it is written
         there and enforced there (:meth:`Portfolio.approve`), not merely passed along.
+
+        ``friction`` is the one argument that changes *what a trade costs*: given a
+        :class:`~agent.physics.transaction_cost_analyzer.TransactionCostAnalyzer`, the
+        wallet refuses entries that cannot pay their own gas and slippage and charges the
+        ones it takes. Omitted, the book is exactly as frictionless as it has always
+        been, which is the honest default for a simulation whose protocols publish no
+        depth.
         """
         from agent.physics.interfaces import MockWeb3Provider
         from agent.physics.risk_assessment import KillSwitch
@@ -1549,6 +1713,7 @@ class Empire:
             cash=float(capital),
             provider=provider,
             execution_limit=int(execution_limit),
+            friction=friction,
         )
         return cls(
             market=market,

@@ -1233,6 +1233,11 @@ class RealTestnetProvider(IWeb3Provider):
         A mined transaction with ``status == 0`` is a refusal too: it cost gas, moved
         nothing, and reporting it as success would put a position in the book that the
         venue never took.
+
+        The record carries ``gas`` (the limit the node accepted) *and* the two facts the
+        chain reported — ``gas_used`` and ``effective_gas_price`` — because those are what
+        :meth:`agent.physics.transaction_cost_analyzer.TransactionCostAnalyzer.from_receipt`
+        prices the next trade with: a limit is an intention, and a receipt is a receipt.
         """
         self._connect()
         sender = self._checksum(self._signer_address())
@@ -1268,6 +1273,8 @@ class RealTestnetProvider(IWeb3Provider):
             "units": int(units),
             "nonce": int(tx["nonce"]),
             "gas": int(gas),
+            "gas_used": int(row.get("gasUsed") or 0),
+            "effective_gas_price": int(row.get("effectiveGasPrice") or 0),
             "hash": self._hex(digest),
             "block": int(row.get("blockNumber") or 0),
             "status": int(row.get("status") or 0),
