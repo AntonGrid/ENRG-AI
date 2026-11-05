@@ -426,6 +426,12 @@ convicted by the assessment alone. Junk is the class with no substitute for leve
 it is not a thief, it is just not a yield, and only the arithmetic of the record
 shows that.
 
+It is worth saying what happens to that funnel as the run goes on: at the last review
+(step 792) the market, not the gate, has changed — all 90 rugs have fired, so level 1
+drops **163** of 200 (*stopped paying* 90, *no turnover* 43, *noise, not a yield* 30) and
+the same funnel reads **200 → 37 → 10**. A gate that narrows because the market rotted is
+a measurement; a gate that narrowed because somebody tuned it would be a lie.
+
 ```python
 import agent.physics.market_generator as M
 from agent.physics import portfolio as P
