@@ -32,6 +32,7 @@ The autopoietic layer sits on the same arithmetic and never re-derives any of it
 ``risk_assessment``        the verdict on somebody else's yield curve
 ``interfaces``             the seam: what a venue must answer, and the mock that does
 ``real_testnet_provider``  first contact: the same seam, answered by a real testnet
+``defillama_adapter``      the wild market: the same two gates, on live DeFiLlama pools
 =========================  ==================================================
 
 Quick start of the organism::
@@ -237,6 +238,15 @@ from agent.physics.portfolio import (
     sim_address,
 )
 from agent.physics.interfaces import IWeb3Provider, MockWeb3Provider, NoVenueProvider
+from agent.physics.defillama_adapter import (
+    DefiLlamaError,
+    DefiLlamaMarket,
+    DefiLlamaScanner,
+    DefiLlamaUnavailable,
+    DiscoveryEngine,
+    MarketFunnel,
+    PoolRow,
+)
 from agent.physics.real_testnet_provider import (
     DryRun,
     ProtocolBook,
@@ -406,6 +416,13 @@ __all__ = [
     "ProtocolBook",
     "ProtocolEntry",
     "DryRun",
+    "DefiLlamaError",
+    "DefiLlamaMarket",
+    "DefiLlamaScanner",
+    "DefiLlamaUnavailable",
+    "DiscoveryEngine",
+    "MarketFunnel",
+    "PoolRow",
     "CONVICTIONS",
     "HONEST",
     "KILL_DRAWDOWN",

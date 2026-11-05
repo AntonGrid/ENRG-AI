@@ -12,3 +12,7 @@ pytest>=7.0
 # Only needed to talk to a chain; nothing else in the package imports it.
 #   web3>=6.0
 #   python-dotenv>=1.0      # optional: reads a .env, never writes one
+
+# optional: the live market feed (agent/physics/defillama_adapter.py).
+# Only needed to read DeFiLlama; the drawn market and the whole test suite run without it.
+#   requests>=2.28

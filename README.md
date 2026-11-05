@@ -455,6 +455,66 @@ market under a second, and an `Empire.report()` that carries the funnel and surv
 `json.dumps`.
 
 
+### The wild market: 200 live DeFiLlama pools (Phase 6)
+
+`agent/physics/defillama_adapter.py` points the same two gates at a market nobody designed.
+Nothing in `Scanner`, `evaluate_opportunity`, the cap or the switch changed — the adapter
+answers the shape a venue already has (`get_protocol_list()`, `protocol(name)`, `step`,
+`name`), and the records arrive through it:
+
+```python
+from agent.physics import DefiLlamaScanner, DiscoveryEngine
+
+funnel = DiscoveryEngine(mode="real_defillama").run(200)
+print(funnel.summary_text())        # level 1, level 2, approved
+funnel.top_rejected(3)              # the loudest promises the record refused, and why
+```
+
+Four decisions are what the file is for, and each is a place a careless adapter invents a
+number:
+
+* **a pool has no address** — `0x…` is the SHA-256 of the name (`portfolio.sim_address`),
+  the same provably-not-a-wallet the drawn market uses;
+* **the history is APYs, not returns** — `(1 + apy)^(1/365) − 1` is the exact inverse of
+  `portfolio.annualise`, so a claim and a record are compared in the same units, and `CV`
+  of the rates is `CV` of the log returns;
+* **a missing APY is not a zero** — gaps are dropped and counted, and a series more than a
+  quarter empty is refused rather than filled;
+* **`429` is not "these pools publish nothing"** — measured on the first real run, at eight
+  concurrent requests the host throttled 125 of the 200 pools. The adapter now paces itself
+  (four in flight, two retries with doubling pauses) and names every pool it still could
+  not read, instead of quietly reporting a smaller, cleaner market.
+
+The one rule the adapter adds to the core's loop is the survey's window arithmetic: an
+Entrain survey needs four fixations of 128 samples at a hop of 64, so a daily series
+younger than about ten months is `UNMEASURED` — waiting, *not* refused — and the reason says
+how many points produced how many windows. A dead feed is an empty funnel with the reason in
+`error` (exit code 3 from the CLI), never a traceback.
+
+Measured here — one scan, 5 Nov 2026, top 200 by TVL (cold cache ≈ 4 min, warm ≈ 1 s):
+
+```text
+mode real_defillama: the venue (defillama) publishes 200 pools, 195 of them readable
+  level 1 (scanner): kept 152, dropped 43 (noise, not a yield 36, record too short 7)
+  level 2 (entrain): judged 83, refused 31, unmeasured 69 (HONEST 52, SUSPECT 31, UNMEASURED 69)
+  approved for investment: 52 of 152
+```
+
+The interesting number is not the approval rate but *which arm did the work*: among the 143
+measured records the smallest `A²` was `1.29` and the median `30.7` against a sterility floor
+of `0.1` — **no live pool was sterile**, because real APYs are noisier than any formula —
+while 72 records claimed more than their own history paid. On this market the funnel is
+convicted by the claim arm, not by Statement #87, and the figure prints both so that a
+reader can see the difference rather than take it on trust.
+
+Demo: section 10 of `notebooks/digital_entrepreneur.ipynb` (`REAL_MARKET = True`, tables of
+the refusals with `A²`, `CV` and the σ gap, plus the funnel figure). Tests:
+`tests/test_physics_defillama.py` — 36 of them, every response a `Mock`: the unit mapping,
+the gaps, the throttle, the window rule, "one dead uuid costs one pool", a dead feed as a
+value, and the assertion that no surface of the adapter — engine, scanner, market — has a
+method that could move a credit.
+
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear
