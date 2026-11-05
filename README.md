@@ -391,6 +391,63 @@ translation and the failures (no network, no key), and, when `anvil` and `forge`
 balances, and `Portfolio` moving capital through it. Without foundry it skips by name.
 
 
+### The discovery engine: 200 protocols, two levels and one rule
+
+Seven declared protocols prove a rule; two hundred ask whether it survives scale.
+`agent/physics/market_generator.py` draws a hostile market in one vectorised pass —
+one `standard_normal((n, steps))` per kind, so 500 protocols of 720 steps take well
+under a second — with the brief's mixture: **60 % scams** (a curve with no market
+noise, an APY of 200…4000 %, half of them publishing no turnover, three quarters
+hiding a `rug_step`), **30 % junk** (noise around a negative mean, a book thinner
+than a credit a step) and **10 % honest** records (a real rate with market noise and
+a claim equal to what is paid). The history is drawn **once**: the venue's clock
+decides how much of it has happened, and no simulation step draws a new number.
+
+`agent/physics/discovery.py` puts two levels in cost order, and neither does the
+other's work. **Level 1** is a `Scanner`: it reads one published record and computes
+a mean, a spread and a `CV` — microseconds per protocol — and drops what arithmetic
+can see: dead, too short, below the turnover floor, noise instead of a yield, a
+promise of profit on a record that loses money. It does **not** judge the curve: a
+perfect formula has an ordinary mean and an ordinary `CV`, and reading that is
+Statement #87's job. **Level 2** is the portfolio: it takes only the `watchlist` and
+runs the Entrain assessment, and it alone writes the wallet's `execution_whitelist`.
+The safety rule is enforced by types rather than discipline — `Scanner` has no method
+that returns a `WhiteList` and `Candidate` carries no approval — so the scanner can
+put a protocol in front of an assessment and never in front of money.
+
+Measured at step 72 on a market of 200 (720 steps, seed 7): **200 published → 120
+dropped by arithmetic, each with its own reason (no turnover, noise instead of a
+yield, an unpaid record) → 60 refused by Entrain and 10 finding no room under a cap
+of ten addresses → 10 honest funded**. Over 720 steps the scanned empire ends at
+**211 credits** from 100 with all 32 of its deposits in honest protocols; the same
+body with the same caps and no scanner reads all 200, puts **45 of its 52 deposits**
+into junk and ends at **50**. No scam is funded by either arm — a sterile curve is
+convicted by the assessment alone. Junk is the class with no substitute for level 1:
+it is not a thief, it is just not a yield, and only the arithmetic of the record
+shows that.
+
+```python
+import agent.physics.market_generator as M
+from agent.physics import portfolio as P
+from agent.physics.discovery import Scanner
+from agent.physics.interfaces import MockWeb3Provider
+
+market = M.generate_market(count=200, steps=720, seed=7)
+venue = MockWeb3Provider(market)
+empire = P.Empire.launch(provider=venue, scanner=Scanner(), steps=720, seed=7)
+empire.run(720)
+print(empire.summary_text())      # funnel: 200 published -> 80 read -> 10 funded
+```
+
+Demo: section 9 of `notebooks/digital_entrepreneur.ipynb` (the funnel, then the two
+arms' equity on one plot with the deposits split by ground truth). Tests:
+`tests/test_physics_discovery.py` — 54 of them, covering the generator's mixture
+(120 scams of 200, the rug share, the vectorised draw) as well as the funnel's
+identity, the `200 → 80 → 10` counts, "a scanner cannot approve", the 500-protocol
+market under a second, and an `Empire.report()` that carries the funnel and survives
+`json.dumps`.
+
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear
