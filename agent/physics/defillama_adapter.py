@@ -137,6 +137,7 @@ __all__ = [
     "DefiLlamaUnavailable",
     "DiscoveryEngine",
     "MarketFunnel",
+    "PoolFrame",
     "PoolRow",
     "apy_to_rate",
     "bucket_for",
@@ -471,6 +472,43 @@ def _unique_names(rows: Sequence[PoolRow]) -> List[str]:
     return names
 
 
+@dataclass(frozen=True)
+class PoolFrame:
+    """One pool's *two* published series, aligned row by row.
+
+    The funnel needs one number per day and reads it with
+    :meth:`DefiLlamaScanner.fetch_pool_history`. A question about *liquidity leaving*
+    needs two — the APY and the depth — and two series cleaned independently cannot be
+    zipped afterwards: :func:`clean_series` drops a missing ``apy`` from one and a
+    missing ``tvlUsd`` from the other, and day 41 of the first is then day 47 of the
+    second. So the pairing happens **before** the cleaning, row by row, and a row that is
+    missing either number is dropped from both. What is left is a shorter record of days
+    the venue actually published both numbers for — which is the only kind of day a
+    statement about "yield rose while depth fell" can be made on.
+
+    ``missing`` counts the rows that were dropped, so a report can say how much of the
+    history the pairing cost instead of quietly measuring a thinner series.
+    """
+
+    uuid: str = ""
+    apy: Tuple[float, ...] = ()
+    tvl: Tuple[float, ...] = ()
+    missing: int = 0
+
+    def __len__(self) -> int:
+        return len(self.apy)
+
+    def __bool__(self) -> bool:
+        return bool(self.apy)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "uuid": self.uuid,
+            "points": len(self),
+            "missing": int(self.missing),
+        }
+
+
 # ── the wire: one reader, two endpoints, and a cache ────────────────────────
 
 
@@ -736,6 +774,56 @@ class DefiLlamaScanner:
             )
             return ()
         return tuple(published)
+
+    def fetch_pool_frame(self, uuid: str, *, refresh: bool = False) -> PoolFrame:
+        """One pool's APY **and** depth, aligned — the frame a two-variable question needs.
+
+        Same contract as :meth:`fetch_pool_history`: an empty frame and one line in
+        :attr:`warnings` for a pool the feed cannot answer, never an exception. The two
+        numbers come from the *same* cached document, so this method costs no second
+        request — and :data:`MAX_MISSING_SHARE` applies to the paired rows, because a
+        pool that publishes an APY but no depth on a third of its days is a series
+        sampled at a different rate than the statistics assume, exactly as before.
+        """
+        key = "chart-" + "".join(
+            character if character.isalnum() else "_" for character in str(uuid)
+        )
+        url = self.chart_url.format(pool=uuid)
+        try:
+            body = self._document(key, url, refresh=refresh)
+        except DefiLlamaUnavailable as exc:
+            self.warnings.append(f"{uuid}: {exc}")
+            return PoolFrame(uuid=str(uuid))
+        apy: List[float] = []
+        tvl: List[float] = []
+        missing = 0
+        for row in body.get("data", ()):
+            if not isinstance(row, Mapping):
+                missing += 1
+                continue
+            rate = _number(row.get("apy"))
+            depth = _number(row.get("tvlUsd"))
+            if rate is None or depth is None:
+                missing += 1
+                continue
+            apy.append(rate)
+            tvl.append(depth)
+        total = len(apy) + missing
+        if total == 0:
+            self.warnings.append(f"{uuid}: the feed published no history")
+            return PoolFrame(uuid=str(uuid))
+        if missing / total > float(MAX_MISSING_SHARE):
+            self.warnings.append(
+                f"{uuid}: {missing} of {total} days are missing an apy or a depth; "
+                "not published"
+            )
+            return PoolFrame(uuid=str(uuid), missing=missing)
+        return PoolFrame(
+            uuid=str(uuid),
+            apy=tuple(apy),
+            tvl=tuple(tvl),
+            missing=int(missing),
+        )
 
     # -- the two composed: a market the funnel can read ---------------------- #
 

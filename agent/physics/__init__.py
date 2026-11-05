@@ -33,6 +33,8 @@ The autopoietic layer sits on the same arithmetic and never re-derives any of it
 ``interfaces``             the seam: what a venue must answer, and the mock that does
 ``real_testnet_provider``  first contact: the same seam, answered by a real testnet
 ``defillama_adapter``      the wild market: the same two gates, on live DeFiLlama pools
+``volatility_hunter``      the hunt: a panic is a price, a lie is a formula — and the book
+                          sizes the first one (:meth:`portfolio.Portfolio.alpha_hunting_weight`)
 =========================  ==================================================
 
 Quick start of the organism::
@@ -245,7 +247,28 @@ from agent.physics.defillama_adapter import (
     DefiLlamaUnavailable,
     DiscoveryEngine,
     MarketFunnel,
+    PoolFrame,
     PoolRow,
+)
+from agent.physics.volatility_hunter import (
+    CALM,
+    DISHONEST,
+    FORMULA,
+    GROWTH,
+    PANIC,
+    THIN,
+    Dislocation,
+    Organic,
+    PanicDetector,
+    PanicEvent,
+    PanicReport,
+    PanicSignal,
+    VolatilityHunter,
+    forward_apy,
+    measure_dislocation,
+    measure_organic,
+    resting_claim,
+    robust_scale,
 )
 from agent.physics.real_testnet_provider import (
     DryRun,
@@ -422,7 +445,26 @@ __all__ = [
     "DefiLlamaUnavailable",
     "DiscoveryEngine",
     "MarketFunnel",
+    "PoolFrame",
     "PoolRow",
+    "CALM",
+    "DISHONEST",
+    "FORMULA",
+    "GROWTH",
+    "PANIC",
+    "THIN",
+    "Dislocation",
+    "Organic",
+    "PanicDetector",
+    "PanicEvent",
+    "PanicReport",
+    "PanicSignal",
+    "VolatilityHunter",
+    "forward_apy",
+    "measure_dislocation",
+    "measure_organic",
+    "resting_claim",
+    "robust_scale",
     "CONVICTIONS",
     "HONEST",
     "KILL_DRAWDOWN",

@@ -515,6 +515,66 @@ value, and the assertion that no surface of the adapter — engine, scanner, mar
 method that could move a credit.
 
 
+### Alpha hunting: a panic is a price, a lie is a formula (Phase 7)
+
+`agent/physics/volatility_hunter.py` asks the funnel's fifty-two approved pools a second
+question, about a *day* rather than about a protocol: liquidity left, the same yield is now
+shared by fewer dollars, the advertised APY tripled — **is the record still a market while
+the price looks like fear?**
+
+The obvious detector is four lines of numpy, and it is wrong in a way this repository can
+show. Measured on the same live scan, "current APY more than two median absolute deviations
+above its own median" ranks `blackrock-buidl BUIDL (BSC)` at **+19.70 σ** on a seven-basis-
+point step — a tokenised Treasury bill as the most panicked asset in DeFi, because its MAD is
+a few hundredths of a point. So the price arm has floors: `PANIC_SIGMA_FLOOR` (0.25 pp),
+`PANIC_GAP_PP` (1 pp) and `PANIC_GAP_RATIO` (1.25×), after which the same pool reads
+`2.63 σ / 0.66 pp / 1.20×` — a bill stepping with the Fed, and nothing else.
+
+```python
+from agent.physics import VolatilityHunter, PanicDetector
+
+report = VolatilityHunter().scan(funnel)      # the funnel's HONEST pools, two series each
+print(report.summary_text())                  # verdicts, then the panics
+report.best()                                 # the loudest signal, or None
+```
+
+Two arms, and only both together are `PANIC` — the same rule the core keeps for its own:
+
+| arm | measures | refuses with |
+|---|---|---|
+| `dislocation` | last 14 days against the resting level: `z`, points, multiple, and **the depth that left** | `CALM`, `GROWTH` |
+| `organic` | Statement #87 on the whole record **and on the raised segment** + the assessment at rest | `FORMULA`, `DISHONEST` |
+
+Two decisions carry the file. The claim a panicking pool is judged against is its **resting
+level** (`resting_claim`, the median of everything before the last fortnight), never the rate
+the panic advertises — otherwise the claim arm refuses every panic by construction. And the
+record is judged at *two* horizons, because a pool can be noisy for a year and then announce a
+flat 300 % for a fortnight, which is precisely the fortnight the strategy would be buying.
+
+Measured here (same cache, 5 Nov 2026):
+
+* **today**: 52 approved pools read, **zero panics** — the strongest reading among all 200 is
+  `2.63 σ`, and "no panic today" is a result, not an empty screen;
+* **replay**, the same arithmetic asked of every historical day of every pool (`replay` takes
+  `apy[:day+1]`, so no verdict sees the future): **53 panics across 17 pools**, `41 of 53`
+  still paying above the pool's resting level a month later, median `+1.35 pp` against
+  `+0.00 pp` for every thirtieth ordinary day of the same pools — the control that makes the
+  number mean something.
+
+Sizing is the book's, not the detector's:
+`Portfolio.alpha_hunting_weight(signal)` gives a fired signal `1 + ALPHA_BOOST_CAP ×
+confidence` on its own bucket (half, at most), `boosted_targets()` funds it out of cash above
+`ALPHA_CASH_FLOOR` (5 %, never spent) and logs every grant, and `rebalance(..., targets=...)`
+runs the *same* accounting against the new numbers — a panic gets a bigger weight, not a
+second code path.
+
+Demo: section 11 of `notebooks/digital_entrepreneur.ipynb` — today's verdicts, the replay with
+its control, two episodes side by side (one that paid and one that did not, `panic_replay.png`)
+and the two books. Tests: `tests/test_physics_volatility_hunter.py` — 53 of them, all mocked:
+the floors, each arm refusing alone, the resting claim, no look-ahead in the replay, the cap
+and the cash floor, and the assertion that nothing here can sign, stake or transfer.
+
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear

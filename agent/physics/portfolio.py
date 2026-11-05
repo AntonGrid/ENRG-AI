@@ -24,6 +24,15 @@ zero costs a *tenth* of the empire, and one that is caught by the assessment cos
 nothing at all. That is a cruder rule than ``worker.py``'s decision, and it is
 deliberately cruder — a cap has to work on the days the measurement is wrong.
 
+The three buckets are the *policy*, and a measurement may re-weight them but not rewrite
+them: :meth:`Portfolio.alpha_hunting_weight` turns a fired panic signal
+(:mod:`agent.physics.volatility_hunter`) into a multiplier on **its own** bucket, capped at
+:data:`ALPHA_BOOST_CAP` (half) and funded only out of cash above :data:`ALPHA_CASH_FLOOR`
+(five percent, never spent). :meth:`Portfolio.boosted_targets` is the resulting map and
+:meth:`Portfolio.rebalance` runs the *same* arithmetic against it, so a panic gets a bigger
+number and not a second code path. A book that has not measured a panic is exactly the book
+it was before any of this existed.
+
 Why the whitelist is necessary and not sufficient
 =================================================
 
@@ -125,6 +134,23 @@ TRIM_BAND = 0.02
 #: The columns of a life, in the order they are recorded: what the empire was worth,
 #: what was in cash, and what was standing in each bucket.
 TRACE_FIELDS = ("step", "equity", "cash", "safe", "active", "experimental")
+
+# ── the alpha budget: what a measured panic may move ────────────────────────
+
+#: The most a panic signal may widen *its own* bucket, as a share of that bucket's
+#: target. Half, and the reason it is a share rather than a number of credits: the
+#: question the cap answers is "how much of my policy am I willing to let one measurement
+#: rewrite", and a policy that can be rewritten by half by a single reading is still a
+#: policy. At the declared targets the widest possible move is ``0.5 × 0.60 = 30 %`` of
+#: equity — and it is funded out of cash, so a book with no spare cash moves nothing at all
+#: no matter how loud the signal is (:data:`ALPHA_CASH_FLOOR`).
+ALPHA_BOOST_CAP = 0.5
+
+#: The share of equity the book never spends, however loud a signal is. A panic is an
+#: argument for *using cash*, never for having none: the whole point of the bucket split
+#: is that capital which has not been committed is the only capital that can answer a
+#: surprise, and the largest surprise in this market is a protocol that stops paying.
+ALPHA_CASH_FLOOR = 0.05
 
 
 class PortfolioError(RuntimeError):
@@ -470,6 +496,71 @@ class Holding:
         return self.protocol.address
 
 
+# ── reading a signal the book did not compute ───────────────────────────────
+
+
+def _signal_fired(signal: Any) -> bool:
+    """True when a signal says a panic is *measured now*.
+
+    The book does not import the hunter: ``volatility_hunter`` imports this file, and a
+    cycle would mean neither could be read alone. So the one fact the book needs is read
+    off the value itself — ``fired`` when the hunter's signal provides it, and otherwise
+    the verdict by name — and the two are held together by a test rather than by an
+    import, exactly as :func:`agent.physics.discovery.measure` is held to
+    :func:`agent.physics.sterility.variation`.
+    """
+    if signal is None:
+        return False
+    fired = getattr(signal, "fired", None)
+    if fired is not None:
+        return bool(fired)
+    verdict = getattr(signal, "verdict", None)
+    if verdict is None and isinstance(signal, Mapping):
+        verdict = signal.get("verdict")
+    return str(verdict or "") == "PANIC"
+
+
+def _signal_confidence(signal: Any) -> float:
+    """The signal's own 0 … 1 confidence, clamped — never a size the book invents."""
+    value = getattr(signal, "confidence", None)
+    if value is None and isinstance(signal, Mapping):
+        value = signal.get("confidence")
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return min(max(number, 0.0), 1.0)
+
+
+def _signal_name(signal: Any) -> str:
+    """The name a log line prints for a signal, whatever shape it arrived in."""
+    for attribute in ("name", "protocol", "address"):
+        value = getattr(signal, attribute, None)
+        if value:
+            return str(value)
+    if isinstance(signal, Mapping):
+        for key in ("name", "protocol", "address"):
+            if signal.get(key):
+                return str(signal[key])
+    return "unnamed"
+
+
+def _signal_bucket(signal: Any) -> str:
+    """The bucket a signal asks to widen — a name, or nothing the book will honour.
+
+    Read off the value rather than imported for the reason :func:`_signal_fired` gives, and
+    an unknown bucket is *ignored* rather than raised: a measurement may name a bucket this
+    book does not keep, and a strategy that crashed on one would be a strategy that cannot
+    be pointed at a second venue.
+    """
+    value = getattr(signal, "bucket", None)
+    if not value and isinstance(signal, Mapping):
+        value = signal.get("bucket")
+    return str(value or "").strip().lower()
+
+
 # ── the portfolio: three buckets, a cap, and an accounting ───────────────────
 
 
@@ -519,6 +610,7 @@ class Portfolio:
     watchlist: Optional["Watchlist"] = None
     execution_whitelist: Optional[WhiteList] = None
     execution_limit: int = EXECUTION_LIMIT
+    alpha_log: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.provider is None:
@@ -811,8 +903,104 @@ class Portfolio:
             self._close(key, step, reason, taken=credits)
         return float(raised)
 
+    # -- the alpha budget: what a measured panic may move ------------------- #
+
+    def alpha_capacity(self) -> float:
+        """The share of equity this book may still commit: cash above the floor.
+
+        Not "cash": a book whose cash is already at the floor has nothing to answer a
+        panic with, and a book that spends the floor to buy a panic is a book that has
+        converted a measured opportunity into an unhedged position. The number is
+        computed from the *current* book, so it shrinks as the boost is spent.
+        """
+        equity = max(float(self.equity), 1e-12)
+        return max(float(self.cash) / equity - float(ALPHA_CASH_FLOOR), 0.0)
+
+    def alpha_hunting_weight(self, signal: Any, *, step: int = 0) -> float:
+        """The multiplier a panic signal puts on its bucket's target — the strategy.
+
+        ``1.0`` is the answer for everything that is not a fired signal, and that is the
+        whole of the safety argument: a book with no measurement behaves exactly as it
+        did before this method existed. A fired signal buys at most
+        :data:`ALPHA_BOOST_CAP` of its bucket, scaled by the signal's own ``confidence``,
+        so the two numbers that decide the size are *the cap* (policy, declared here) and
+        *the measurement* (the ``z`` and the size of the dislocation, computed in
+        :mod:`agent.physics.volatility_hunter`).
+
+        The boost is temporary by construction rather than by a timer: nothing here is
+        stored, permissioned or remembered, and the weight is a function of a signal that
+        is itself a function of the last
+        :data:`~agent.physics.volatility_hunter.PANIC_RECENT` days. When the dislocation
+        closes the signal stops firing and the weight returns to one on the next review,
+        without anyone having to remember to undo it.
+        """
+        if not _signal_fired(signal):
+            return 1.0
+        return 1.0 + float(ALPHA_BOOST_CAP) * _signal_confidence(signal)
+
+    def boosted_targets(
+        self, signals: Optional[Sequence[Any]] = None, *, step: int = 0
+    ) -> Dict[str, float]:
+        """The bucket targets with every fired panic priced in — what ``rebalance`` takes.
+
+        Three limits, and each one is a different fear:
+
+        * the **cap** (:data:`ALPHA_BOOST_CAP`) — one measurement may rewrite at most
+          half of its own bucket, and never another bucket's;
+        * the **cash floor** (:data:`ALPHA_CASH_FLOOR`) — the boost is funded out of cash
+          the book is holding, so the sum of the targets may exceed one while the book
+          can never run out of the capital that answers a surprise;
+        * the **order** — when the floor binds, the strongest signal is served first, so
+          the room goes to the loudest *measurement* rather than to the first name in a
+          list.
+
+        Everything granted is appended to :attr:`alpha_log` with the numbers that granted
+        it, because a book that moved a tenth of its equity on a measurement should be
+        able to say which measurement.
+        """
+        base = {bucket: float(value) for bucket, value in self.targets.items()}
+        targets = dict(base)
+        capacity = self.alpha_capacity()
+        if capacity <= 0.0:
+            return targets
+        ranked = sorted(
+            (signal for signal in (signals or ()) if _signal_fired(signal)),
+            key=lambda signal: (-_signal_confidence(signal), str(_signal_name(signal))),
+        )
+        granted_by: Dict[str, float] = {}
+        for signal in ranked:
+            bucket = _signal_bucket(signal)
+            if bucket not in targets:
+                continue
+            weight = self.alpha_hunting_weight(signal, step=step)
+            want = (weight - 1.0) * base[bucket]
+            ceiling = float(ALPHA_BOOST_CAP) * base[bucket] - granted_by.get(bucket, 0.0)
+            grant = min(want, max(ceiling, 0.0), capacity)
+            if grant <= 0.0:
+                continue
+            granted_by[bucket] = granted_by.get(bucket, 0.0) + grant
+            targets[bucket] = targets[bucket] + grant
+            capacity -= grant
+            self.alpha_log.append(
+                {
+                    "step": int(step),
+                    "bucket": bucket,
+                    "protocol": _signal_name(signal),
+                    "confidence": round(_signal_confidence(signal), 4),
+                    "weight": round(weight, 4),
+                    "wanted": round(want, 6),
+                    "granted": round(grant, 6),
+                    "capacity_left": round(capacity, 6),
+                }
+            )
+        return targets
+
     def rebalance(
-        self, plan: Mapping[str, Optional[Protocol]], *, step: int = 0
+        self,
+        plan: Mapping[str, Optional[Protocol]],
+        *,
+        step: int = 0,
+        targets: Optional[Mapping[str, float]] = None,
     ) -> Dict[str, float]:
         """Bring each bucket to its target, with ``plan`` naming where it may stand.
 
@@ -824,11 +1012,21 @@ class Portfolio:
         The trim band is why a bucket that is a little over its target is left alone: at
         ten percent of equity, a trim of less than :data:`TRIM_BAND` of the whole empire
         costs a trade to move nothing.
+
+        ``targets`` is how a *temporary* policy gets in: with ``None`` the book uses its
+        own numbers, exactly as it always has, and with a mapping —
+        :meth:`boosted_targets` is the one this file produces — the same arithmetic runs
+        against those instead. That is deliberate: a panic does not get its own code path
+        through the accounting, it gets a bigger number in the same one.
         """
+        scale = dict(self.targets) if targets is None else dict(targets)
+        missing = [bucket for bucket in BUCKETS if bucket not in scale]
+        if missing:
+            raise PortfolioError(f"targets must name every bucket, missing {missing}")
         placed: Dict[str, float] = {}
         for bucket in BUCKETS:
             chosen = plan.get(bucket)
-            target = float(self.targets[bucket]) * self.equity
+            target = float(scale[bucket]) * self.equity
             for key in list(self.holdings):
                 holding = self.holdings[key]
                 if holding.protocol.bucket != bucket:
@@ -1213,6 +1411,13 @@ class Empire:
     (:meth:`Portfolio.discover`). Nothing else changes: the verdicts are the same verdicts
     on the same records, and a protocol the scanner never watched was never judged — the
     report says so as ``truncated`` rather than pretending it was refused.
+
+    The sixth is optional and inert by default: ``alpha`` is a list of *signals* the caller
+    measured — the ``PanicSignal`` values of :mod:`agent.physics.volatility_hunter`, or
+    anything shaped like them — and :meth:`_targets_with_alpha` is the only place they touch
+    capital. They can re-weight a bucket the plan already chose and nothing else, so the
+    hunter cannot name a protocol, cannot widen a whitelist, and cannot size a position
+    beyond the book's own cap.
     """
 
     market: Optional[ProtocolMarket]
@@ -1232,6 +1437,7 @@ class Empire:
     resonance: Optional[float] = None
     scanner: Any = None
     funnel: Optional[Dict[str, Any]] = None
+    alpha: Optional[Sequence[Any]] = None
 
     def __post_init__(self) -> None:
         """Hand the one venue to the book, or refuse two of them.
@@ -1415,7 +1621,9 @@ class Empire:
                 continue
             best = max(admissible, key=lambda item: (item.implied_apy, item.name))
             plan[bucket] = self.provider.protocol(best.name)
-        placed = self.portfolio.rebalance(plan, step=self.step)
+        placed = self.portfolio.rebalance(
+            plan, step=self.step, targets=self._targets_with_alpha()
+        )
         measured = {name: item.as_dict() for name, item in found.items()}
         self.resonance = self._resonance_of(plan, measured)
         self.assessments[self.step] = measured
@@ -1449,6 +1657,25 @@ class Empire:
         self.decisions.append(decision)
         self.log.append({"step": int(self.step), "action": "review", **decision})
         return decision
+
+    def _targets_with_alpha(self) -> Optional[Dict[str, float]]:
+        """The book's targets with today's measured panics priced in — or ``None``.
+
+        ``alpha`` is how the hunter (:mod:`agent.physics.volatility_hunter`) reaches the
+        manager: the caller hands over the signals it measured — ``PanicSignal`` values,
+        mappings, or nothing at all — and this is the only place they are allowed to touch
+        capital. A signal cannot name a protocol, cannot add an address to a whitelist and
+        cannot size a position: it can only *re-weight* buckets the plan already chose, via
+        :meth:`Portfolio.boosted_targets`, which is bounded by the cap and the cash floor.
+
+        ``None`` is the answer when there is nothing to price in, and ``None`` means
+        :meth:`Portfolio.rebalance` uses the book's own targets — so an empire with no
+        hunter attached behaves exactly as it did before this method existed.
+        """
+        signals = [signal for signal in (self.alpha or ()) if signal is not None]
+        if not signals:
+            return None
+        return self.portfolio.boosted_targets(signals, step=self.step)
 
     def _submit_proofs(
         self, found: Mapping[str, Any], convictions: Sequence[str]
