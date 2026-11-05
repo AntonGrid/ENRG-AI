@@ -1102,6 +1102,11 @@ def plot_funnel(
     a market. The reasons are necessarily a subset of level 1's loss: level 2's refusals
     are verdicts, and a verdict is not a one-line reason.
 
+    The stage names run down the left edge as tick labels and only the count sits at the
+    end of its own bar. That is not decoration: the last stages of a funnel are the short
+    ones, and a name written *inside* its bar lands on top of the number precisely where
+    the number is the news.
+
     Everything is duck-typed: nothing here imports ``discovery``, ``portfolio`` or
     ``risk_assessment``, so a figure can be drawn from a plain list of tuples in a test
     and cannot make the plotting layer a dependency of the decision layer.
@@ -1142,7 +1147,7 @@ def plot_funnel(
         edgecolor="#1b2631",
         linewidth=0.8,
     )
-    for position, (label, count), width in zip(positions, rows, counts):
+    for position, width, count in zip(positions, counts, (row[1] for row in rows)):
         left.text(
             width + top * 0.012,
             position,
@@ -1151,14 +1156,6 @@ def plot_funnel(
             fontsize=11,
             fontweight="bold",
             color="#1b2631",
-        )
-        left.text(
-            top * 0.015,
-            position,
-            label,
-            va="center",
-            fontsize=9.5,
-            color="white" if width > top * 0.2 else "#1b2631",
         )
     for index in range(len(rows) - 1):
         dropped = int(rows[index][1]) - int(rows[index + 1][1])
@@ -1178,7 +1175,7 @@ def plot_funnel(
             arrowprops={"arrowstyle": "->", "color": "#b03a2e", "linewidth": 0.9},
         )
     left.set_xlim(0.0, top * 1.24)
-    left.set_yticks([])
+    left.set_yticks(positions, [row[0] for row in rows], fontsize=9.5)
     left.set_xlabel("protocols")
     left.set_title(title, fontsize=11, loc="left")
     left.grid(axis="x", alpha=0.25)
