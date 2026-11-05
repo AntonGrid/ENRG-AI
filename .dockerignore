@@ -1,0 +1,25 @@
+# What the image does not need.
+.git
+.gitignore
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.cache
+data
+*.log
+
+# Secrets never enter a layer. `.env` is gitignored already; this makes the
+# build context honour the same rule, so `docker build` cannot bake a key.
+.env
+.env.local
+
+# Not needed to run the package, and large.
+notebooks
+docs
+projects
+*.png
+ANALYSIS_AND_PLAN.md
+GLOBAL_AI_ARCHITECTURE.md
+MISSION.md

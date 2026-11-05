@@ -464,6 +464,135 @@ def test_a_node_that_does_not_answer_is_unavailable():
     assert "127.0.0.1" in str(raised.value)
 
 
+# ── the L2 profile: a spelling, not a permission ────────────────────────────
+#
+# Real gas prices make a small trade uneconomic on Ethereum and cheap on an L2, so the
+# operator must be able to switch networks by editing variables and nothing else. What
+# the profile is *not* allowed to do is make a real-money chain easier to sign on: the
+# tests below hold both halves of that sentence.
+
+ARBITRUM = 42161
+ARBITRUM_SEPOLIA = 421614
+
+
+def test_a_profile_supplies_the_chain_id_and_accepts_its_own_spellings():
+    """``TESTNET_PROFILE=arbitrum`` and the names the node provider handed out."""
+    config = NetConfig.from_env(
+        {
+            "TESTNET_PROFILE": "arbitrum",
+            "ARBITRUM_RPC_URL": "http://arb.example/v3/secret-key-in-the-path",
+            "ARBITRUM_PRIVATE_KEY": KEY,
+        }
+    )
+    assert config.profile == "arbitrum"
+    assert config.chain_id == ARBITRUM == T.L2_PROFILES["arbitrum"]
+    assert config.rpc_host == "arb.example"
+    assert config.can_sign and config.private_key == KEY
+
+    # Provenance, in names: the report can say where each value came from, and the
+    # report still carries neither the endpoint nor the key.
+    assert config.sources == {
+        "TESTNET_RPC_URL": "ARBITRUM_RPC_URL",
+        "TESTNET_PRIVATE_KEY": "ARBITRUM_PRIVATE_KEY",
+    }
+    line = config.describe()
+    assert line["profile"] == "arbitrum" and line["chain_id"] == ARBITRUM
+    printed = json.dumps(line)
+    assert "secret-key-in-the-path" not in printed and KEY not in printed
+    assert "abab" in printed  # the mask, and no more
+
+
+def test_a_chain_id_in_the_profile_spelling_wins_over_the_preset():
+    """A preset is a default, not a verdict: Arbitrum Sepolia is still reachable."""
+    config = NetConfig.from_env(
+        {
+            "TESTNET_PROFILE": "arbitrum",
+            "ARBITRUM_RPC_URL": "http://arb.example/v3/k",
+            "ARBITRUM_CHAIN_ID": str(ARBITRUM_SEPOLIA),
+        }
+    )
+    assert config.chain_id == ARBITRUM_SEPOLIA
+    assert config.sources["TESTNET_CHAIN_ID"] == "ARBITRUM_CHAIN_ID"
+    assert ARBITRUM_SEPOLIA not in MAINNET_CHAIN_IDS
+
+
+def test_a_canonical_name_wins_over_the_profile_spelling():
+    """One value, from one variable — the canonical one, when both are set."""
+    config = NetConfig.from_env(
+        {
+            "TESTNET_PROFILE": "arbitrum",
+            "TESTNET_RPC_URL": "http://canon.example/v3/k",
+            "TESTNET_CHAIN_ID": "5",
+            "TESTNET_PRIVATE_KEY": KEY,
+            "ARBITRUM_RPC_URL": "http://arb.example/v3/k",
+            "ARBITRUM_CHAIN_ID": str(ARBITRUM),
+        }
+    )
+    assert config.rpc_host == "canon.example"
+    assert config.chain_id == 5
+    assert config.sources == {}
+
+
+def test_a_profile_does_not_unlock_a_chain_where_credits_are_money(world):
+    """An L2 is cheap, not free: 42161 is a mainnet here and still needs both yeses."""
+    world.chain = ARBITRUM
+    env = venue_env(TESTNET_PROFILE="arbitrum")
+    env.pop("TESTNET_RPC_URL")
+    env["ARBITRUM_RPC_URL"] = "http://arb.example/v3/k"
+
+    with pytest.raises(NetNotConfigured) as raised:
+        RealTestnetProvider(env=env, web3=FakeWeb3(world)).get_protocol_list()
+    assert "mainnet" in str(raised.value)
+    assert "TESTNET_ALLOW_MAINNET" in str(raised.value)
+
+    # and with both yeses the venue answers on the chain the profile named
+    allowed = RealTestnetProvider(
+        env=dict(env, TESTNET_ALLOW_MAINNET="1"),
+        web3=FakeWeb3(world),
+        allow_mainnet=True,
+    )
+    assert allowed.describe()["chain_id"] == ARBITRUM
+    assert allowed.config.profile == "arbitrum"
+
+
+def test_an_unknown_profile_is_a_named_error():
+    """A typo must not quietly leave the venue on some other chain."""
+    with pytest.raises(NetNotConfigured) as raised:
+        NetConfig.from_env(
+            {
+                "TESTNET_PROFILE": "optimism",
+                "OPTIMISM_RPC_URL": "http://op.example/v3/k",
+            }
+        )
+    message = str(raised.value)
+    assert "TESTNET_PROFILE" in message and "arbitrum" in message
+
+
+def test_a_bare_rpc_url_or_private_key_is_not_an_alias():
+    """A stray variable from another project must not become a signer."""
+    stray = {
+        "RPC_URL": "http://other.example/v3/k",
+        "PRIVATE_KEY": KEY,
+        "CHAIN_ID": str(ARBITRUM),
+    }
+    with pytest.raises(NetNotConfigured) as raised:
+        NetConfig.from_env(stray)
+    assert "TESTNET_RPC_URL" in str(raised.value)
+    with pytest.raises(NetNotConfigured):
+        NetConfig.from_env(dict(stray, TESTNET_PROFILE="arbitrum"))
+
+
+def test_no_chain_id_is_written_into_the_venue_by_default():
+    """Chain-agnostic by construction: an id that is not given is not invented."""
+    config = NetConfig.from_env({"TESTNET_RPC_URL": "http://any.example/v3/k"})
+    assert config.chain_id is None and config.profile == ""
+    assert config.sources == {}
+    assert "DEFAULT_CHAIN_ID" not in MODULE.read_text(encoding="utf-8")
+    # the chains this project recommends are all in the lock, so none of them is silent
+    for chain in (ARBITRUM, 137, 8453):
+        assert chain in MAINNET_CHAIN_IDS
+
+
 # ── the clock is the chain's, and it is waited for ──────────────────────────
 
 

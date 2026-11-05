@@ -16,6 +16,10 @@ __pycache__/
 # Runtime data
 knowledge.db
 memory/
+data/
+
+# Deploy files: the operator's `.env` is private, the example is not
+!.env.example
 
 # Cache
 .pytest_cache/

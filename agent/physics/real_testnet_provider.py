@@ -43,6 +43,12 @@ with a name, never a silent fallback.
 ``TESTNET_UNLOCKED_ACCOUNT``   an address the *node* signs for (Anvil, Hardhat).
                                Alternative to a key; the key never leaves the box.
 ``TESTNET_CHAIN_ID``           asserted against the node's own chain id.
+``TESTNET_PROFILE``            ``arbitrum``, ``base``, ``polygon`` or ``sepolia``: the
+                               chain's *name*, so the names a node provider hands out
+                               (``ARBITRUM_RPC_URL``, ``ARBITRUM_PRIVATE_KEY``,
+                               ``ARBITRUM_CHAIN_ID``) can answer for the canonical
+                               ones and the id need not be written down. A spelling,
+                               never a permission — an L2 is still a mainnet here.
 ``TESTNET_PROTOCOLS_FILE``     path to the operator's address book (JSON).
 ``TESTNET_PROTOCOLS``          the same book inline, as JSON.
 ``TESTNET_DECIMALS``           credits per unit (default ``6``, a USDC-like token).
@@ -145,6 +151,7 @@ __all__ = [
     "TestnetNotConfigured",
     "TestnetUnavailable",
     "MAINNET_CHAIN_IDS",
+    "L2_PROFILES",
     "YIELD_EVENT_SIGNATURE",
 ]
 
@@ -162,6 +169,22 @@ ENV_RECEIPT_TIMEOUT = "TESTNET_RECEIPT_TIMEOUT"
 ENV_BLOCK_TIMEOUT = "TESTNET_BLOCK_TIMEOUT"
 ENV_ALLOW_MAINNET = "TESTNET_ALLOW_MAINNET"
 ENV_ABI_FILE = "TESTNET_ABI_FILE"
+ENV_PROFILE = "TESTNET_PROFILE"
+
+#: The chains this venue knows by name, and nothing else about them. A profile is a
+#: **spelling plus a chain id**: ``TESTNET_PROFILE=arbitrum`` lets the operator keep the
+#: names their node provider gave them (``ARBITRUM_RPC_URL``, ``ARBITRUM_PRIVATE_KEY``,
+#: ``ARBITRUM_CHAIN_ID``) and supplies ``42161`` when the id is not written down. It is
+#: not a permission: every L2 here is in :data:`MAINNET_CHAIN_IDS`, so signing on it
+#: still needs *both* yeses, and a profile never changes a timeout, a decimal count or
+#: the whitelist. A bare ``RPC_URL`` / ``PRIVATE_KEY`` is deliberately **not** an alias
+#: — a stray variable from another project must not be able to become a signer.
+L2_PROFILES: Dict[str, int] = {
+    "arbitrum": 42161,  # Arbitrum One: the cheap seat, ~30x fewer wei per transaction
+    "base": 8453,  # Base
+    "polygon": 137,  # Polygon PoS
+    "sepolia": 11155111,  # the testnet this file was written against
+}
 
 #: Credits per token unit when nobody says otherwise: a USDC-like token, because a
 #: credit is a cent-shaped thing and six decimals is what a test stablecoin has.
@@ -609,6 +632,13 @@ class TestnetConfig:
     private_key: str = field(default="", repr=False)
     unlocked_account: str = ""
     chain_id: Optional[int] = None
+    #: ``TESTNET_PROFILE``: the chain's name, if the operator named one. Supplies the
+    #: chain id and the spelling of the node/signer variables — never a permission.
+    profile: str = ""
+    #: Which variable actually answered, when it was not the canonical ``TESTNET_*``
+    #: name (``{"TESTNET_RPC_URL": "ARBITRUM_RPC_URL"}``). Provenance, not secrets:
+    #: names only, so a report can say where a signer came from.
+    sources: Dict[str, str] = field(default_factory=dict)
     book: ProtocolBook = field(default_factory=ProtocolBook)
     decimals: int = DEFAULT_DECIMALS
     lookback: int = DEFAULT_LOOKBACK
@@ -618,14 +648,37 @@ class TestnetConfig:
     abi: Optional[List[Dict[str, Any]]] = None
 
     def __post_init__(self) -> None:
+        # A profile is resolved before anything is validated, because it is allowed to
+        # supply exactly one value: which chain this is. A misspelt profile is a named
+        # error rather than a silent testnet, so a typo cannot quietly point the venue
+        # at the wrong network.
+        profile = _clean(self.profile).lower()
+        if profile:
+            if profile not in L2_PROFILES:
+                raise TestnetNotConfigured(
+                    f"{ENV_PROFILE}={self.profile!r} is not one of: "
+                    + ", ".join(sorted(L2_PROFILES))
+                )
+            if self.chain_id is None:
+                object.__setattr__(self, "chain_id", int(L2_PROFILES[profile]))
+        object.__setattr__(self, "profile", profile)
+        object.__setattr__(
+            self, "sources", {str(k): str(v) for k, v in dict(self.sources).items()}
+        )
+
+        # The name that answered, so an error about a value from an alias sends the
+        # operator to the variable they actually set.
+        named_rpc = self.sources.get(ENV_RPC, ENV_RPC)
+        named_key = self.sources.get(ENV_KEY, ENV_KEY)
+
         url = _clean(self.rpc_url)
         if not url:
             raise TestnetNotConfigured(
-                f"no node: set {ENV_RPC} (this venue has no default endpoint)"
+                f"no node: set {named_rpc} (this venue has no default endpoint)"
             )
         if "://" not in url:
             raise TestnetNotConfigured(
-                f"{ENV_RPC} must carry a scheme (http, https or ws), got {url!r}"
+                f"{named_rpc} must carry a scheme (http, https or ws), got {url!r}"
             )
         object.__setattr__(self, "rpc_url", url)
 
@@ -633,7 +686,7 @@ class TestnetConfig:
         if key and not _is_private_key(key):
             # Never echo the value: a wrong key is still a key.
             raise TestnetNotConfigured(
-                f"{ENV_KEY} is not 32 bytes of hex (its length is {len(key)})"
+                f"{named_key} is not 32 bytes of hex (its length is {len(key)})"
             )
         object.__setattr__(self, "private_key", key)
 
@@ -674,20 +727,53 @@ class TestnetConfig:
         must ask for it. An operator who exported the variable months ago should not be
         one forgotten argument away from signing on Ethereum, and a run that asks for
         it should not be one exported variable away from the same.
+
+        ``TESTNET_PROFILE`` is a *spelling*, not a permission. Naming a chain
+        (``arbitrum``) lets the names an operator already has exported answer for the
+        ``TESTNET_*`` ones — ``ARBITRUM_RPC_URL`` for ``TESTNET_RPC_URL``, and the same
+        for the signer, the unlocked account and the chain id — and supplies the chain
+        id when it is not written down. The canonical name always wins, and whichever
+        name answered is recorded in :attr:`sources`, so nothing about a signer's
+        provenance is left to be guessed. An L2 named here is still a chain where
+        credits are money, so it is still refused without both yeses.
         """
         if env is None:
             _load_dotenv_once()
         source: Mapping[str, str] = os.environ if env is None else env
         requested = bool(overrides.pop("allow_mainnet", False))
+
+        profile_name = _clean(source.get(ENV_PROFILE)).lower()
+        if profile_name and profile_name not in L2_PROFILES:
+            raise TestnetNotConfigured(
+                f"{ENV_PROFILE}={profile_name!r} is not one of: "
+                + ", ".join(sorted(L2_PROFILES))
+            )
+        prefix = f"{profile_name.upper()}_" if profile_name else ""
+        sources: Dict[str, str] = {}
+
+        def ask(canonical: str) -> str:
+            """The canonical variable, or the profile's spelling of it — never both."""
+            value = _clean(source.get(canonical))
+            if value or not prefix:
+                return value
+            alias = prefix + canonical[len("TESTNET_") :]
+            answer = _clean(source.get(alias))
+            if answer:
+                sources[canonical] = alias
+            return answer
+
+        chain_text = ask(ENV_CHAIN_ID)
         values: Dict[str, Any] = {
-            "rpc_url": source.get(ENV_RPC, ""),
-            "private_key": source.get(ENV_KEY, ""),
-            "unlocked_account": source.get(ENV_UNLOCKED, ""),
+            "rpc_url": ask(ENV_RPC),
+            "private_key": ask(ENV_KEY),
+            "unlocked_account": ask(ENV_UNLOCKED),
             "chain_id": (
-                _int_or(source.get(ENV_CHAIN_ID), 0, ENV_CHAIN_ID)
-                if _clean(source.get(ENV_CHAIN_ID))
-                else None
+                _int_or(chain_text, 0, sources.get(ENV_CHAIN_ID, ENV_CHAIN_ID))
+                if chain_text
+                else (int(L2_PROFILES[profile_name]) if profile_name else None)
             ),
+            "profile": profile_name,
+            "sources": sources,
             "book": ProtocolBook.from_env(source),
             "decimals": _int_or(
                 source.get(ENV_DECIMALS), DEFAULT_DECIMALS, ENV_DECIMALS
@@ -741,6 +827,8 @@ class TestnetConfig:
                 else ("key " + self.masked_key if self.private_key else "read-only")
             ),
             "chain_id": self.chain_id,
+            "profile": self.profile or None,
+            "sources": dict(self.sources),
             "decimals": int(self.decimals),
             "lookback": int(self.lookback),
             "protocols": len(self.book),

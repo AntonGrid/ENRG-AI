@@ -1,0 +1,81 @@
+# ENRG-AI on a single VPS.
+#
+#   cp .env.example .env      # fill in only what the workload needs
+#   docker compose up -d --build
+#   docker compose logs -f trainer
+#
+# Two services share one image. `trainer` is the long-running one (the
+# background self-training loop); `coherence` is a one-shot job behind the
+# `jobs` profile, so `docker compose up` never runs it by accident:
+#
+#   docker compose run --rm coherence
+#   docker compose run --rm trainer python -m agent.forecast --source offline --output /data/forecast.json
+#
+# Compose v2 (`docker compose`) is assumed; every key here exists in 2.20+
+name: enrg-ai
+
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enrg-ai:local
+    # `.env` is gitignored and is where the operator's values live. It must
+    # exist: `cp .env.example .env` is step one of every deployment.
+    env_file:
+      - .env
+    environment:
+      ENRG_CACHE_DIR: /data/.cache
+    volumes:
+      - ./data:/data
+    command:
+      - python
+      - -m
+      - agent.digital_train.pipeline
+      - --loop
+      - --interval
+      - "${TRAIN_INTERVAL:-3600}"
+      - --state
+      - /data/digital_state.json
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One shot, on demand: the same seam the notebook shows, written as a file.
+  # `--source online` reads the live oracle and degrades to the deterministic
+  # park when the oracle is unreachable, so the job always produces an answer.
+  coherence:
+    profiles:
+      - jobs
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enrg-ai:local
+    env_file:
+      - .env
+    environment:
+      ENRG_CACHE_DIR: /data/.cache
+    volumes:
+      - ./data:/data
+    command:
+      - python
+      - -m
+      - agent.physics
+      - --source
+      - online
+      - --output
+      - /data/coherence.json
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

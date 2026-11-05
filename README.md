@@ -621,6 +621,304 @@ python -m agent.main
 pytest
 ```
 
+## Production Readiness
+
+What is already a property of the code, what an operator must supply, and what
+this repository still does not have. Written for one VPS, because that is the
+size of the thing: nothing here needs a cluster, a broker or a database.
+
+### What is ready
+
+* **One process, no services of its own.** The package is pure Python
+  (`requires-python >= 3.10`, 3.12 tested) and **opens no port**: every entry
+  point is a module run (`python -m agent.<module>`). State is a JSON file whose
+  path is an argument, so "deploy" is a checkout, a venv and a unit file.
+* **A working offline mode.** `--offline` on the self-training loop, the
+  coherence CLI and the forecast CLI yields the same numbers every time with no
+  egress at all — a box with a broken route still trains, forecasts and reports
+  instead of idling.
+* **No secrets in the tree.** No endpoint, no key and no address is written in
+  the source: `RealTestnetProvider` reads the environment and nothing else, and
+  a test parses the module to prove it. `describe()` prints the RPC *host* and a
+  masked signer, because a report usually ends up somewhere shared.
+* **One seam for every venue.** `IWeb3Provider` is five operations and three
+  facts; a mock, a local Anvil and Sepolia are one constructor argument apart.
+  Nothing above the seam knows which one it has, so the same code that runs in
+  the tests runs on a chain.
+* **A cost model that refuses rather than hopes.** `TransactionCostAnalyzer`
+  prices gas and slippage (92 000 gas × 2 gwei × $3 000 = **$0.5520** a
+  transaction on Ethereum, **$0.00276** on an L2 at 0.01 gwei) and `Portfolio`
+  refuses an entry whose net alpha is below the floor, recording it in `cost_log`
+  / `friction_summary()`. Exits are never refused and never charged: the kill
+  switch is not hostage to a gas estimate.
+* **A venue switched by variables, not by code.** No chain id is written into the
+  provider: `TESTNET_CHAIN_ID` is read and asserted, and
+  `TESTNET_PROFILE=arbitrum` lets the names a node provider hands out
+  (`ARBITRUM_RPC_URL`, `ARBITRUM_PRIVATE_KEY`, `ARBITRUM_CHAIN_ID`) answer for the
+  canonical ones. A profile is a spelling, not a permission — 42161, 137 and 8453
+  are in the mainnet lock, so an L2 still needs both yeses to sign.
+* **A suite that runs like a deployment.** 692 tests, no network, no key, no
+  chain; a live chain is an extra (`pip install 'enrg-ai[testnet]'`) and the
+  Anvil tests skip by name when foundry is absent.
+
+### Why an L2, in one measurement
+
+TCA priced the *trade*, not the idea: on Ethereum, 92 000 gas at 2 gwei and
+$3 000/ETH is **$0.5520** before the position exists, which is why the floor in
+`Portfolio` refused most small entries there. The same call on Arbitrum One, at
+~0.01 gwei, is **$0.00276** of execution gas:
+
+| Where | gas price | 92 000 gas costs | a $50 entry |
+|---|---|---|---|
+| Ethereum L1 | 2 gwei | $0.5520 | refused — 1.1 % of the ticket is friction |
+| Arbitrum One | 0.02 gwei | $0.00552 | admissible — 0.011 % |
+| Arbitrum One | 0.01 gwei | $0.00276 | admissible — 0.0055 % |
+
+Two honest footnotes. A rollup also charges an **L1 data fee** for the calldata it
+posts — a few cents for a stake, in practice — which this model does not price, so
+read the L2 column as "cents, not half a dollar". And the model is a parameter,
+not a religion: `TransactionCostAnalyzer(gas_price_gwei=0.01)` is exactly how the
+number above was produced, and `friction_summary()` reports what the floor
+actually refused.
+
+### How to deploy on a VPS (Arbitrum One), no Docker
+
+#### 1. The box
+
+Any VPS with Ubuntu 22.04 (24.04 also tested), 2 vCPU / 2 GB RAM / 20 GB SSD is
+more than enough: the agent opens **no port** and needs no database. Work as a
+non-root user, keep the key out of `root`'s environment, and open nothing inbound:
+
+```bash
+sudo adduser --disabled-password --gecos "" enrg
+sudo install -d -o enrg -g enrg /opt/ENRG-AI /var/lib/enrg-ai
+sudo ufw allow OpenSSH && sudo ufw enable     # SSH only: nothing here listens
+```
+
+#### 2. Python, git, the venv
+
+```bash
+sudo apt update && sudo apt install -y python3 python3-venv python3-pip git
+sudo -iu enrg
+git clone https://github.com/AntonGrid/ENRG-AI.git /opt/ENRG-AI && cd /opt/ENRG-AI
+python3 -m venv .venv && . .venv/bin/activate
+pip install -U pip && pip install '.[testnet,market,plot]'
+pytest -q                                   # 692 passed, no network, no key
+cp .env.example .env && chmod 600 .env      # fill in only what you need
+```
+
+A smoke test that touches no money — three CLIs, deterministic, offline:
+
+```bash
+python -m agent.physics --source offline --output coherence.json
+python -m agent.forecast --source offline --horizon 6 --output forecast.json
+python -m agent.digital_train.pipeline --once --offline --points 48 \
+       --state /var/lib/enrg-ai/digital_state.json
+```
+
+#### 3. `.env` — a real Arbitrum node and a funded key
+
+An endpoint from Infura, Alchemy or the public `https://arb1.arbitrum.io/rpc`, and
+a **fresh** address for the signer:
+
+```ini
+# which chain: the profile names it, and the ARBITRUM_* names may answer for TESTNET_*
+TESTNET_PROFILE=arbitrum
+# the node (this string usually contains an API key — it is a secret too)
+TESTNET_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY_HERE
+# the signer: a dedicated address, funded with what you can afford to lose
+TESTNET_PRIVATE_KEY=0x...
+# asserted against the node's own chain id; 42161 = Arbitrum One (empty = trust the node)
+TESTNET_CHAIN_ID=42161
+# the whitelist: nothing outside this book can be staked into
+TESTNET_PROTOCOLS_FILE=book.json
+# still 0: 42161 is a chain where credits are money, and the other half of the lock is in code
+TESTNET_ALLOW_MAINNET=0
+```
+
+The three names a node provider prints — `ARBITRUM_RPC_URL`,
+`ARBITRUM_PRIVATE_KEY`, `ARBITRUM_CHAIN_ID` — are honoured as well, which is what
+`TESTNET_PROFILE` buys: the canonical `TESTNET_*` name wins when both are set, and
+`describe()` records which one answered (`{"TESTNET_RPC_URL":
+"ARBITRUM_RPC_URL"}`), so provenance is never guessed. A bare `RPC_URL` or
+`PRIVATE_KEY` is deliberately **not** an alias: a stray variable from another
+project must not be able to become a signer.
+
+Then the chain, read-only, *before* anything signs:
+
+```python
+from agent.physics import RealTestnetProvider
+
+provider = RealTestnetProvider.from_env()   # no node => TestnetNotConfigured, never a default
+print(provider.describe())
+# {'rpc_host': 'arb-mainnet.g.alchemy.com', 'signer': 'read-only', 'chain_id': 42161,
+#  'profile': 'arbitrum', 'sources': {}, 'decimals': 6, ...}
+for p in provider.get_protocol_list():
+    print(p.name, f"{p.claim_apy:.1%}")
+print(provider.dry_run("stake", "<vault from your book>", 250.0))   # nothing is signed
+```
+
+Signing on 42161 needs **both** yeses — `TESTNET_ALLOW_MAINNET=1` in `.env` *and*
+`allow_mainnet=True` in the calling code. Run on Arbitrum Sepolia (421614) first
+if you want the loop to sign without a lock, then switch two variables.
+
+#### 4. Run it forever: systemd
+
+A unit file at `/etc/systemd/system/enrg-ai-trainer.service` — this is the part
+that outlives your laptop, your SSH session and a reboot:
+
+```ini
+[Unit]
+Description=ENRG-AI self-training loop
+After=network-online.target
+
+[Service]
+User=enrg
+WorkingDirectory=/opt/ENRG-AI
+EnvironmentFile=/opt/ENRG-AI/.env
+ExecStart=/opt/ENRG-AI/.venv/bin/python -m agent.digital_train.pipeline \
+          --loop --interval 3600 --state /var/lib/enrg-ai/digital_state.json
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/enrg-ai
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo chown enrg:enrg /opt/ENRG-AI/.env && sudo chmod 600 /opt/ENRG-AI/.env
+sudo systemctl daemon-reload && sudo systemctl enable --now enrg-ai-trainer
+journalctl -u enrg-ai-trainer -f
+```
+
+#### 5. The fast way: tmux (a look, not a deployment)
+
+```bash
+tmux new -s enrg
+cd /opt/ENRG-AI && . .venv/bin/activate
+set -a && . ./.env && set +a         # export the file into this shell only
+python -m agent.digital_train.pipeline --loop --interval 3600 \
+       --state /var/lib/enrg-ai/digital_state.json
+# Ctrl-b then d to detach; `tmux attach -t enrg` to look again
+```
+
+tmux survives a dropped SSH session but **not** a reboot, and it does not restart
+a loop that died. Use it to watch the first cycle; use the unit for the standing
+job.
+
+### Deploy with Docker
+
+```bash
+cp .env.example .env && chmod 600 .env
+docker compose up -d --build
+docker compose logs -f trainer
+docker compose run --rm coherence            # one-shot job, behind the `jobs` profile
+docker compose exec trainer pytest -q        # the suite, inside the image
+```
+
+The image is `python:3.12-slim` plus the package's extras, runs as uid `10001`,
+and holds **no key, no `.env` and no address** — both are `.dockerignore`d, so
+`docker build` cannot bake a secret into a layer. `trainer` is the long-running
+service (the self-training loop, one cycle an hour, `${TRAIN_INTERVAL}` to
+change it); `coherence` is the same seam as a one-shot job. One health check,
+and it is the honest one: the state file is written at the end of every cycle,
+so a file older than three hours means the loop is not working and compose
+restarts it.
+
+### Environment variables
+
+`TESTNET_*` is the venue (`agent/physics/real_testnet_provider.py`). Nothing in
+this table has a default that could move value: missing configuration is an
+error with a name, never a silent fallback.
+
+| Variable | Needed for | Default |
+|---|---|---|
+| `TESTNET_RPC_URL` | every chain call — **required** for a real venue | none → `TestnetNotConfigured` |
+| `TESTNET_PRIVATE_KEY` | signing capital calls | none → the venue is **read-only** |
+| `TESTNET_UNLOCKED_ACCOUNT` | signing by the node (Anvil/Hardhat) instead of a key | none |
+| `TESTNET_CHAIN_ID` | asserted against the node's own chain id; a mismatch refuses to connect | none → accepts what the node reports |
+| `TESTNET_PROFILE` | `arbitrum` (42161), `base` (8453), `polygon` (137) or `sepolia` (11155111): names the chain, so the provider's own spellings answer and the id need not be written down | unset → `TESTNET_*` only |
+| `ARBITRUM_RPC_URL` / `ARBITRUM_PRIVATE_KEY` / `ARBITRUM_CHAIN_ID` | the same three values under a node provider's names — read only when `TESTNET_PROFILE=arbitrum` **and** the canonical name is empty | the canonical name always wins |
+| `TESTNET_PROTOCOLS_FILE` / `TESTNET_PROTOCOLS` | the operator's address book — the whitelist | empty book (nothing stakeable) |
+| `TESTNET_DECIMALS` | credits per token unit | `6` |
+| `TESTNET_LOOKBACK` | blocks scanned for a record | `5000` |
+| `TESTNET_RECEIPT_TIMEOUT` | seconds to await a receipt | `120` |
+| `TESTNET_BLOCK_TIMEOUT` | seconds to await a block | `30` |
+| `TESTNET_ALLOW_MAINNET` | `1` to let a real-money chain through (with `allow_mainnet=True` in code) | unset → refused |
+| `TESTNET_ABI_FILE` | override the built-in vault ABI | built in |
+| `AXIS_AI_SIGNING_KEY` | `--sign` on `agent.signals` / `agent.physics` (base64 Ed25519 seed) | unset → `--sign` exits 2 |
+| `ENRG_CACHE_DIR` | where the market cache lives | `.cache` |
+
+The three names a deploy normally touches map straight onto that table:
+**`RPC_URL` → `TESTNET_RPC_URL`**, **`PRIVATE_KEY` → `TESTNET_PRIVATE_KEY`**,
+**`CHAIN_ID` → `TESTNET_CHAIN_ID`** — but the mapping is done by *you*, in the
+file, not by the code. The code reads the canonical names, plus (when
+`TESTNET_PROFILE` names a chain) that chain's prefixed ones. A bare `RPC_URL` or
+`PRIVATE_KEY` in the environment is ignored on purpose: another project's variable
+must never be able to become this project's signer.
+
+A `.env` file is read when `python-dotenv` is installed (the `testnet` extra); it
+is never written, and an exported variable always wins — a file that can override
+the environment is a file that can silently redirect a signer.
+
+### A real Web3 wallet is required — and it is a hot key
+
+`TESTNET_PRIVATE_KEY` is a plain EOA key in an environment variable. That is the
+weakest link in any deployment of this package, so it is stated rather than
+implied: whoever reads that variable can move everything the address holds.
+
+* **a dedicated address, funded with ~$50** — real money, and only as much as you
+  would shrug at losing: it is enough for the loop to be real (the L2 gas for
+  thousands of transactions is a few dollars) and small enough that a mistake is
+  survivable. The code does not enforce the amount; it is a rule you keep.
+* **that key is shown to nobody.** Not in a screenshot, not in a chat, not in a
+  commit, not as a `docker build --build-arg`. Everything a report needs is the
+  masked form `describe()` prints (`0x...abab`); the key itself never leaves
+  `.env`, and `.env` is `chmod 600`, owned by the service user.
+* **Sepolia or a local Anvil first** — until the whole loop has run there. A
+  mainnet chain id is refused unless `TESTNET_ALLOW_MAINNET=1` *and* the code
+  passes `allow_mainnet=True`: two keys, one lock, because the mistake this
+  guards against is expensive and one keystroke away. Arbitrum, Base and Polygon
+  are mainnets by that definition, however cheap their gas.
+* **`chmod 600 .env`**, owned by the service user; with systemd, an
+  `EnvironmentFile=` read by root; with Docker, `env_file:` (never a build
+  argument), so it stays out of every layer.
+* **one writer per key.** The nonce is dropped on any failure and re-asked from
+  the node, but it lives in memory: two processes signing with the same key
+  produce a replacement-transaction race, not a queue. Scale by adding keys, not
+  replicas.
+* **`dry_run()` before every signature** is the operator's habit, not the code's
+  guarantee: `eth_call` says whether it would revert, `estimate_gas` says what it
+  would cost, and neither creates a hash.
+* **rotation is a restart** — change the variable, restart the unit, and the old
+  key is out. There is no revocation list here; that is what the operator's
+  address book is for.
+
+### What this is not
+
+An honest list, so nothing above is read as more than it is:
+
+* **no metrics endpoint, no alerts, no tracing.** Logs go to stdout, a supervisor
+  (`systemd`, `compose restart`) is the entire availability story, and the health
+  check is a state file's mtime. Put the unit behind your own monitoring.
+* **no secret manager** — no KMS, no HSM, no multisig, no per-request key
+  scoping. An operator who needs those should keep signing in their own service
+  and hand this package a provider.
+* **no lock file** — dependencies are floors in `pyproject.toml`, so a rebuild can
+  move them. `pip freeze > constraints.txt` on the box that works, and rebuild
+  from that.
+* **state is local JSON** (`digital_state.json`, `.cache/`) — back it up or lose
+  the accumulated history.
+* **nothing here is a trading bot.** There is no scheduler in the venue, one call
+  to `execute_stake` is one transaction, and `Portfolio` refuses far more often
+  than it buys. The system is deployable; it is not autonomous capital.
+
+
+
 ## Roadmap (Phase 0–1)
 
 ### Phase 0 — foundation ✅
