@@ -434,9 +434,10 @@ from agent.physics.interfaces import MockWeb3Provider
 
 market = M.generate_market(count=200, steps=720, seed=7)
 venue = MockWeb3Provider(market)
+venue.advance(72)                 # the venue's clock: what may be read
 empire = P.Empire.launch(provider=venue, scanner=Scanner(), steps=720, seed=7)
 empire.run(720)
-print(empire.summary_text())      # funnel: 200 published -> 80 read -> 10 funded
+print(empire.summary_text())      # the funnel of the last review, and the wallet
 ```
 
 Demo: section 9 of `notebooks/digital_entrepreneur.ipynb` (the funnel, then the two
