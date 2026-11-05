@@ -33,6 +33,10 @@ notebook = [
     "nbclient>=0.9",
     "ipython>=8.0",
 ]
+testnet = [
+    "web3>=6.0",
+    "python-dotenv>=1.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*"]

@@ -1007,7 +1007,7 @@ class Empire:
     :meth:`launch`, not a change in this class.
     """
 
-    market: ProtocolMarket
+    market: Optional[ProtocolMarket]
     portfolio: Portfolio
     kill_switch: Any
     provider: Optional["IWeb3Provider"] = None
@@ -1030,10 +1030,18 @@ class Empire:
         whose numbers mean nothing, so the disagreement is an error rather than a
         preference: a book with no venue attached adopts the empire's, and a book with a
         *different* one is a bug.
+
+        ``market`` may be ``None`` when the venue is not a declared market at all — a
+        testnet answers ``IWeb3Provider`` and publishes no ``ProtocolMarket``. Nothing in
+        the decision reads this attribute; it is the *simulation* the empire was born in,
+        kept for the report, and its absence is reported as absent rather than filled
+        with a mock that was never tradeable.
         """
         from agent.physics.interfaces import MockWeb3Provider, NoVenueProvider
 
         if self.provider is None:
+            if self.market is None:
+                raise PortfolioError("an empire needs a venue: pass a provider")
             self.provider = MockWeb3Provider(self.market)
         book = self.portfolio.provider
         if isinstance(book, NoVenueProvider) or book is None:
@@ -1074,17 +1082,22 @@ class Empire:
         and mirror arms are blind, and every assessment says so in
         ``details["measured"]``. That is the honest way to run a cheaper simulation: the
         absence of a measurement is recorded, not filled in.
+
+        A provider that is not a declared market — a testnet, say — leaves ``market`` as
+        ``None``: there is no ``ProtocolMarket`` to stand in for it, and inventing one
+        would mean the report printed a simulation that nothing was ever traded on. The
+        wallet's whitelist comes from the venue in every case, because the venue is the
+        only thing that knows what it will actually accept.
         """
         from agent.physics.interfaces import MockWeb3Provider
         from agent.physics.risk_assessment import KillSwitch
 
         venue = getattr(provider, "market", None)
         if market is None:
-            market = (
-                venue
-                if venue is not None
-                else ProtocolMarket.mock(steps=int(steps), seed=int(seed))
-            )
+            if venue is not None:
+                market = venue
+            elif provider is None:
+                market = ProtocolMarket.mock(steps=int(steps), seed=int(seed))
         elif venue is not None and venue is not market:
             # The provider publishes a clock and a record list, and both are the
             # market's: two different markets in one run would mean assessing one and
@@ -1107,7 +1120,7 @@ class Empire:
                 seed=int(seed),
             )
         portfolio = Portfolio(
-            whitelist=market.whitelist, cash=float(capital), provider=provider
+            whitelist=provider.whitelist, cash=float(capital), provider=provider
         )
         return cls(
             market=market,
@@ -1361,7 +1374,7 @@ class Empire:
         return {
             "step": int(self.step),
             "provider": self.provider.describe(),
-            "market": self.market.summary(),
+            "market": None if self.market is None else self.market.summary(),
             "portfolio": self.portfolio.report(),
             "kill_switch": self.kill_switch.as_dict(),
             "proofs": list(self.proofs),

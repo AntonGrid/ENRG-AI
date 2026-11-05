@@ -7,3 +7,8 @@ PyNaCl>=1.5          # Ed25519-signed federated contributions (agent/fed)
 
 # dev / tests
 pytest>=7.0
+
+# optional: the first-contact venue (agent/physics/real_testnet_provider.py).
+# Only needed to talk to a chain; nothing else in the package imports it.
+#   web3>=6.0
+#   python-dotenv>=1.0      # optional: reads a .env, never writes one

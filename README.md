@@ -344,8 +344,51 @@ route.
 
 What the layer does *not* contain is any ability to reach a network: no endpoint, no ABI,
 no signer, no key. The test parses the module's imports and checks them, and the notebook
-carries a commented `RealTestnetProvider` so the size of the remaining step is visible —
-five operations, three facts, and `provider =` in one line.
+shows the real venue below, so the size of the step stays visible — five operations, three
+facts, and `provider =` in one line.
+
+### First contact: the same seam, answered by a chain (Phase 5)
+
+`agent/physics/real_testnet_provider.py` is that one line, written out: a venue that
+speaks to Sepolia, or to a local Anvil, through `web3.py`. Nothing above it changed — the
+assessment, the cap, the switch, `Portfolio` and `Empire` still know only `IWeb3Provider`.
+
+```bash
+pip install 'enrg-ai[testnet]'
+export TESTNET_RPC_URL=https://sepolia.example/v3/KEY     # the node
+export TESTNET_PRIVATE_KEY=0x...                         # optional: without it, read-only
+export TESTNET_PROTOCOLS_FILE=book.json                  # the operator's address book
+```
+
+```python
+from agent.physics import RealTestnetProvider
+
+provider = RealTestnetProvider.from_env()
+for protocol in provider.get_protocol_list():
+    print(protocol.name, f"{protocol.claim_apy:.1%}", protocol.returns.size, "epochs")
+empire = Empire.launch(provider=provider)                # market=None: there is no market
+```
+
+Three properties are the reason the file is longer than the two lines it replaces:
+
+* **configuration comes from the environment and nowhere else** — `TESTNET_RPC_URL`,
+  `TESTNET_PRIVATE_KEY` or `TESTNET_UNLOCKED_ACCOUNT`, `TESTNET_PROTOCOLS[_FILE]`, plus
+  timeouts and decimals. No endpoint, no key and no address is written in the source, and
+  a test parses the file to prove it. The whitelist *is* the operator's book and cannot be
+  widened by the venue; a rejected address is `False`, which `Portfolio` turns into a
+  refusal;
+* **a transaction is awaited** — estimate, sign, send, `wait_for_transaction_receipt`, and
+  the local nonce is dropped on any failure so the next call asks the node. A loop cannot
+  queue transactions it can never land. A reverted receipt and a refused gas estimate are
+  `StakeRefused`, never a position;
+* **`dry_run()` signs nothing** — `eth_call` says whether the call would revert,
+  `estimate_gas` says what it would cost, and neither creates a hash. A mainnet chain id is
+  refused unless `TESTNET_ALLOW_MAINNET=1` *and* `allow_mainnet=True`: two keys, one lock.
+
+Tests: `tests/test_physics_real_testnet.py` — a recording `web3` double for the
+translation and the failures (no network, no key), and, when `anvil` and `forge` are on
+`PATH`, a real local chain: a token and a vault compiled and deployed, real receipts, real
+balances, and `Portfolio` moving capital through it. Without foundry it skips by name.
 
 
 ## Energy generation forecasting

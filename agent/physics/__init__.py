@@ -31,6 +31,7 @@ The autopoietic layer sits on the same arithmetic and never re-derives any of it
 ``portfolio``              capital: three buckets, a cap, a whitelist, a switch
 ``risk_assessment``        the verdict on somebody else's yield curve
 ``interfaces``             the seam: what a venue must answer, and the mock that does
+``real_testnet_provider``  first contact: the same seam, answered by a real testnet
 =========================  ==================================================
 
 Quick start of the organism::
@@ -53,6 +54,12 @@ Capital is handed its venue through ``interfaces.IWeb3Provider`` rather than rea
 for one, so the same run can be pointed at a different source with one line::
 
     provider = MockWeb3Provider()                  # the declared market
+    empire = Empire.launch(body=body, provider=provider)
+
+The same run against a chain, once an operator has a node and an address book (the key
+and the endpoint arrive from the environment and from nowhere else)::
+
+    provider = RealTestnetProvider.from_env()      # TESTNET_RPC_URL, TESTNET_PROTOCOLS
     empire = Empire.launch(body=body, provider=provider)
 """
 from agent.physics.oscillator import (
@@ -203,6 +210,16 @@ from agent.physics.portfolio import (
     sim_address,
 )
 from agent.physics.interfaces import IWeb3Provider, MockWeb3Provider, NoVenueProvider
+from agent.physics.real_testnet_provider import (
+    DryRun,
+    ProtocolBook,
+    ProtocolEntry,
+    RealTestnetProvider,
+    TestnetConfig,
+    TestnetError,
+    TestnetNotConfigured,
+    TestnetUnavailable,
+)
 from agent.physics.risk_assessment import (
     CONVICTIONS,
     HONEST,
@@ -354,6 +371,14 @@ __all__ = [
     "IWeb3Provider",
     "MockWeb3Provider",
     "NoVenueProvider",
+    "RealTestnetProvider",
+    "TestnetConfig",
+    "TestnetError",
+    "TestnetNotConfigured",
+    "TestnetUnavailable",
+    "ProtocolBook",
+    "ProtocolEntry",
+    "DryRun",
     "CONVICTIONS",
     "HONEST",
     "KILL_DRAWDOWN",
