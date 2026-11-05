@@ -196,6 +196,128 @@ plot_depin_dynamics(timestamps, energy_wh, R, share_spread, relief_trace,
 `matplotlib` is optional: `pip install 'enrg-ai[plot]'`. Tests:
 `tests/test_physics_sterility.py`, `tests/test_physics_plots.py`.
 
+## Curiosity: which stream deserves the next look (L3)
+
+Above the park sits the body from `agent.physics.organism` — sensorium, homeostasis,
+mirror. The mirror answers *"is this the world, or my own emission?"*. The next
+question is cheaper and harder: **which stream is worth another look**, when looking
+at all of them at once is not possible. `agent/physics/curiosity.py` answers it with
+an expected information gain in four measured factors, each of which can be printed
+and disputed on its own:
+
+```
+curiosity = reality(R) × 2V/(V + V_ref) × (1 − e^(−Λ/0.25)) × 1/(1 + 0.5·looks)
+```
+
+Every factor is a gate, not a bonus: a stream that does not move costs exactly zero
+even if it is real, and a stream that moves but does not explain *itself* costs zero
+even if it moves more than anything else. Structure is tested against the exact null
+`P(R² > r) = (1 − r)^((n−2)/2)` with a Bonferroni correction over lags — measured on
+pure noise it fires 0/120 at any α from 0.5 down to 0.01, and 0 of 33 no-repeat
+streams (permutations, a random walk, AR(1), a frozen sensor) fire at all.
+
+Measured on the offline sensorium, with no label anywhere: a forgery (a block of a
+real feed re-served) ranks **0.815** and a replay **0.807**, while a control copy of
+the very same bytes ranks **0.000** — the difference is the repeat, not the
+provenance. A frozen sensor ranks 0.000. The organism then asks six questions
+(*where*, *what next*, *what is it really*, twice) and stops because curiosity
+crossed the threshold (0.815 → 0.546 → 0.410 → 0.326), not because a counter ran out.
+
+```bash
+python -m agent.physics.organism --offline --explore --curiosity-plot curiosity.png
+```
+
+The limitations are measured, not disclaimed: the detector catches *the same window
+again* — the question a forgery actually asks — and does not catch periodicity of a
+window summary, nor a forgery shorter than two fixations. Demo:
+`notebooks/curious_agent.ipynb` (its rule is declared before the run). Details and
+numbers: [`agent/physics/README.md`](agent/physics/README.md). Tests:
+`tests/test_physics_curiosity.py`, `tests/test_physics_plots.py`.
+
+## The economic agent: a verdict with a price (L3)
+
+A body that is never hungry never learns to be careful. `agent/physics/economy_sim.py`
+is the market the body works in: three streams per contract, one of them synthetic,
+**50 credits** for a correct verdict, **30** for a wrong one, and **10 credits of
+rent every four iterations** whether or not there is work. Which kind of synthetic
+is public; which *stream* is not — the `Contract` object does not carry the answer,
+and the truth surfaces only in the settlement, after the verdict is paid for.
+
+Four kinds sit in the mix: `repeat` (a block re-served) and `replay` (a half copied)
+are solvable by the structure arm; `surrogate` (phase-randomised, same spectrum) and
+`noise` are not, and the whole exercise is discovering which half is which. The
+penalty is 30 rather than Anton's 20 for an arithmetic reason: at 50/20 and three
+streams a blind guess is worth `+3.33` per contract, so "take everything and guess"
+would be the optimal policy and a refusal would be an error rather than caution.
+At 50/30 the same guess is `−3.33` and the break-even accuracy is `30/80 = 0.375`.
+
+`agent/physics/worker.py` is the decision. Its confidence is a blend of what this
+contract's survey says (`Certainty.probability`, with the epistemic weight being how
+often the answer survives five perturbations of the data) and a *pessimistic* bound
+on the kind's record (`EpisodicMemory.belief`: the mean minus one standard error).
+It bids when `p ≥ 0.375`, refuses when it does not, and buys at most two paid
+lessons per kind while the balance can absorb the fine. Both banks are compared
+against the policies that do not think: refuse everything dies of rent, guess
+everything dies of fines.
+
+Measured, seed 11, 120 iterations: 65 taken, 62 won (95%), 55 refused, the 55
+refusals saved **1050 credits** of fines that would have been charged, and the
+balance ends at **2760** from a start of 50. The surrogate and noise kinds are
+taken twice each — the two paid lessons — and refused forever after; the replay
+kind is taken 19 times and won 18.
+
+```bash
+python -m agent.physics.worker --iterations 120 --plot economy.png
+```
+
+Demo: `notebooks/economic_agent.ipynb` (balance, refusals that saved credits, UCB
+and the attention share; the acceptance rule is asserted in the last cell). Tests:
+`tests/test_physics_economy.py`, `tests/test_physics_worker.py`. No exchange, no
+wallet, no key, no network: credits exist as one float per simulation.
+
+## The digital entrepreneur: capital, a trap and a switch (L4)
+
+The worker earned one contract at a time. L4 asks what a body with a balance does
+*between* jobs, and the answer is a cap rather than a forecast:
+`agent/physics/portfolio.py` splits the empire **60 / 30 / 10** across a safe
+staking vault, an active bounty/MEV book and an experimental farm — so a protocol
+that goes to zero costs a tenth of the empire — and refuses to send a credit to any
+address the operator has not approved. The whitelist is necessary and *not*
+sufficient: every scam in the simulation is on it, because an approved address says
+who runs it and nothing about whether its curve is a record.
+
+`agent/physics/risk_assessment.py` answers the second question. Statement #87 is
+applied to the return curve itself — a lived record leaves non-normal residuals, a
+formula leaves none — and the same `reducibility` that names a re-served contract in
+`worker.py` names a re-served record here. Neither arm can convict alone, and that is
+measured rather than argued: a *bond* is sterile too (`CV = 1e-4`), so a sterile
+record with a plausible claim is refused as `SYNTHETIC_COLLUSION` while the same
+sterility under an impossible claim is a `SCAM_TRAP`. The agent's kill switch watches
+three things — the 15 % cycle drawdown the brief asked for, the market's volatility
+against its own history, and the mirror's `internal_resonance` — and takes the risky
+buckets to cash when any of them fires.
+
+Measured on the declared market (720 steps, seed 7, one body): **100 → 149 credits**,
+five protocols refused at every one of 28 reviews, both traps convicted *before* they
+stopped paying (YieldMax at step 280 by sterility, AurumDAO at 336 by `R² = 1.00`), the
+switch fired on the drawdown at 403 (15.6 % in a cycle) and on the volatility at 475,
+and the worst fall from the running peak was **15.9 %** against **59.9 %** for the same
+caps without an assessment and **100 %** for "everything into the highest claim". The
+price of caution is printed too: refusing the sterile bond cost 18 credits of forgone
+yield.
+
+```bash
+python -m agent.physics.portfolio --steps 720 --body --against --plot empire.png
+```
+
+Demo: `notebooks/digital_entrepreneur.ipynb` (capital against two credulous policies,
+the moment of truth, and the switch working; the acceptance rule is asserted in the
+last cell). Tests: `tests/test_physics_portfolio.py`,
+`tests/test_physics_risk_assessment.py`. No key, no signature, no RPC: an address is
+`0x` plus forty hex digits of a SHA-256 of the protocol's name, and the venue is
+swappable for a real Web3 adapter behind `ProtocolMarket`.
+
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear

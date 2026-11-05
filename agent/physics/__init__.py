@@ -16,6 +16,37 @@ Quick start::
 The maths is a port, not an interpretation: every function in ``oscillator``
 matches ``entrain/julia/kuramoto/basic.jl`` to the last bit (see
 ``tests/fixtures/entrain_reference.json``).
+
+The autopoietic layer sits on the same arithmetic and never re-derives any of it:
+
+=========================  ==================================================
+``genome``                 the core, reached through one door and fingerprinted
+``sensorium``              organs of sense: world feeds and the four dreams
+``homeostasis``            λ, ε, α and the mutations that keep them honest
+``self_model``             the mirror: internal resonance, the ledger, the score
+``organism``               the body that lives the three phases in order
+``curiosity``              the appetite: which stream is worth asking about
+``economy_sim``            the market: what a verdict is worth, and the rent
+``worker``                 the body that bids, refuses, and remembers why
+``portfolio``              capital: three buckets, a cap, a whitelist, a switch
+``risk_assessment``        the verdict on somebody else's yield curve
+=========================  ==================================================
+
+Quick start of the organism::
+
+    python -m agent.physics.organism --offline --output report.json --plot phases.png
+
+Quick start of the appetite (the same body, now asking questions)::
+
+    python -m agent.physics.organism --offline --explore --curiosity-plot curiosity.png
+
+Quick start of the worker (the same body, now earning its rent)::
+
+    python -m agent.physics.worker --iterations 120 --plot economy.png
+
+Quick start of the empire (the same body, now managing capital)::
+
+    python -m agent.physics.portfolio --steps 720 --body --against --plot empire.png
 """
 from agent.physics.oscillator import (
     MEMORY_REFERENCE,
@@ -74,6 +105,115 @@ from agent.physics.synthetic import (
     build_scenario,
     clean_park,
 )
+from agent.physics.genome import (
+    GenomeError,
+    GenomeFrozenError,
+    describe as describe_genome,
+    fingerprint as genome_fingerprint,
+    verify as verify_genome,
+)
+from agent.physics.homeostasis import (
+    Calibration,
+    Homeostasis,
+    Mutation,
+    Parameters,
+    calibrate,
+    internal_resonance,
+    mutate,
+    separation,
+)
+from agent.physics.sensorium import (
+    Perception,
+    SensorError,
+    Sensorium,
+    dream,
+    hear,
+    listen_dataset,
+    listen_finance,
+)
+from agent.physics.self_model import Ledger, SelfModel, reality_score
+from agent.physics.curiosity import (
+    ANOMALY_THRESHOLD,
+    MAX_PROBES,
+    PROBE_THRESHOLD,
+    SURVEY_FIXATIONS,
+    Certainty,
+    Curiosity,
+    Probe,
+    Trait,
+    UCB,
+    lindley_gain,
+    perturb,
+    reducibility,
+    structure_of,
+)
+from agent.physics.economy_sim import (
+    CONTRACT_STREAMS,
+    PENALTY,
+    REWARD,
+    SOLVABLE,
+    START_BALANCE,
+    Bankrupt,
+    Contract,
+    EconomyError,
+    EconomySim,
+    Market,
+    Settlement,
+)
+from agent.physics.worker import (
+    CERTAIN,
+    SCHOOLING,
+    Decision,
+    EpisodicMemory,
+    Experience,
+    RealityOracle,
+    Worker,
+)
+from agent.physics.plots import (
+    plot_curiosity,
+    plot_economy,
+    plot_emergence,
+    plot_empire,
+)
+from agent.physics.portfolio import (
+    BUCKETS,
+    CYCLE,
+    MIN_RECORD,
+    START_CAPITAL,
+    TARGETS,
+    Empire,
+    NaiveInvestor,
+    NotWhitelisted,
+    Portfolio,
+    PortfolioError,
+    Protocol,
+    ProtocolMarket,
+    WhiteList,
+    annualise,
+    implied_apy,
+    per_step_rate,
+    sim_address,
+)
+from agent.physics.risk_assessment import (
+    HONEST,
+    KILL_DRAWDOWN,
+    KILL_VOLATILITY,
+    PLAUSIBLE_APY,
+    REALITY_FLOOR,
+    REPEAT_R2,
+    RESONANCE_FLOOR,
+    SCAM_TRAP,
+    SUSPECT,
+    SYNTHETIC_COLLUSION,
+    UNMEASURED,
+    VERDICTS,
+    Assessment,
+    KillSwitch,
+    Trigger,
+    evaluate_opportunity,
+    sterility_of,
+    volatility_ratio,
+)
 
 __all__ = [
     "MEMORY_REFERENCE",
@@ -125,4 +265,97 @@ __all__ = [
     "wave",
     "build_scenario",
     "clean_park",
+    "Calibration",
+    "GenomeError",
+    "GenomeFrozenError",
+    "Homeostasis",
+    "Ledger",
+    "Mutation",
+    "Parameters",
+    "Perception",
+    "SelfModel",
+    "SensorError",
+    "Sensorium",
+    "calibrate",
+    "describe_genome",
+    "dream",
+    "genome_fingerprint",
+    "hear",
+    "internal_resonance",
+    "listen_dataset",
+    "listen_finance",
+    "mutate",
+    "plot_curiosity",
+    "plot_emergence",
+    "reality_score",
+    "separation",
+    "verify_genome",
+    "ANOMALY_THRESHOLD",
+    "MAX_PROBES",
+    "PROBE_THRESHOLD",
+    "SURVEY_FIXATIONS",
+    "Certainty",
+    "Curiosity",
+    "Probe",
+    "Trait",
+    "UCB",
+    "lindley_gain",
+    "perturb",
+    "reducibility",
+    "structure_of",
+    "CONTRACT_STREAMS",
+    "PENALTY",
+    "REWARD",
+    "SOLVABLE",
+    "START_BALANCE",
+    "Bankrupt",
+    "Contract",
+    "EconomyError",
+    "EconomySim",
+    "Market",
+    "Settlement",
+    "CERTAIN",
+    "SCHOOLING",
+    "Decision",
+    "EpisodicMemory",
+    "Experience",
+    "RealityOracle",
+    "Worker",
+    "plot_economy",
+    "plot_empire",
+    "BUCKETS",
+    "CYCLE",
+    "MIN_RECORD",
+    "START_CAPITAL",
+    "TARGETS",
+    "Empire",
+    "NaiveInvestor",
+    "NotWhitelisted",
+    "Portfolio",
+    "PortfolioError",
+    "Protocol",
+    "ProtocolMarket",
+    "WhiteList",
+    "annualise",
+    "implied_apy",
+    "per_step_rate",
+    "sim_address",
+    "HONEST",
+    "KILL_DRAWDOWN",
+    "KILL_VOLATILITY",
+    "PLAUSIBLE_APY",
+    "REALITY_FLOOR",
+    "REPEAT_R2",
+    "RESONANCE_FLOOR",
+    "SCAM_TRAP",
+    "SUSPECT",
+    "SYNTHETIC_COLLUSION",
+    "UNMEASURED",
+    "VERDICTS",
+    "Assessment",
+    "KillSwitch",
+    "Trigger",
+    "evaluate_opportunity",
+    "sterility_of",
+    "volatility_ratio",
 ]
