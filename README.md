@@ -621,6 +621,14 @@ python -m agent.main
 pytest
 ```
 
+692 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+and are named rather than hidden: the Anvil tests skip when foundry is absent, the
+tests for the sibling `axis_core` package skip when that package is not installed,
+and the `entrain_infer` core plus the scikit-learn datasets are needed by the
+genome/sensorium/organism tests — on a box without them those tests say so by
+name, which is why the full run is a *workspace* command, not a pip-install one.
+Nothing on the deployment path needs any of the three.
+
 ## Production Readiness
 
 What is already a property of the code, what an operator must supply, and what
@@ -664,15 +672,15 @@ size of the thing: nothing here needs a cluster, a broker or a database.
 ### Why an L2, in one measurement
 
 TCA priced the *trade*, not the idea: on Ethereum, 92 000 gas at 2 gwei and
-$3 000/ETH is **$0.5520** before the position exists, which is why the floor in
-`Portfolio` refused most small entries there. The same call on Arbitrum One, at
-~0.01 gwei, is **$0.00276** of execution gas:
+$3 000/ETH is **$0.5520** before the position exists — on a $50 ticket that is
+1.1 % of the capital, an order of magnitude above the 0.1 % floor in `Portfolio`.
+The same call on Arbitrum One, at ~0.01 gwei, is **$0.00276**:
 
-| Where | gas price | 92 000 gas costs | a $50 entry |
+| Where | gas price | 92 000 gas costs | on a $50 ticket |
 |---|---|---|---|
-| Ethereum L1 | 2 gwei | $0.5520 | refused — 1.1 % of the ticket is friction |
-| Arbitrum One | 0.02 gwei | $0.00552 | admissible — 0.011 % |
-| Arbitrum One | 0.01 gwei | $0.00276 | admissible — 0.0055 % |
+| Ethereum L1 | 2 gwei | $0.5520 | 1.1 % — above the 0.1 % floor |
+| Arbitrum One | 0.02 gwei | $0.00552 | 0.011 % — below it |
+| Arbitrum One | 0.01 gwei | $0.00276 | 0.0055 % — two orders below |
 
 Two honest footnotes. A rollup also charges an **L1 data fee** for the calldata it
 posts — a few cents for a stake, in practice — which this model does not price, so
@@ -703,7 +711,7 @@ sudo -iu enrg
 git clone https://github.com/AntonGrid/ENRG-AI.git /opt/ENRG-AI && cd /opt/ENRG-AI
 python3 -m venv .venv && . .venv/bin/activate
 pip install -U pip && pip install '.[testnet,market,plot]'
-pytest -q                                   # 692 passed, no network, no key
+pytest -q                                   # the standalone suite (see "Tests")
 cp .env.example .env && chmod 600 .env      # fill in only what you need
 ```
 
@@ -750,17 +758,25 @@ Then the chain, read-only, *before* anything signs:
 from agent.physics import RealTestnetProvider
 
 provider = RealTestnetProvider.from_env()   # no node => TestnetNotConfigured, never a default
-print(provider.describe())
+print(provider.describe()["config"])
 # {'rpc_host': 'arb-mainnet.g.alchemy.com', 'signer': 'read-only', 'chain_id': 42161,
 #  'profile': 'arbitrum', 'sources': {}, 'decimals': 6, ...}
+print(provider.describe().get("unavailable"))
+# chain 42161 is a mainnet: this venue is configured to move credits on a testnet, and
+# letting it sign here would need TESTNET_ALLOW_MAINNET=1 and allow_mainnet=True
+#   ^ the lock doing its job, not a bug: this is the state to *start* in
+
+# On Arbitrum Sepolia (TESTNET_PROFILE=arbitrum + ARBITRUM_CHAIN_ID=421614) the whole
+# loop runs and signs with no lock at all. Only after that, on One, give both yeses:
+provider = RealTestnetProvider.from_env(allow_mainnet=True)   # env var too, or this raises
 for p in provider.get_protocol_list():
     print(p.name, f"{p.claim_apy:.1%}")
 print(provider.dry_run("stake", "<vault from your book>", 250.0))   # nothing is signed
 ```
 
 Signing on 42161 needs **both** yeses — `TESTNET_ALLOW_MAINNET=1` in `.env` *and*
-`allow_mainnet=True` in the calling code. Run on Arbitrum Sepolia (421614) first
-if you want the loop to sign without a lock, then switch two variables.
+`allow_mainnet=True` in the calling code. Arbitrum Sepolia (421614) is the rehearsal
+space: the same profile, a different id, no lock, no money.
 
 #### 4. Run it forever: systemd
 
@@ -817,7 +833,7 @@ cp .env.example .env && chmod 600 .env
 docker compose up -d --build
 docker compose logs -f trainer
 docker compose run --rm coherence            # one-shot job, behind the `jobs` profile
-docker compose exec trainer pytest -q        # the suite, inside the image
+docker compose exec trainer pytest -q        # the suite, as far as it ships in the image
 ```
 
 The image is `python:3.12-slim` plus the package's extras, runs as uid `10001`,
@@ -828,6 +844,19 @@ change it); `coherence` is the same seam as a one-shot job. One health check,
 and it is the honest one: the state file is written at the end of every cycle,
 so a file older than three hours means the loop is not working and compose
 restarts it.
+
+The `.env` from step 3 is the file compose reads: the same
+`TESTNET_PROFILE=arbitrum` and the same key, handed to the container's
+environment at start — never copied into the image, never a build argument.
+
+The image carries the suite and the `dev` extra so it can be *measured*, not
+because a deploy needs them: `pytest -q` in the container runs every test whose
+dependencies ship in this repository, and the ones that need a workspace sibling
+(the `entrain_infer` core, `axis_core`, the scikit-learn datasets) say so by
+name. The whole 692 run on a host that holds the workspace. What to check after
+the first build: the image runs as uid `10001`, writes `/data/digital_state.json`
+through the mounted volume when given `--once --offline`, and its health check
+answers 1 before that file exists and 0 after.
 
 ### Environment variables
 

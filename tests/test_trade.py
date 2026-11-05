@@ -1,10 +1,20 @@
-"""Closed economic loop tests (Phase 3) — recommender + policy gates + reward."""
+"""Closed economic loop tests (Phase 3) — recommender + policy gates + reward.
 
-from axis_core.ai.recommender import recommend
-from axis_core.policy.engine import PolicyEngine
-from axis_core.policy.models import PolicyRegistry, ProducerState
+Requires ``axis_core`` (installed alongside the workspace); skipped when the
+package is unavailable so the core ENRG-AI suite stays standalone — the same rule
+:mod:`tests.test_pilot` and :mod:`tests.test_evolution` follow.
+"""
 
-from agent.trade import simulate_rounds
+import pytest
+
+pytest.importorskip("axis_core.ai.recommender")
+pytest.importorskip("axis_core.policy.engine")
+
+from axis_core.ai.recommender import recommend  # noqa: E402
+from axis_core.policy.engine import PolicyEngine  # noqa: E402
+from axis_core.policy.models import PolicyRegistry, ProducerState  # noqa: E402
+
+from agent.trade import simulate_rounds  # noqa: E402
 
 
 def test_recommender_overflow_sell():

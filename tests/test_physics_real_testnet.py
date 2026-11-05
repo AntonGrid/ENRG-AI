@@ -485,7 +485,7 @@ def test_a_profile_supplies_the_chain_id_and_accepts_its_own_spellings():
         }
     )
     assert config.profile == "arbitrum"
-    assert config.chain_id == ARBITRUM == T.L2_PROFILES["arbitrum"]
+    assert config.chain_id == ARBITRUM == T.CHAIN_PROFILES["arbitrum"]
     assert config.rpc_host == "arb.example"
     assert config.can_sign and config.private_key == KEY
 

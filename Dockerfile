@@ -20,15 +20,19 @@ COPY pyproject.toml README.md requirements.txt ./
 COPY agent/ ./agent/
 
 # The extras a deploy actually uses: `testnet` is web3.py (a chain), `market`
-# is requests (DeFiLlama), `plot` is matplotlib (the figures the CLI can print).
-# The base deps (numpy, httpx, PyNaCl, ollama) come with the project itself.
+# is requests (DeFiLlama), `plot` is matplotlib (the figures the CLI can print),
+# and `dev` is pytest — the base deps (numpy, httpx, PyNaCl, ollama) come with the
+# project itself. `dev` is here because the image claims the suite runs inside it.
 RUN python -m pip install --upgrade pip setuptools wheel \
- && python -m pip install --no-cache-dir ".[testnet,market,plot]"
+ && python -m pip install --no-cache-dir ".[testnet,market,plot,dev]"
 
-# The suite runs inside the image with no network and no key: it is the same
-# 685 tests an operator can run on the host, which is what makes the image's
-# claim to be deployable checkable rather than asserted.
+# The suite and the CLI scripts are copied in so the image can be *measured*, not
+# because a deploy needs them: `pytest -q` inside the container runs every test
+# whose dependencies ship in this repository. The ones that need a workspace
+# sibling — the `entrain_infer` core, `axis_core`, the scikit-learn datasets —
+# skip or fail by name. The whole 692 run on a host that holds the workspace.
 COPY tests/ ./tests/
+COPY scripts/ ./scripts/
 
 # Non-root, and an owner for the volume that carries the state file.
 RUN useradd --create-home --uid 10001 enrg \

@@ -151,7 +151,7 @@ __all__ = [
     "TestnetNotConfigured",
     "TestnetUnavailable",
     "MAINNET_CHAIN_IDS",
-    "L2_PROFILES",
+    "CHAIN_PROFILES",
     "YIELD_EVENT_SIGNATURE",
 ]
 
@@ -179,8 +179,10 @@ ENV_PROFILE = "TESTNET_PROFILE"
 #: still needs *both* yeses, and a profile never changes a timeout, a decimal count or
 #: the whitelist. A bare ``RPC_URL`` / ``PRIVATE_KEY`` is deliberately **not** an alias
 #: — a stray variable from another project must not be able to become a signer.
-L2_PROFILES: Dict[str, int] = {
-    "arbitrum": 42161,  # Arbitrum One: the cheap seat, ~30x fewer wei per transaction
+#: ``sepolia`` rides along because the rehearsal space is a chain too: this map is
+#: about which network is meant, not about which layer it settles on.
+CHAIN_PROFILES: Dict[str, int] = {
+    "arbitrum": 42161,  # Arbitrum One: the cheap seat, ~200x cheaper gas than L1
     "base": 8453,  # Base
     "polygon": 137,  # Polygon PoS
     "sepolia": 11155111,  # the testnet this file was written against
@@ -654,13 +656,13 @@ class TestnetConfig:
         # at the wrong network.
         profile = _clean(self.profile).lower()
         if profile:
-            if profile not in L2_PROFILES:
+            if profile not in CHAIN_PROFILES:
                 raise TestnetNotConfigured(
                     f"{ENV_PROFILE}={self.profile!r} is not one of: "
-                    + ", ".join(sorted(L2_PROFILES))
+                    + ", ".join(sorted(CHAIN_PROFILES))
                 )
             if self.chain_id is None:
-                object.__setattr__(self, "chain_id", int(L2_PROFILES[profile]))
+                object.__setattr__(self, "chain_id", int(CHAIN_PROFILES[profile]))
         object.__setattr__(self, "profile", profile)
         object.__setattr__(
             self, "sources", {str(k): str(v) for k, v in dict(self.sources).items()}
@@ -743,10 +745,10 @@ class TestnetConfig:
         requested = bool(overrides.pop("allow_mainnet", False))
 
         profile_name = _clean(source.get(ENV_PROFILE)).lower()
-        if profile_name and profile_name not in L2_PROFILES:
+        if profile_name and profile_name not in CHAIN_PROFILES:
             raise TestnetNotConfigured(
                 f"{ENV_PROFILE}={profile_name!r} is not one of: "
-                + ", ".join(sorted(L2_PROFILES))
+                + ", ".join(sorted(CHAIN_PROFILES))
             )
         prefix = f"{profile_name.upper()}_" if profile_name else ""
         sources: Dict[str, str] = {}
@@ -770,7 +772,7 @@ class TestnetConfig:
             "chain_id": (
                 _int_or(chain_text, 0, sources.get(ENV_CHAIN_ID, ENV_CHAIN_ID))
                 if chain_text
-                else (int(L2_PROFILES[profile_name]) if profile_name else None)
+                else (int(CHAIN_PROFILES[profile_name]) if profile_name else None)
             ),
             "profile": profile_name,
             "sources": sources,
