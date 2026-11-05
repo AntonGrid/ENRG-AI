@@ -81,6 +81,8 @@ from typing import (
 
 import numpy as np
 
+from agent.physics.discovery import EXECUTION_LIMIT, DiscoveryReport, Watchlist
+
 if TYPE_CHECKING:  # pragma: no cover - for the type checker, never imported at runtime
     from agent.physics.interfaces import IWeb3Provider
 
@@ -335,6 +337,7 @@ class Protocol:
     address: str = ""
     alive: bool = True
     rug_step: Optional[int] = None
+    turnover: Optional[float] = None
     note: str = ""
 
     def __post_init__(self) -> None:
@@ -373,7 +376,13 @@ class Protocol:
         return implied_apy(self.returns)
 
     def as_opportunity(self, step: int) -> Dict[str, Any]:
-        """The published opportunity, as a mapping — what an adapter would hand over."""
+        """The published opportunity, as a mapping — what an adapter would hand over.
+
+        ``turnover`` is ``None`` when the venue does not publish one, and ``None`` is not
+        zero: an unmeasured liquidity is unmeasured, and the scanner's rule about volume
+        must fire on a *published* zero rather than on an absent field, or the first
+        protocol a testnet lists would be refused for the crime of having no history.
+        """
         alive = bool(self.alive) and not (
             self.rug_step is not None and int(step) > int(self.rug_step)
         )
@@ -384,6 +393,7 @@ class Protocol:
             "claim_apy": float(self.claim_apy),
             "returns": [float(value) for value in self.record(step)],
             "alive": alive,
+            "turnover": None if self.turnover is None else float(self.turnover),
         }
 
     def summary(self, step: Optional[int] = None) -> Dict[str, Any]:
@@ -399,6 +409,7 @@ class Protocol:
             "recorded": int(self.returns.size),
             "alive": bool(self.alive),
             "rug_step": None if self.rug_step is None else int(self.rug_step),
+            "turnover": None if self.turnover is None else float(self.turnover),
             "note": self.note,
         }
 
@@ -479,6 +490,23 @@ class Portfolio:
     :class:`~agent.physics.interfaces.NoVenueProvider` — the same code path, a venue
     that is only the ledger — so there is no configuration in which capital moves by
     some other route.
+
+    Two lists, and the difference between them
+    ------------------------------------------
+
+    ``watchlist`` is what the *scanner* proposed (:meth:`discover`, and
+    :class:`agent.physics.discovery.Watchlist`): names worth the expensive reading, and
+    nothing more. It is a record of a proposal and it grants nothing — a book whose only
+    list were this one would be a book that buys whatever looked interesting, which is
+    the failure mode of every screener ever written.
+
+    ``execution_whitelist`` is what this book has **approved**: the addresses that passed
+    the deep assessment and for which there was room under ``execution_limit``. It is the
+    only list :meth:`deposit` consults, and it is written in exactly one place
+    (:meth:`approve`), which is reached only from :meth:`discover` — from a measurement,
+    never from a proposal. Left as ``None`` the book behaves as it always did and the
+    operator's ``whitelist`` is the whole of the permission, which is what every existing
+    caller and test gets.
     """
 
     whitelist: WhiteList
@@ -488,6 +516,9 @@ class Portfolio:
     events: List[Dict[str, Any]] = field(default_factory=list)
     trace: List[Dict[str, Any]] = field(default_factory=list)
     provider: Optional["IWeb3Provider"] = None
+    watchlist: Optional["Watchlist"] = None
+    execution_whitelist: Optional[WhiteList] = None
+    execution_limit: int = EXECUTION_LIMIT
 
     def __post_init__(self) -> None:
         if self.provider is None:
@@ -533,6 +564,146 @@ class Portfolio:
     def addresses(self) -> List[str]:
         return sorted(self.holdings)
 
+
+    # -- what may be funded, and who decides ------------------------------- #
+
+    def is_executable(self, address: str) -> bool:
+        """True when capital may reach ``address`` at all.
+
+        Two gates, and the answer is the *narrower* of them: the operator's list is the
+        outer boundary (a venue will not process what it has not approved) and the
+        execution whitelist is the inner one (the book will not buy what it has not
+        measured).
+
+        A book that has not looked at anything yet has no inner gate, and that is exactly
+        the behaviour every caller had before discovery existed — left as it was so that
+        the declared market, the CLI and seven hundred tests keep their semantics. But a
+        book that *has* proposed a watchlist and has not yet approved anything approves
+        **nothing**: an empty execution whitelist is a book that is still deciding, and
+        the one thing it must not do while deciding is buy.
+        """
+        key = str(address).lower()
+        if not self.whitelist.allows(key):
+            return False
+        if self.execution_whitelist is None:
+            return self.watchlist is None
+        return self.execution_whitelist.allows(key)
+
+    def propose(self, watchlist: "Watchlist") -> "Watchlist":
+        """Record what the scanner proposed, and refuse to record a stranger.
+
+        A proposal is not a permission: this writes ``watchlist`` and touches nothing
+        else, so a scanner that proposed the whole market would leave the book with a
+        long list and the same empty execution whitelist. The check that every candidate
+        is on the operator's list is defence in depth — the venue would refuse the stake
+        anyway — and it is here because a proposal that could widen the outer boundary
+        would make the outer boundary decorative.
+        """
+        for candidate in watchlist.kept:
+            self.whitelist.require(candidate.address)
+        self.watchlist = watchlist
+        return watchlist
+
+    def approve(self, protocols: Sequence[Protocol]) -> WhiteList:
+        """Write the execution whitelist: the only method that grants permission.
+
+        Two invariants, both of them errors rather than decisions. An address that is not
+        on the operator's list cannot be approved (:class:`NotWhitelisted`), and more
+        approvals than ``execution_limit`` is a bug in whoever counted
+        (:class:`PortfolioError`) — the cap is enforced here so that no caller can widen
+        it by asking nicely, which is the same argument the whitelist itself is built on.
+        """
+        chosen = list(protocols)
+        if len(chosen) > int(self.execution_limit):
+            raise PortfolioError(
+                f"{len(chosen)} protocols approved against a cap of "
+                f"{int(self.execution_limit)}"
+            )
+        for protocol in chosen:
+            self.whitelist.require(protocol.address)
+        self.execution_whitelist = WhiteList(
+            tuple(protocol.address for protocol in chosen)
+        )
+        return self.execution_whitelist
+
+    def discover(
+        self,
+        provider: Optional["IWeb3Provider"] = None,
+        *,
+        scanner: Any = None,
+        oracle: Any = None,
+        min_record: int = MIN_RECORD,
+    ) -> DiscoveryReport:
+        """Level 1 then level 2: ask the scanner what is worth a look, then look.
+
+        This is the method the whole two-tier design exists for, and it is deliberately
+        short: the scanner produces a :class:`~agent.physics.discovery.Watchlist`, the
+        book records it (:meth:`propose`), the loop below runs the *expensive* assessment
+        over **exactly those candidates and nothing else**, and the survivors — the
+        admissible, in queue order, up to ``execution_limit`` — are written into the
+        execution whitelist (:meth:`approve`).
+
+        The three outcomes after level 2 are kept apart because they are three different
+        facts: ``refused`` is a verdict about a record, ``capped`` is a decision about
+        room, ``approved`` is permission. A funnel that merged the first two would let a
+        policy look like a measurement, and :class:`DiscoveryReport` refuses to be built
+        when the counts do not add up.
+
+        ``oracle`` is optional in the same sense it is everywhere else: without a body the
+        structural and mirror arms are blind, every assessment says so in
+        ``details["measured"]``, and the verdict rests on Statement #87 and the claim.
+        That is what makes the two-hundred-protocol run in the notebook affordable — and
+        the report of that run prints how long the deep pass took, so the trade is visible
+        rather than hidden.
+        """
+        from agent.physics.discovery import Scanner
+        from agent.physics.risk_assessment import evaluate_opportunity
+
+        venue = self.provider if provider is None else provider
+        scan = Scanner() if scanner is None else scanner
+        watch = self.propose(scan.scan(venue))
+        step = int(getattr(venue, "step", 0))
+        cap = int(self.execution_limit)
+        approved: List[Any] = []
+        capped: List[Any] = []
+        refused: List[Dict[str, Any]] = []
+        judged: Dict[str, Any] = {}
+        chosen: Dict[str, Protocol] = {}
+        for candidate in watch.kept:
+            protocol = venue.protocol(candidate.name)
+            item = evaluate_opportunity(
+                protocol.as_opportunity(step),
+                oracle=oracle,
+                min_record=int(min_record),
+            )
+            judged[candidate.name] = item
+            if not item.admissible:
+                refused.append(
+                    {
+                        "name": item.name,
+                        "address": item.address,
+                        "verdict": item.verdict,
+                        "reason": item.reason,
+                    }
+                )
+                continue
+            if len(approved) < cap:
+                approved.append(candidate)
+                chosen[candidate.name] = protocol
+            else:
+                capped.append(candidate)
+        self.approve([chosen[candidate.name] for candidate in approved])
+        return DiscoveryReport(
+            step=step,
+            watchlist=watch,
+            approved=tuple(approved),
+            capped=tuple(capped),
+            refused=tuple(refused),
+            assessments=judged,
+            limit=cap,
+        )
+
+
     # -- moving credits --------------------------------------------------- #
 
     def deposit(self, protocol: Protocol, amount: float, *, step: int = 0) -> float:
@@ -544,12 +715,23 @@ class Portfolio:
         not an error — it clamps, because a top-up that cannot be filled should fill
         what it can instead of failing a cycle.
 
+        The fourth gate is the execution whitelist, and it is the same error on purpose:
+        an address on the operator's list that no verdict has approved is *not* a place
+        the book may put capital, and the difference between "not allowed" and "not
+        approved yet" belongs in the message rather than in the exception type — both are
+        the book refusing, not the venue.
+
         The transfer itself goes to the venue (:meth:`IWeb3Provider.execute_stake`) and
         the book only moves what the venue accepted: if the answer is ``False`` the
         holding is untouched and :class:`StakeRefused` is raised, so a stake the book
         believes in and the venue does not can never be recorded as a position.
         """
         self.whitelist.require(protocol.address)
+        if not self.is_executable(protocol.address):
+            raise NotWhitelisted(
+                f"{protocol.name} ({protocol.address}) is on the operator's list but not "
+                "on the execution whitelist: no verdict approved it, or there was no room"
+            )
         if not protocol.alive:
             raise DeadProtocol(f"{protocol.name} has stopped paying")
         want = float(amount)
@@ -762,6 +944,21 @@ class Portfolio:
                 )
             ],
             "events": len(self.events),
+            "watchlist": (
+                None
+                if self.watchlist is None
+                else {
+                    "watched": len(self.watchlist),
+                    "dropped": len(self.watchlist.dropped),
+                    "step": int(self.watchlist.step),
+                }
+            ),
+            "execution_whitelist": (
+                None
+                if self.execution_whitelist is None
+                else self.execution_whitelist.as_list()
+            ),
+            "execution_limit": int(self.execution_limit),
         }
 
 
@@ -1005,6 +1202,17 @@ class Empire:
     capital through the same one — so replacing the simulation with a testnet is a
     change of constructor argument in
     :meth:`launch`, not a change in this class.
+
+    The fifth is the **scanner** (:mod:`agent.physics.discovery`), and it is the only
+    thing here that exists for scale. With no scanner the empire assesses every protocol
+    a venue publishes, which is the right reading for a market of seven and an
+    impossibility for a market of five hundred: a full review cycle would run the deep
+    assessment — Statement #87, the structural survey, the mirror — hundreds of times to
+    find the same handful of answers. With a scanner, :meth:`review` hands the *portfolio*
+    the job of looking, and the portfolio looks only at what survived level 1
+    (:meth:`Portfolio.discover`). Nothing else changes: the verdicts are the same verdicts
+    on the same records, and a protocol the scanner never watched was never judged — the
+    report says so as ``truncated`` rather than pretending it was refused.
     """
 
     market: Optional[ProtocolMarket]
@@ -1022,6 +1230,8 @@ class Empire:
     proofs: List[Dict[str, Any]] = field(default_factory=list)
     volatility: Optional[float] = None
     resonance: Optional[float] = None
+    scanner: Any = None
+    funnel: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         """Hand the one venue to the book, or refuse two of them.
@@ -1066,6 +1276,8 @@ class Empire:
         seed: int = 7,
         review_every: int = CYCLE,
         kill_switch: Any = None,
+        scanner: Any = None,
+        execution_limit: int = EXECUTION_LIMIT,
     ) -> "Empire":
         """Open for business: a venue, a wallet, and (if given) a body's own oracle.
 
@@ -1088,6 +1300,13 @@ class Empire:
         would mean the report printed a simulation that nothing was ever traded on. The
         wallet's whitelist comes from the venue in every case, because the venue is the
         only thing that knows what it will actually accept.
+
+        ``scanner`` is the only argument that changes *what the empire looks at* rather
+        than what it looks through: given one, every review goes through
+        :meth:`Portfolio.discover` and the deep assessment runs on the watchlist instead
+        of on the whole market. ``execution_limit`` is the cap on the resulting
+        whitelist, and it belongs to the wallet — the thing that spends — so it is written
+        there and enforced there (:meth:`Portfolio.approve`), not merely passed along.
         """
         from agent.physics.interfaces import MockWeb3Provider
         from agent.physics.risk_assessment import KillSwitch
@@ -1120,7 +1339,10 @@ class Empire:
                 seed=int(seed),
             )
         portfolio = Portfolio(
-            whitelist=provider.whitelist, cash=float(capital), provider=provider
+            whitelist=provider.whitelist,
+            cash=float(capital),
+            provider=provider,
+            execution_limit=int(execution_limit),
         )
         return cls(
             market=market,
@@ -1129,6 +1351,7 @@ class Empire:
             provider=provider,
             oracle=oracle,
             review_every=int(review_every),
+            scanner=scanner,
         )
 
     # -- the decision ------------------------------------------------------- #
@@ -1148,13 +1371,33 @@ class Empire:
         fetched *by name from the venue*, and each stake is one ``execute_stake`` call.
         A different provider therefore changes what the empire can see and touch without
         changing a line of the decision.
+
+        With a ``scanner`` attached the reading is the same reading, taken over a smaller
+        set: :meth:`Portfolio.discover` runs level 1 over everything the venue publishes
+        and level 2 over the watchlist alone, writes the surviving addresses into the
+        wallet's execution whitelist, and the plan below may only name one of them. That
+        last clause is the whole safety argument of the two-tier design — the scanner can
+        put a protocol in front of the assessment, never in front of the money.
         """
         from agent.physics.risk_assessment import CONVICTIONS
         from agent.physics.risk_assessment import review as assess_all
 
-        found = assess_all(
-            self.provider, oracle=self.oracle, min_record=self.min_record
-        )
+        approved: Optional[set] = None
+        if self.scanner is not None:
+            report = self.portfolio.discover(
+                self.provider,
+                scanner=self.scanner,
+                oracle=self.oracle,
+                min_record=self.min_record,
+            )
+            found: Dict[str, Any] = dict(report.assessments)
+            self.funnel = report.as_dict()
+            whitelist = self.portfolio.execution_whitelist
+            approved = set() if whitelist is None else set(whitelist.as_list())
+        else:
+            found = assess_all(
+                self.provider, oracle=self.oracle, min_record=self.min_record
+            )
         plan: Dict[str, Optional[Protocol]] = {}
         for bucket in BUCKETS:
             if bucket != BUCKET_SAFE and bool(getattr(self.kill_switch, "engaged")):
@@ -1163,7 +1406,9 @@ class Empire:
             admissible = [
                 item
                 for item in found.values()
-                if item.bucket == bucket and item.admissible
+                if item.bucket == bucket
+                and item.admissible
+                and (approved is None or str(item.address).lower() in approved)
             ]
             if not admissible:
                 plan[bucket] = None
@@ -1194,6 +1439,12 @@ class Empire:
             ],
             "proofs": int(submitted),
             "resonance": None if self.resonance is None else round(self.resonance, 4),
+            "funnel": self.funnel,
+            "approved": (
+                None
+                if self.portfolio.execution_whitelist is None
+                else len(self.portfolio.execution_whitelist)
+            ),
         }
         self.decisions.append(decision)
         self.log.append({"step": int(self.step), "action": "review", **decision})
@@ -1267,11 +1518,23 @@ class Empire:
         provider that publishes a shorter or later record therefore moves this number,
         which is the point — the arm has to be able to fire on what the venue says, not
         on what the simulation knows.
+
+        With a scanner attached the median is taken over the *watchlist* rather than over
+        every published protocol, and that is the same argument one level down: the arm
+        reads the world the empire is actually looking at. A market of five hundred
+        protocols measured on all five hundred, every step, is a volatility estimate that
+        costs more than the capital it protects.
         """
         from agent.physics.risk_assessment import volatility_ratio
 
+        protocols = list(self.provider.get_protocol_list())
+        if self.portfolio.watchlist is not None:
+            watched = set(self.portfolio.watchlist.addresses())
+            protocols = [
+                protocol for protocol in protocols if protocol.address in watched
+            ]
         ratios: List[float] = []
-        for protocol in self.provider.get_protocol_list():
+        for protocol in protocols:
             if not protocol.alive:
                 continue
             if protocol.bucket not in (BUCKET_ACTIVE, BUCKET_EXPERIMENTAL):
@@ -1388,6 +1651,7 @@ class Empire:
             },
             "decisions": list(self.decisions),
             "log": list(self.log),
+            "funnel": self.funnel,
             "assessments": {
                 str(step): verdicts for step, verdicts in self.assessments.items()
             },
@@ -1419,6 +1683,15 @@ class Empire:
             f"{'engaged' if getattr(self.kill_switch, 'engaged') else 'idle'}, "
             f"{len(triggers)} events",
         ]
+        if self.funnel is not None:
+            lines.append(
+                f"funnel: {self.funnel['market']} published -> "
+                f"{self.funnel['watchlist']} watched -> "
+                f"{self.funnel['approved']} approved "
+                f"(refused by scanner {self.funnel['refused_by_scanner']}, "
+                f"by portfolio {self.funnel['refused_by_portfolio']}, "
+                f"no room {self.funnel['capped']})"
+            )
         for event in triggers:
             lines.append(f"  step {event.step:>4}  {event.arm:<10} {event.reason}")
         for bucket in BUCKETS:

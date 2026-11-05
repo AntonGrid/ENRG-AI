@@ -1075,3 +1075,135 @@ def _finish(figure, plt, path, dpi, show, previous_backend):
         except Exception:  # pragma: no cover - a backend that cannot be restored
             pass
     return target
+
+
+def plot_funnel(
+    stages,
+    path: os.PathLike | str = "discovery_funnel.png",
+    *,
+    reasons=None,
+    title: str = "Discovery funnel: what a market offers, and what survives",
+    show: bool = False,
+    dpi: int = 130,
+):
+    """Draw a search: the widths that survive each gate, and what each gate cost.
+
+    ``stages`` is a sequence of ``(label, count)`` in the order the gates are passed —
+    ``DiscoveryReport.stages()`` returns exactly that — and the figure draws the counts as
+    bars that shrink, with the *difference* between two consecutive bars labelled as a
+    loss. That is the whole design decision: a funnel is a picture of what was removed,
+    not of what was measured, and a reader who subtracts two numbers should not have to
+    do it in their head.
+
+    ``reasons`` is optional and, when given, is the scanner's own count of *why* it
+    dropped what it dropped (:meth:`agent.physics.discovery.Watchlist.reasons`). Without
+    it the figure is one panel; with it, the reasons are a second panel, because "120
+    dropped" and "120 dropped for three different reasons" are different statements about
+    a market. The reasons are necessarily a subset of level 1's loss: level 2's refusals
+    are verdicts, and a verdict is not a one-line reason.
+
+    Everything is duck-typed: nothing here imports ``discovery``, ``portfolio`` or
+    ``risk_assessment``, so a figure can be drawn from a plain list of tuples in a test
+    and cannot make the plotting layer a dependency of the decision layer.
+
+    Returns the path written. Raises ``ImportError`` with the install hint when
+    ``matplotlib`` is missing.
+    """
+    try:
+        plt, previous_backend = _pyplot(show)
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "plotting needs matplotlib: pip install 'enrg-ai[plot]' "
+            "(or pip install matplotlib)"
+        ) from exc
+
+    rows = [(str(label), int(count)) for label, count in stages] or [("market", 0)]
+    counts = np.array([count for _, count in rows], dtype=float)
+    top = max(float(counts.max()), 1.0)
+    palette = ("#1b4f72", "#2874a6", "#5499c7", "#a9cce3", "#d4e6f1")
+    height = 0.95 * len(rows) + 2.4
+    if reasons:
+        figure, (left, right) = plt.subplots(
+            1,
+            2,
+            figsize=(12.4, height),
+            gridspec_kw={"width_ratios": [2.6, 1.0]},
+        )
+    else:  # pragma: no cover - the one-panel figure is drawn by the same code below
+        figure, left = plt.subplots(1, 1, figsize=(9.6, height))
+        right = None
+
+    positions = np.arange(len(rows))[::-1].astype(float)
+    left.barh(
+        positions,
+        counts,
+        height=0.62,
+        color=[palette[index % len(palette)] for index in range(len(rows))],
+        edgecolor="#1b2631",
+        linewidth=0.8,
+    )
+    for position, (label, count), width in zip(positions, rows, counts):
+        left.text(
+            width + top * 0.012,
+            position,
+            f"{count}",
+            va="center",
+            fontsize=11,
+            fontweight="bold",
+            color="#1b2631",
+        )
+        left.text(
+            top * 0.015,
+            position,
+            label,
+            va="center",
+            fontsize=9.5,
+            color="white" if width > top * 0.2 else "#1b2631",
+        )
+    for index in range(len(rows) - 1):
+        dropped = int(rows[index][1]) - int(rows[index + 1][1])
+        if dropped <= 0:
+            continue
+        share = dropped / max(int(rows[index][1]), 1)
+        left.annotate(
+            f"−{dropped} ({share:.0%})",
+            xy=(max(float(counts[index + 1]), 1.0), positions[index]),
+            xytext=(
+                top * 1.04,
+                (positions[index] + positions[index + 1]) / 2.0,
+            ),
+            fontsize=9,
+            color="#b03a2e",
+            va="center",
+            arrowprops={"arrowstyle": "->", "color": "#b03a2e", "linewidth": 0.9},
+        )
+    left.set_xlim(0.0, top * 1.24)
+    left.set_yticks([])
+    left.set_xlabel("protocols")
+    left.set_title(title, fontsize=11, loc="left")
+    left.grid(axis="x", alpha=0.25)
+
+    if right is not None:
+        names = list(reasons)[::-1]
+        values = [int(reasons[name]) for name in names]
+        right.barh(
+            np.arange(len(names)),
+            values,
+            height=0.6,
+            color="#b03a2e",
+            alpha=0.85,
+            edgecolor="#1b2631",
+            linewidth=0.6,
+        )
+        for index, value in enumerate(values):
+            right.text(value + max(values) * 0.02, index, f"{value}", va="center",
+                       fontsize=9, color="#1b2631")
+        right.set_yticks(np.arange(len(names)), names, fontsize=8.5)
+        right.set_xlim(0.0, max(values) * 1.22)
+        right.set_xlabel("protocols")
+        right.set_title("why level 1 dropped them", fontsize=10, loc="left")
+        right.grid(axis="x", alpha=0.25)
+
+    figure.tight_layout()
+    return _finish(figure, plt, path, dpi, show, previous_backend)
+
