@@ -596,13 +596,39 @@ python -m agent.trade.loop --once --dry-run --json cycle.json    # one cycle, as
 python -m agent.trade.loop --loop --interval 300                 # the container's command
 ```
 
+### How wide the hunt is: `SCAN_LIMIT` and `MEASURE_LIMIT`
+
+A cycle reads the market in two stages, and both widths are the operator's, not the code's:
+`SCAN_LIMIT` pools go through the two gates (default **200**, the feed's own
+`POOLS_LIMIT` — a test holds the two equal so this file cannot disagree with the funnel it
+describes), then `MEASURE_LIMIT` of the approved ones are measured by the hunter (default
+**50**). A first deployment ran `50` and `10`: enough to see the pipe work, not enough to
+call it a hunt.
+
+```bash
+SCAN_LIMIT=350 MEASURE_LIMIT=20 python -m agent.trade.loop --once
+python -m agent.trade.loop --once --limit 9 --hunt 3    # a flag beats the environment
+```
+
+Both are honoured from `.env` (the container reads it), a flag overrides either, and `0`,
+`-5` or `lots` stop the process with the variable named — a scan of nothing is not
+"unlimited", and a loop that read it that way would hammer a feed until it stopped
+answering. The cycle prints the width it used: `market real (scan 200, measure 50)`.
+
 ### Two ceilings, and a wallet smaller than both
 
 `MAX_TRADE_SIZE_USD` is what the operator will risk on a single transaction.
 `MAX_TRADE_FRACTION` (default `0.20`) is a share of what the wallet holds **at that
 moment** — the balance is read from the node on the same cycle that sizes the trade, never
-remembered from a previous one. The smaller number wins, so `MAX_TRADE_SIZE_USD=50` on the
-`$18` wallet this was written for produces `$3.60`, and the log says which ceiling decided:
+remembered from a previous one. The smaller number wins.
+
+`.env.example` ships `MAX_TRADE_SIZE_USD=10.0`, because the wallet this was written for
+holds about `$18`: the trade is then `$3.60`, and the **fraction** is what decided it. A
+ceiling above the wallet never binds and is not a guard — it is a number in a file. Raise it
+when the wallet grows; leave the fraction where it is.
+
+The double below is deliberately larger — a `$50` ceiling and a `$68` wallet — so that both
+ceilings can be seen at once, with the log naming the one that decided:
 
 ```text
 ── cycle 1 · DRY RUN (nothing will be signed) · chain 11155111 · block 101
@@ -643,6 +669,66 @@ That line is the honest answer on a first run, and on most runs. No amount is pr
 it, because without a vault there is no token to stake: a dollar figure there would be a
 number about nothing.
 
+### The address book: why a fresh deployment prints *book empty*
+
+The book is not a list of protocols you like. It is the list of addresses this venue may
+stake into, and an entry has to be a **vault of this interface**:
+
+```solidity
+event YieldDistributed(uint256 indexed epoch, uint256 rateE18);   // the record
+function stake(uint256 amount) external;                          // capital in
+function withdraw(uint256 amount) external;                       // capital out
+```
+
+Two facts follow, and both of them surprise a first run:
+
+* **no `YieldDistributed` log, no price.** `get_protocol_list()` reads those logs out of
+  the last `TESTNET_LOOKBACK` blocks (`5000` by default). A book entry with no log is
+  *not published* — correctly, because a protocol with no record cannot be measured, and
+  the hunter will not size a position on nothing. The cycle now says which entry failed
+  instead of one word about the whole book:
+  `Aave V3 USDC (0x724d…c637): no YieldDistributed(uint256,uint256) log in the last 5000 blocks`.
+* **a dApp is not a vault.** Aave's `aUSDC`, a Uniswap V3 pool, a Curve gauge: real
+  addresses, real money, and none of them answer `stake(uint256)` or emit our event. They
+  belong in a book about *them*, not in this one.
+
+`book.example.json` in the repo root is a file the loader accepts, and it holds both facts:
+two **verified** Arbitrum One addresses (Aave V3 `aArbUSDCn`
+`0x724dc807b04555b71ed48a6896b6F41593b8C637` over native USDC
+`0xaf88d065e77c8cC2239327C5EDb3A432268e5831`; Uniswap V3 USDC/WETH 0.05 %
+`0xC6962004f452bE9203591991D15f6b388e09E8D0`, read back from the factory's `getPool`),
+written down as the *diagnosis* they are, plus the template for your own vault. Copy it and
+ask the question:
+
+```bash
+cp book.example.json data/book.json          # the container reads /data/book.json
+docker compose exec trader python -m agent.trade.loop --book-report
+```
+
+```text
+book report — 2 entry/entries · lookback 5000 blocks · chain 42161
+  USDC                     0x724dc807b04555b71ed48a6896b6f41593b8c637  no record
+                           market: no pool in the report is named like this vault
+  USDC-WETH                0xc6962004f452be9203591991d15f6b388e09e8d0  no record
+                           market: no pool in the report is named like this vault
+  nothing to price: an entry has to emit YieldDistributed(uint256,uint256) (and a cycle
+  has to see it inside the lookback window) before the hunter can measure it
+```
+
+(That run is real: `SCAN_LIMIT=200 MEASURE_LIMIT=50`, the public Arbitrum RPC, live
+DeFiLlama. Both addresses published no record — as they must, being a lending pool's token
+and a pool, not vaults — and neither was named by the market's report, so nothing was
+priced. `--book-report` exits `4` when nothing can be priced, the same code the hunter uses
+for "nothing to hunt in", so a script can tell an empty book from a broken node.)
+
+To get a book that prices, deploy the vault — `tests/test_physics_real_testnet.py` carries
+the reference contract (`TestVault.sol`: `publish(rateE18)`, `stake`, `withdraw`, the four
+events) and compiles it with Foundry — publish one `YieldDistributed`, and put **its**
+address in `data/book.json` with `token` set to the ERC20 it pulls and `decimals` to that
+token's own (6 for USDC). `name` must be spelled like the DeFiLlama pool you want it
+measured against, or the cycle answers the other half of the truth: *the market has no pool
+named like this vault*.
+
 ### Dry run is the default, and it is not a flag inside the venue
 
 `DRY_RUN` unset is a dry run; only `0/false/no/off` makes the loop sign, so a typo
@@ -660,9 +746,11 @@ is **not** treated as an empty portfolio. The process stops and names the file.
 `UNMEASURED` never closes a position (a feed that stopped publishing is not evidence against
 a record); `FORMULA`/`DISHONEST`/`THIN` do.
 
-Tests: `tests/test_trade_loop.py` — 35 of them, no network and no chain: the caps, the
+Tests: `tests/test_trade_loop.py` — 50 of them, no network and no chain: the caps, the
 fail-closed refusals, the dry run's empty ledger, the exit path, the state file's refusal to
-lie, and the CLI's mode. The provider's new read has its own in
+lie, the widths of the hunt (`SCAN_LIMIT`/`MEASURE_LIMIT`, and the flag that beats them), the
+address book's two kinds of empty, the book report, and the CLI's mode. The provider's new
+read has its own in
 `tests/test_physics_real_testnet.py` (six more: two decimals, a missing signer, a read that
 failed, a vault outside the book).
 
@@ -831,8 +919,10 @@ TESTNET_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY_HERE
 TESTNET_PRIVATE_KEY=0x...
 # asserted against the node's own chain id; 42161 = Arbitrum One (empty = trust the node)
 TESTNET_CHAIN_ID=42161
-# the whitelist: nothing outside this book can be staked into
-TESTNET_PROTOCOLS_FILE=book.json
+# the whitelist: nothing outside this book can be staked into, and an entry has to be
+# a vault of this interface (stake/withdraw/YieldDistributed) — see book.example.json.
+# In the container the path is /data/book.json; on a host, ./book.json
+TESTNET_PROTOCOLS_FILE=/data/book.json
 # still 0: 42161 is a chain where credits are money, and the other half of the lock is in code
 TESTNET_ALLOW_MAINNET=0
 ```
@@ -999,7 +1089,9 @@ error with a name, never a silent fallback.
 | `TESTNET_ALLOW_MAINNET` | `1` to let a real-money chain through (with `allow_mainnet=True` in code) | unset → refused |
 | `TESTNET_ABI_FILE` | override the built-in vault ABI | built in |
 | `DRY_RUN` | `0/false/no/off` makes the trader sign; anything else (including unset, and a typo) computes and logs only | unset → **dry run** |
-| `MAX_TRADE_SIZE_USD` | the most one transaction may commit | `0` → no USD ceiling of its own |
+| `SCAN_LIMIT` | pools the funnel reads each cycle (`--limit` overrides it) | `200` (= the feed's `POOLS_LIMIT`) |
+| `MEASURE_LIMIT` | approved pools the hunter measures each cycle (`--hunt` overrides it) | `50` |
+| `MAX_TRADE_SIZE_USD` | the most one transaction may commit | `0` → no USD ceiling of its own; `.env.example` ships `10.0` |
 | `MAX_TRADE_FRACTION` | a share of the wallet, read from the chain on the same cycle | `0.20` |
 | `ETH_USD_PRICE` | how the native balance is valued; without it the fraction applies to the stable credits only | unset → ETH unpriced |
 | `GAS_RESERVE_ETH` | below this, a stake is refused instead of sent | `0.0005` |

@@ -6,12 +6,16 @@ in this order, each of which can stop the cycle:
 1. **What may be traded?** The operator's address book
    (``TESTNET_PROTOCOLS``) and the record each vault has published on chain
    (``RealTestnetProvider.get_protocol_list``). This file never chooses an address: a
-   venue with an empty book trades nothing, and says so in one line.
+   venue with an empty book trades nothing, and says why in as many lines as it has
+   entries — an empty book and a book of addresses that publish no ``YieldDistributed``
+   are different faults, and the message names the one that happened.
 2. **What does the market say about it?** ``DiscoveryEngine`` reads DeFiLlama, the two
    gates screen it, and ``VolatilityHunter`` measures each approved pool — ``PANIC``,
    ``CALM``, ``THIN``, ``FORMULA``, ``DISHONEST``, ``UNMEASURED``. Those are the verdicts
    of :mod:`agent.physics.volatility_hunter`, unchanged: this loop **consumes** them and
-   does not re-implement a single threshold.
+   does not re-implement a single threshold. How wide the hunt is, is the operator's:
+   ``SCAN_LIMIT`` pools read (200), ``MEASURE_LIMIT`` measured (50), ``--limit``/``--hunt``
+   over them, and ``--book-report`` to say per entry why nothing was priced.
 3. **How much?** The balance is read from the chain *on the same cycle*
    (``provider.balance``) and :func:`agent.trade.capital.size_trade` cuts the amount to the
    smaller of ``MAX_TRADE_SIZE_USD`` and ``MAX_TRADE_FRACTION`` of the wallet — so an $18
@@ -56,13 +60,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
+from agent.physics.real_testnet_provider import YIELD_EVENT_SIGNATURE
 from agent.physics.volatility_hunter import PanicSignal
 from agent.trade.capital import Sizing, TradeSize, _flag, size_trade
 
 __all__ = [
     "Action",
     "Cycle",
+    "DEFAULT_MEASURE_LIMIT",
+    "DEFAULT_SCAN_LIMIT",
     "ENV_INTERVAL",
+    "ENV_MEASURE",
+    "ENV_MARKET",
+    "ENV_SCAN",
     "ENV_STATE",
     "EXIT_VERDICTS",
     "ENTRY_VERDICTS",
@@ -75,6 +85,18 @@ __all__ = [
 ENV_STATE = "TRADER_STATE"
 ENV_INTERVAL = "TRADE_INTERVAL"
 ENV_MARKET = "TRADE_MARKET"
+ENV_SCAN = "SCAN_LIMIT"
+ENV_MEASURE = "MEASURE_LIMIT"
+
+#: How wide the hunt is: how many pools the funnel reads, and how many of the approved
+#: ones the hunter measures. The first is the feed's own ``POOLS_LIMIT`` (a test holds
+#: the two equal, so this number cannot drift away from the funnel it describes); the
+#: second is the part a cycle can afford, because every measured pool is another read of
+#: its history. Both are the loop's to widen — an operator on a fast box with a feed that
+#: answers in a second may hunt two hundred pools a cycle, and one on a slow route may
+#: not — which is why they are environment variables and not constants.
+DEFAULT_SCAN_LIMIT = 200
+DEFAULT_MEASURE_LIMIT = 50
 
 #: The state the loop writes, and the default the container mounts. A relative path
 #: because a host run should not need ``/data`` to exist.
@@ -100,6 +122,50 @@ class TradeError(RuntimeError):
 def _normalise(name: object) -> str:
     """A pool or vault name as comparable words: lower case, letters and digits only."""
     return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _count(value: object, source: str) -> int:
+    """A positive count, and the refusal names where it came from.
+
+    ``SCAN_LIMIT=0`` and ``--limit 0`` fail the same way and for the same reason: a scan
+    of nothing hunts nothing, and a loop that reads that as "unlimited" would hammer a
+    feed until it stopped answering. ``200.0`` is accepted because a ``.env`` file is
+    written by hand and writes decimals; a word is not.
+    """
+    text = str(value if value is not None else "").strip()
+    try:
+        number = int(float(text))
+    except (TypeError, ValueError):
+        raise TradeError(
+            f"{source}={text!r} is not a count: give a positive integer"
+        ) from None
+    if number <= 0:
+        raise TradeError(f"{source}={number} is not a count: nothing would be scanned")
+    return number
+
+
+def _limit(name: str, default: int, env: Optional[Mapping[str, str]] = None) -> int:
+    """``SCAN_LIMIT``/``MEASURE_LIMIT`` if written down, else the loop's own default."""
+    source: Mapping[str, str] = os.environ if env is None else env
+    raw = str(source.get(name, "")).strip()
+    return int(default) if not raw else _count(raw, name)
+
+
+def _signal_index(report: Any) -> Dict[str, PanicSignal]:
+    """The report's signals by normalised pool name — the entry point both the cycle and
+    the book report read, so a diagnostic can never disagree with the decision it is
+    supposed to explain."""
+    index: Dict[str, PanicSignal] = {}
+    for signal in getattr(report, "signals", ()) or ():
+        key = _normalise(getattr(signal, "name", ""))
+        if not key:
+            continue
+        known = index.get(key)
+        if known is None or (
+            getattr(signal, "fired", False) and not getattr(known, "fired", False)
+        ):
+            index[key] = signal
+    return index
 
 
 @dataclass
@@ -364,6 +430,8 @@ class Trader:
                 f"the book could not be read ({type(exc).__name__}: {exc})"
             )
             return []
+        if not protocols:
+            self._empty_book(cycle)
         for protocol in protocols:
             apy = getattr(protocol, "implied_apy", None)
             record = getattr(protocol, "returns", None)
@@ -381,6 +449,34 @@ class Trader:
                 }
             )
         return protocols
+
+    def _empty_book(self, cycle: Cycle) -> None:
+        """Why nothing was priced: no entry at all, or entries that published nothing.
+
+        "book empty" on its own sends an operator looking for a network fault. The two
+        causes are different and only one of them is a fault: an empty book is a
+        configuration that says "trade nothing", and a book whose vaults published no
+        ``YieldDistributed`` log is usually a book of the wrong kind of address. Naming
+        which one this is costs one log line and saves an afternoon.
+        """
+        config = getattr(self.venue, "config", None)
+        book = getattr(config, "book", None)
+        if book is None:  # a stub, or a venue without a book: run_once's line is enough
+            return
+        entries = list(book)
+        if not entries:
+            cycle.warnings.append(
+                "the operator's book is empty — no address is listed, so nothing can be "
+                "priced and nothing staked (see book.example.json)"
+            )
+            return
+        lookback = int(getattr(config, "lookback", 0) or 0)
+        for entry in entries:
+            cycle.warnings.append(
+                f"{getattr(entry, 'name', '?')} ({getattr(entry, 'address', '?')}): no "
+                f"{YIELD_EVENT_SIGNATURE} log in the last {lookback} blocks — an entry is "
+                "a vault of this interface, not a lending pool's share token"
+            )
 
     def _market(self, cycle: Cycle) -> Any:
         """Read the wild market once; a dead feed is a warning, never an exception."""
@@ -420,17 +516,7 @@ class Trader:
         When two pools normalise to the same words, the one that fired is the one that
         matters to a book: it is the only verdict that sizes a trade.
         """
-        index: Dict[str, PanicSignal] = {}
-        for signal in getattr(report, "signals", ()) or ():
-            key = _normalise(getattr(signal, "name", ""))
-            if not key:
-                continue
-            known = index.get(key)
-            if known is None or (
-                getattr(signal, "fired", False) and not getattr(known, "fired", False)
-            ):
-                index[key] = signal
-        return index
+        return _signal_index(report)
 
     def _balance(self, address: str, cycle: Cycle) -> Any:
         """The wallet, read now. ``None`` means the loop cannot see it and will not size."""
@@ -758,6 +844,88 @@ def _market_arm(mode: str, limit: int, hunt: int) -> Optional[Callable[[], Any]]
     return once
 
 
+def _book_report(
+    venue: Any,
+    market: Optional[Callable[[], Any]],
+    printer: Callable[[str], None] = print,
+) -> int:
+    """``--book-report``: for every address in the book, the three things that must be
+    true before a cycle can act — does it publish a record, does the market name it, and
+    is it a vault at all.
+
+    "book empty" sends an operator looking for a broken node. The cause is usually one
+    address: a token that is not a vault, or a vault whose record predates the lookback
+    window. This mode says which, per entry, and exits ``4`` when nothing can be priced —
+    the same code the hunter uses for "there is nothing to hunt in", so a shell script
+    can tell an empty market from a broken one.
+    """
+    config = getattr(venue, "config", None)
+    book = getattr(config, "book", None)
+    entries = list(book) if book is not None else []
+    lookback = int(getattr(config, "lookback", 0) or 0)
+    chain = getattr(venue, "chain_id", 0) or "?"
+    printer(
+        f"book report — {len(entries)} entry/entries · lookback {lookback} blocks · "
+        f"chain {chain}"
+    )
+    if not entries:
+        printer("  empty — no address is listed, so nothing can be priced or staked")
+        printer(
+            '  an entry is {"address": "0x…", "name": "USDC", "token": "0x…", '
+            '"decimals": 6} — see book.example.json'
+        )
+        return 4
+
+    index: Dict[str, PanicSignal] = {}
+    if market is not None:
+        try:
+            index = _signal_index(market())
+        except Exception as exc:  # noqa: BLE001 - a report is a report, not a crash
+            printer(
+                f"  market unreadable ({type(exc).__name__}: {exc}): only the chain is "
+                "reported"
+            )
+
+    published = 0
+    for entry in entries:
+        name = str(getattr(entry, "name", ""))
+        address = str(getattr(entry, "address", ""))
+        records = 0
+        note = ""
+        read = getattr(venue, "fetch_protocol_history", None)
+        if read is None:  # pragma: no cover - a stub might not have it
+            note = "the venue cannot read a record"
+        else:
+            try:
+                records = len(list(read(address)))
+            except Exception as exc:  # noqa: BLE001 - the line is the report
+                note = f"the record could not be read ({type(exc).__name__}: {exc})"
+        published += 1 if records else 0
+        signal = index.get(_normalise(name))
+        if market is None:
+            verdict = "market off"
+        elif signal is not None:
+            verdict = (
+                f"{getattr(signal, 'verdict', '?')} "
+                f"{float(getattr(signal, 'confidence', 0.0) or 0.0):.2f}"
+            )
+        else:
+            verdict = "no pool in the report is named like this vault"
+        if records:
+            record = f"{records} record(s)"
+        else:
+            record = "no record" + (f" — {note}" if note else "")
+        printer(f"  {name:<24} {address}  {record}")
+        printer(f"  {'':<24} market: {verdict}")
+    if not published:
+        printer(
+            f"  nothing to price: an entry has to emit {YIELD_EVENT_SIGNATURE} "
+            "(and a cycle has to see it inside the lookback window) before the hunter "
+            "can measure it"
+        )
+    return 0 if published else 4
+
+
 def _venue_from_env() -> Any:
     """The real venue. An L2 is a mainnet here, so the two-key lock still applies."""
     from agent.physics.real_testnet_provider import RealTestnetProvider
@@ -800,8 +968,29 @@ def _parser() -> "argparse.ArgumentParser":
         default=str(os.environ.get(ENV_MARKET) or "real").lower(),
         help=f"which market to read (default real, env {ENV_MARKET})",
     )
-    parser.add_argument("--limit", type=int, default=50, help="pools the funnel scans")
-    parser.add_argument("--hunt", type=int, default=10, help="approved pools to measure")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            f"pools the funnel scans (default {DEFAULT_SCAN_LIMIT}, env {ENV_SCAN})"
+        ),
+    )
+    parser.add_argument(
+        "--hunt",
+        type=int,
+        default=None,
+        help=(
+            "approved pools to measure "
+            f"(default {DEFAULT_MEASURE_LIMIT}, env {ENV_MEASURE})"
+        ),
+    )
+    parser.add_argument(
+        "--book-report",
+        dest="book_report",
+        action="store_true",
+        help="say per book entry why it is or is not priced, and exit (4 = nothing to price)",
+    )
     parser.add_argument(
         "--state",
         default=os.environ.get(ENV_STATE) or DEFAULT_STATE,
@@ -835,6 +1024,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
 
     try:
+        # The two widths of the hunt: the operator's `.env` first, the flag over it.
+        scan_limit = (
+            _limit(ENV_SCAN, DEFAULT_SCAN_LIMIT)
+            if args.limit is None
+            else _count(args.limit, "--limit")
+        )
+        measure_limit = (
+            _limit(ENV_MEASURE, DEFAULT_MEASURE_LIMIT)
+            if args.hunt is None
+            else _count(args.hunt, "--hunt")
+        )
         sizing = Sizing.from_env()
         overrides: Dict[str, Any] = {}
         if args.max_usd is not None:
@@ -857,12 +1057,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: the venue cannot be configured — {exc}", file=sys.stderr)
         return 2
 
+    if args.book_report:
+        # Before the trader is built: a report about the book must not depend on a state
+        # file, a policy or a cycle.
+        return _book_report(venue, _market_arm(args.market, scan_limit, measure_limit))
+
     try:
         trader = Trader(
             venue=venue,
             sizing=sizing,
             state_path=Path(args.state) if args.state else None,
-            market=_market_arm(args.market, args.limit, args.hunt),
+            market=_market_arm(args.market, scan_limit, measure_limit),
         )
     except TradeError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -870,7 +1075,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"ENRG-AI trader — {sizing}")
     print(f"  venue  {getattr(venue, 'name', 'venue')}")
-    print(f"  market {args.market} (scan {args.limit}, measure {args.hunt})")
+    print(f"  market {args.market} (scan {scan_limit}, measure {measure_limit})")
     print(f"  state  {trader.state_path}")
     if trader.positions:
         print(f"  held   {len(trader.positions)} position(s) from earlier cycles")

@@ -22,6 +22,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -490,7 +491,14 @@ def wire(monkeypatch, venue: FakeVenue, *signals: PanicSignal) -> None:
     monkeypatch.setattr(
         L, "_market_arm", lambda mode, limit, hunt: (lambda: report(*signals))
     )
-    for name in ("DRY_RUN", "MAX_TRADE_SIZE_USD", "MAX_TRADE_FRACTION", "ETH_USD_PRICE"):
+    for name in (
+        "DRY_RUN",
+        "MAX_TRADE_SIZE_USD",
+        "MAX_TRADE_FRACTION",
+        "ETH_USD_PRICE",
+        L.ENV_SCAN,
+        L.ENV_MEASURE,
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -624,3 +632,240 @@ def test_a_dry_run_warns_about_an_unwritable_state_file_instead(tmp_path):
     ).run_once()
 
     assert any("could not be written" in warning for warning in cycle.warnings)
+
+
+# ── how wide the hunt is: SCAN_LIMIT and MEASURE_LIMIT ──────────────────────
+
+
+def test_the_scan_width_comes_from_the_environment():
+    """``SCAN_LIMIT=350`` is a wider hunt than the loop's own 200, not a new rule."""
+    assert L._limit(L.ENV_SCAN, L.DEFAULT_SCAN_LIMIT, {}) == L.DEFAULT_SCAN_LIMIT
+    assert L._limit(L.ENV_SCAN, L.DEFAULT_SCAN_LIMIT, {"SCAN_LIMIT": "350"}) == 350
+    assert L._limit(L.ENV_MEASURE, L.DEFAULT_MEASURE_LIMIT, {"MEASURE_LIMIT": "8"}) == 8
+    # a `.env` is written by hand and a hand writes "200.0"; an empty value is a default
+    assert L._limit(L.ENV_SCAN, 200, {"SCAN_LIMIT": "200.0"}) == 200
+    assert L._limit(L.ENV_SCAN, 200, {"SCAN_LIMIT": "  "}) == 200
+
+
+def test_a_width_of_nothing_is_a_refusal_with_a_name():
+    """``0`` is not "unlimited": a loop that read it that way would hammer the feed."""
+    with pytest.raises(L.TradeError) as raised:
+        L._count("0", "SCAN_LIMIT")
+    assert "SCAN_LIMIT=0" in str(raised.value)
+    with pytest.raises(L.TradeError):
+        L._count("-5", "--hunt")
+    with pytest.raises(L.TradeError) as raised:
+        L._count("many", "--limit")
+    assert "--limit='many'" in str(raised.value)
+
+
+def test_the_default_scan_width_is_the_funnels_own():
+    """The loop does not carry a second opinion about how big the market is."""
+    from agent.physics.defillama_adapter import POOLS_LIMIT, WATCH_LIMIT
+
+    assert L.DEFAULT_SCAN_LIMIT == POOLS_LIMIT
+    assert L.DEFAULT_MEASURE_LIMIT <= WATCH_LIMIT
+
+
+def arm_recorder(
+    monkeypatch, seen: List[Tuple[str, int, int]], *signals: PanicSignal
+) -> None:
+    """Replace the market arm with one that writes down how wide it was asked to read."""
+
+    def arm(mode: str, limit: int, hunt: int):
+        seen.append((str(mode), int(limit), int(hunt)))
+        return lambda: report(*signals)
+
+    monkeypatch.setattr(L, "_market_arm", arm)
+
+
+def test_the_cli_reads_the_width_of_the_hunt_from_the_environment(
+    monkeypatch, tmp_path, capsys
+):
+    seen: List[Tuple[str, int, int]] = []
+    wire(monkeypatch, FakeVenue(), signal())
+    arm_recorder(monkeypatch, seen, signal())
+    monkeypatch.setenv(L.ENV_SCAN, "300")
+    monkeypatch.setenv(L.ENV_MEASURE, "25")
+
+    assert L.main(["--once", "--state", str(tmp_path / "s.json")]) == 0
+
+    assert seen == [("real", 300, 25)]
+    assert "scan 300, measure 25" in capsys.readouterr().out
+
+
+def test_the_flag_beats_the_environment_and_the_environment_beats_the_default(
+    monkeypatch, tmp_path
+):
+    seen: List[Tuple[str, int, int]] = []
+    wire(monkeypatch, FakeVenue(), signal())
+    arm_recorder(monkeypatch, seen, signal())
+
+    monkeypatch.delenv(L.ENV_SCAN, raising=False)
+    monkeypatch.delenv(L.ENV_MEASURE, raising=False)
+    assert L.main(["--once", "--state", str(tmp_path / "a.json")]) == 0
+    assert seen[-1] == ("real", L.DEFAULT_SCAN_LIMIT, L.DEFAULT_MEASURE_LIMIT)
+
+    monkeypatch.setenv(L.ENV_SCAN, "300")
+    monkeypatch.setenv(L.ENV_MEASURE, "25")
+    flags = ["--once", "--limit", "9", "--hunt", "3", "--state", str(tmp_path / "b.json")]
+    assert L.main(flags) == 0
+    assert seen[-1] == ("real", 9, 3)
+
+
+def test_a_bad_width_stops_the_cli_before_a_cycle(monkeypatch, tmp_path, capsys):
+    seen: List[Tuple[str, int, int]] = []
+    wire(monkeypatch, FakeVenue(), signal())
+    arm_recorder(monkeypatch, seen, signal())
+    monkeypatch.setenv(L.ENV_SCAN, "lots")
+
+    assert L.main(["--once", "--state", str(tmp_path / "s.json")]) == 2
+    assert "SCAN_LIMIT='lots' is not a count" in capsys.readouterr().err
+    assert seen == []
+
+    monkeypatch.delenv(L.ENV_SCAN)
+    assert L.main(["--once", "--limit", "0", "--state", str(tmp_path / "s.json")]) == 2
+    assert "--limit=0 is not a count" in capsys.readouterr().err
+    assert seen == []
+
+
+# ── the address book: one example the loader accepts, and why it is empty ────
+
+
+def example_book_path() -> Path:
+    """``book.example.json`` in the repo root — the file the operator is told to copy."""
+    return Path(L.__file__).resolve().parents[2] / "book.example.json"
+
+
+def test_the_example_book_is_a_book_the_venue_accepts():
+    """The example is loaded by the real loader, so it cannot document a shape it fails."""
+    from agent.physics.real_testnet_provider import ProtocolBook
+
+    book = ProtocolBook.load(str(example_book_path()))
+
+    assert len(book) == 2
+    for row in book:
+        assert row.name and row.address.startswith("0x") and len(row.address) == 42
+        assert row.decimals == 6
+        assert row.token.startswith("0x")
+    # the reader's notes are ignored by the loader, so the file can explain itself
+    payload = json.loads(example_book_path().read_text(encoding="utf-8"))
+    assert "_readme" in payload and "protocols" in payload
+
+
+def book_of(*rows: Dict[str, Any]) -> Any:
+    from agent.physics.real_testnet_provider import ProtocolBook
+
+    return ProtocolBook.from_payload({"protocols": list(rows)})
+
+
+def book_entry(address: str = VAULT, name: str = "Aave V3 USDC") -> Dict[str, Any]:
+    return {"address": address, "name": name, "bucket": "active", "decimals": 6}
+
+
+def with_book(venue: FakeVenue, book: Any, lookback: int = 5_000) -> FakeVenue:
+    """Give a stub the one attribute the diagnostics need: the book it was built from."""
+    venue.config = SimpleNamespace(book=book, lookback=lookback)  # type: ignore[attr-defined]
+    return venue
+
+
+def test_an_empty_book_names_the_configuration_and_not_the_network():
+    venue = with_book(FakeVenue(published=[]), book_of())
+    cycle = trader(venue).run_once()
+
+    assert any("the operator's book is empty" in warning for warning in cycle.warnings)
+    assert any("book.example.json" in warning for warning in cycle.warnings)
+
+
+def test_a_book_whose_vaults_published_nothing_names_each_one():
+    """The line that turns "book empty" into "this address is not a vault"."""
+    venue = with_book(FakeVenue(published=[]), book_of(book_entry()))
+    cycle = trader(venue).run_once()
+
+    warnings = [warning for warning in cycle.warnings if VAULT in warning]
+    assert warnings, cycle.warnings
+    assert "Aave V3 USDC" in warnings[0]
+    assert L.YIELD_EVENT_SIGNATURE in warnings[0]
+    assert "5000 blocks" in warnings[0]
+
+
+def test_a_venue_without_a_book_still_says_nothing_to_price():
+    """A stub that answers no ``config`` keeps the old one-line behaviour."""
+    cycle = trader(FakeVenue(published=[]), signal()).run_once()
+
+    assert any("nothing to price" in warning for warning in cycle.warnings)
+
+
+# ── the book report: the diagnostic that answers "why is it empty?" ─────────
+
+
+@dataclass
+class BookVenue(FakeVenue):
+    """A venue that also answers for its records, address by address."""
+
+    records: Dict[str, List[float]] = field(default_factory=dict)
+    config: Any = None
+
+    def fetch_protocol_history(
+        self, address: str, steps: Optional[int] = None
+    ) -> List[float]:
+        return list(self.records.get(str(address).lower(), ()))
+
+
+def test_the_book_report_says_which_entry_has_no_record():
+    venue = BookVenue(published=[], records={})
+    with_book(venue, book_of(book_entry(), book_entry(OTHER, "UNI V3 USDC-ETH")))
+    printed: List[str] = []
+
+    assert L._book_report(venue, None, printed.append) == 4
+
+    text = "\n".join(printed)
+    assert "2 entry/entries" in text
+    assert "5000 blocks" in text
+    for address in (VAULT, OTHER):
+        assert address in text
+    assert "no record" in text
+    assert "nothing to price" in text
+    assert L.YIELD_EVENT_SIGNATURE in text
+
+
+def test_the_book_report_says_which_entry_published_and_what_the_market_thinks():
+    venue = BookVenue(published=[], records={VAULT: [0.0001] * 60})
+    with_book(venue, book_of(book_entry()))
+    printed: List[str] = []
+
+    assert L._book_report(venue, lambda: report(signal()), printed.append) == 0
+
+    text = "\n".join(printed)
+    assert "60 record(s)" in text
+    assert "PANIC" in text
+    assert "nothing to price" not in text
+
+
+def test_the_book_report_survives_a_market_that_cannot_be_read():
+    def boom():
+        raise ConnectionError("no route to host")
+
+    venue = BookVenue(published=[], records={VAULT: [0.0001]})
+    with_book(venue, book_of(book_entry()))
+    printed: List[str] = []
+
+    assert L._book_report(venue, boom, printed.append) == 0
+    assert any("market unreadable" in line for line in printed)
+
+
+def test_the_book_report_says_empty_and_nothing_else():
+    printed: List[str] = []
+
+    assert L._book_report(FakeVenue(), None, printed.append) == 4
+    assert "empty" in "\n".join(printed)
+
+
+def test_the_cli_reports_the_book_and_runs_no_cycle(monkeypatch, capsys):
+    wire(monkeypatch, FakeVenue(), signal())
+
+    assert L.main(["--book-report"]) == 4
+    printed = capsys.readouterr().out
+    assert "book report" in printed
+    assert "empty" in printed
+    assert "cycle 1" not in printed   # no cycle was run, and no state file was written

@@ -1,0 +1,59 @@
+{
+  "_readme": [
+    "The operator's address book — the whitelist. Copy it to data/book.json (the container",
+    "reads /data/book.json; TESTNET_PROTOCOLS_FILE names the path) or set TESTNET_PROTOCOLS",
+    "to the same JSON inline.",
+    "",
+    "An entry is a VAULT OF THIS INTERFACE, not a dApp: a contract that answers",
+    "stake(uint256), withdraw(uint256), and publishes a record by emitting",
+    "YieldDistributed(uint256 indexed epoch, uint256 rateE18). A record is what",
+    "get_protocol_list() reads: the YieldDistributed logs that address emitted in the last",
+    "TESTNET_LOOKBACK blocks (5000 by default). No log, no record, no price, no trade.",
+    "",
+    "The two entries below are REAL Arbitrum One addresses, and they are here to be",
+    "DIAGNOSED, not traded. Aave's aToken and a Uniswap V3 pool are not vaults of this",
+    "interface: they emit no YieldDistributed, so the loop refuses them — which is the",
+    "honest answer, and why a fresh deployment prints 'book empty'.",
+    "  python -m agent.trade.loop --book-report",
+    "says it per entry, against the live chain and the live market, and exits 4 when",
+    "nothing can be priced. Replace them with your own vault once it is deployed.",
+    "",
+    "Keys the loader reads: address, name, bucket, claim_apy, decimals, token, note.",
+    "  address   0x + 40 hex — the vault. Checked, and lower-cased.",
+    "  name      MUST be spelled like the DeFiLlama pool the hunter measures, or the cycle",
+    "            answers 'the market has no pool named like this vault' and holds.",
+    "  bucket    safe | active | experimental (agent.physics.portfolio.BUCKETS).",
+    "  decimals  credits per token unit: 6 for USDC, 18 for an 18-decimal token.",
+    "  token     the ERC20 the vault pulls on stake(); empty means the built-in default.",
+    "Keys starting with '_' are ignored by the loader and exist for the reader."
+  ],
+  "_template_for_your_vault": {
+    "address": "0xYourVaultAddressHere",
+    "name": "USDC",
+    "bucket": "active",
+    "claim_apy": 0.045,
+    "decimals": 6,
+    "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "note": "the vault this loop is allowed to stake into, and nothing else"
+  },
+  "protocols": [
+    {
+      "address": "0x724dc807b04555b71ed48a6896b6F41593b8C637",
+      "name": "USDC",
+      "bucket": "active",
+      "claim_apy": 0.045,
+      "decimals": 6,
+      "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      "note": "Aave V3 Arbitrum aUSDC (aArbUSDCn) — a real address over real USDC, and not a vault of this interface"
+    },
+    {
+      "address": "0xC6962004f452bE9203591991D15f6b388e09E8D0",
+      "name": "USDC-WETH",
+      "bucket": "active",
+      "claim_apy": 0.10,
+      "decimals": 6,
+      "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      "note": "Uniswap V3 USDC/WETH 0.05% pool on Arbitrum (read back from the factory's getPool) — also not a vault of this interface"
+    }
+  ]
+}
