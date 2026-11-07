@@ -52,6 +52,16 @@ entry share a name (the operator's own declaration, matched on normalised words)
 
 That line is the honest answer, and on a first run it is usually the answer.
 
+Two things narrow that sentence without weakening it. First, a name is not the only way
+an operator declares a pool: a book entry may carry the feed's own ``project``,
+``symbol``, ``chain`` and pinned ``pool`` uuid, and for an ``aave-v3`` entry — whose
+address the deployment table has already verified by chain id — that declaration is
+enough to find the verdict, so ``aave-v3 USDC (Arbitrum)`` and the feed's ``USDC`` are
+the same pool rather than two strangers. Second, ``FORCE_TRADE=1`` (``--force-trade``)
+lets an ``aave-v3`` entry be supplied while the market has *no* verdict for it at all —
+a test tool that says out loud ``Force trade: I would supply $1.00 USDC to Aave.``, and
+one that lifts no ceiling, outranks no conviction and signs nothing in a dry run.
+
 The state file, and why a corrupt one stops the loop
 ====================================================
 
@@ -87,6 +97,7 @@ __all__ = [
     "Cycle",
     "DEFAULT_MEASURE_LIMIT",
     "DEFAULT_SCAN_LIMIT",
+    "ENV_FORCE",
     "ENV_INTERVAL",
     "ENV_MEASURE",
     "ENV_MARKET",
@@ -97,6 +108,7 @@ __all__ = [
     "Position",
     "TradeError",
     "Trader",
+    "UNMATCHED",
     "main",
 ]
 
@@ -105,6 +117,11 @@ ENV_INTERVAL = "TRADE_INTERVAL"
 ENV_MARKET = "TRADE_MARKET"
 ENV_SCAN = "SCAN_LIMIT"
 ENV_MEASURE = "MEASURE_LIMIT"
+
+#: ``FORCE_TRADE=1`` (or ``--force-trade``): prove the pipe on an ``aave-v3`` entry even
+#: when the market has nothing to say about it. A test tool with a narrow remit — see
+#: :meth:`Trader._forced` — never a reason to skip a ceiling, a conviction or the table.
+ENV_FORCE = "FORCE_TRADE"
 
 #: How wide the hunt is: how many pools the funnel reads, and how many of the approved
 #: ones the hunter measures. The first is the feed's own ``POOLS_LIMIT`` (a test holds
@@ -131,6 +148,14 @@ ENTRY_VERDICTS = frozenset({"PANIC", "CALM", "GROWTH"})
 #: as. ``UNMEASURED`` is deliberately *not* here — "I cannot measure it today" is not
 #: "get out", and a feed outage must not be able to liquidate a good position.
 EXIT_VERDICTS = frozenset({"FORMULA", "DISHONEST", "THIN"})
+
+#: The loop's own verdict for an entry the market report never named, and the only one of
+#: its kind. It is not a hunter verdict — the hunter speaks only about pools it measured —
+#: and it is reachable only through :func:`_match_key` for an ``aave-v3`` entry, whose
+#: address is verified by the deployment table rather than by a label. "The report did not
+#: reach this pool" is not evidence against the pool, and for that one kind it is not a
+#: refusal either: the record that priced the entry is the feed's history of it.
+UNMATCHED = "UNMATCHED"
 
 
 class TradeError(RuntimeError):
@@ -184,6 +209,60 @@ def _signal_index(report: Any) -> Dict[str, PanicSignal]:
         ):
             index[key] = signal
     return index
+
+
+def _declared_key(index: Mapping[str, PanicSignal], identity: Any) -> str:
+    """The key of the signal this entry *declares* itself to be — the fallback to a name.
+
+    A label is the weakest key a book can offer: the book spells ``aave-v3 USDC
+    (Arbitrum)`` so a human can read it, the feed spells the row ``USDC`` under project
+    ``aave-v3`` so a database can index it, and neither spelling is wrong. What is wrong is
+    treating the difference as evidence that the pool the operator named is a stranger.
+
+    So the declaration is tried, strongest first: the pinned DeFiLlama uuid (an identity,
+    not a similarity), then the project with the symbol as a word of the pool's name, with
+    the chain as a filter when it is known. Ties are broken by the index itself (``PANIC``
+    wins a name clash — see :func:`_signal_index`), and an entry that declares nothing
+    returns ``""``, which is the strict path.
+    """
+    uuid = str(getattr(identity, "pool", "") or "").strip().lower()
+    if uuid:
+        for key, signal in index.items():
+            if str(getattr(signal, "uuid", "") or "").strip().lower() == uuid:
+                return key
+    project = _normalise(getattr(identity, "project", ""))
+    symbol = _normalise(getattr(identity, "symbol", ""))
+    chain = _normalise(getattr(identity, "chain", ""))
+    if not project or not symbol:
+        return ""
+    for key, signal in index.items():
+        if _normalise(getattr(signal, "project", "")) != project:
+            continue
+        if chain and _normalise(getattr(signal, "chain", "")) != chain:
+            continue
+        if symbol in _normalise(getattr(signal, "name", "")):
+            return key
+    return ""
+
+
+def _match_key(
+    index: Mapping[str, PanicSignal], name: str, identity: Any = None, kind: str = ""
+) -> str:
+    """The verdict about this entry, as an index key — ``""`` when the report is silent.
+
+    The name is tried first and it is the whole answer for a vault, because a vault's
+    address is a stranger until its own log vouches for it and a label is the only thing
+    tying it to a pool. An ``aave-v3`` entry is not that: its (pool, asset) is in the
+    deployment table on the chain id the node reported, so the declaration in the book —
+    the uuid, or the project and symbol — is enough to recognise the row, and a spelling
+    difference is not a refusal (see :data:`UNMATCHED`).
+    """
+    key = _normalise(name)
+    if key in index:
+        return key
+    if kind != AAVE_KIND or identity is None:
+        return ""
+    return _declared_key(index, identity)
 
 
 @dataclass
@@ -361,6 +440,11 @@ class Trader:
     market: Optional[Callable[[], Any]] = None
     now: Callable[[], float] = time.time
     printer: Callable[[str], None] = print
+    #: ``FORCE_TRADE=1`` / ``--force-trade``: an ``aave-v3`` entry may be supplied while the
+    #: market has no verdict for it. It is a *test* tool — "prove the pipe, not the thesis" —
+    #: and :meth:`_forced` is the whole of its remit: three conditions, no ceiling lifted,
+    #: no conviction outranked, nothing signed in a dry run.
+    force: bool = False
     cycles: int = 0
     positions: Dict[str, Position] = field(default_factory=dict)
 
@@ -409,6 +493,7 @@ class Trader:
             "cycles": int(self.cycles),
             "updated": float(self.now()),
             "dry_run": bool(self.sizing.dry_run),
+            "force": bool(self.force),
             "positions": {
                 address: position.as_dict() for address, position in self.positions.items()
             },
@@ -436,6 +521,7 @@ class Trader:
             "venue": str(getattr(self.venue, "name", "venue")),
             "sizing": self.sizing.describe(),
             "state": None if self.state_path is None else str(self.state_path),
+            "force": bool(self.force),
             "cycles": int(self.cycles),
             "positions": [position.as_dict() for position in self.positions.values()],
         }
@@ -601,36 +687,73 @@ class Trader:
     def _consider(
         self, protocol: Any, index: Dict[str, PanicSignal], cycle: Cycle
     ) -> Action:
-        """One vault: does the market say buy it, and can the wallet afford a fifth?"""
+        """One vault: does the market say buy it, and can the wallet afford a fifth?
+
+        Three things can stop the cycle before a size is computed, and each says so in its
+        own words: the report never named the entry (a hold for a vault — a name is the only
+        thing tying a stranger's address to a pool — and, for an ``aave-v3`` entry, merely
+        :data:`UNMATCHED`, because that address is verified by the deployment table rather
+        than by a label), the hunter's verdict was not an entry verdict, and the record came
+        from the feed while the address is a vault. :data:`ENV_FORCE` lifts the second one
+        for an ``aave-v3`` entry and nothing else — see :meth:`_forced`.
+        """
         name = str(getattr(protocol, "name", ""))
         address = str(getattr(protocol, "address", "")).lower()
-        signal = index.get(_normalise(name))
-        if signal is None:
-            return Action(
-                kind="hold",
-                venue=name,
-                address=address,
-                reason=(
-                    "the market has no pool named like this vault — a signal about a pool "
-                    "is not a signal about this address, and this loop does not guess which "
-                    "contract implements which pool"
-                ),
-            )
-
-        verdict = str(getattr(signal, "verdict", ""))
-        confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
-        reason = str(getattr(signal, "reason", ""))
-        held = self.positions.get(address)
         kind = _kind_of(self.venue, address)
-
-        if verdict not in ENTRY_VERDICTS:
-            return Action(
-                kind="hold",
-                venue=name,
-                address=address,
-                verdict=verdict,
-                confidence=confidence,
-                reason=reason or "the hunter refused this pool",
+        identity = _identity_of(self.venue, address)
+        key = _match_key(index, name, identity, kind)
+        signal = index.get(key) if key else None
+        if signal is None:
+            if kind != AAVE_KIND:
+                return Action(
+                    kind="hold",
+                    venue=name,
+                    address=address,
+                    reason=(
+                        "the market has no pool named like this vault — a signal about a "
+                        "pool is not a signal about this address, and this loop does not "
+                        "guess which contract implements which pool"
+                    ),
+                )
+            # The report never reached this pool. For this one kind that is not evidence
+            # against it: the address is the pool the deployment table files under the
+            # chain id the node reported, so `supply` is a real call on a real pool
+            # whatever DeFiLlama calls its row — and the record that priced the entry (the
+            # feed's history of the pinned uuid) is the protocol's own statement about what
+            # the position earns.
+            verdict, confidence = UNMATCHED, 0.0
+            reason = (
+                "the market report names no pool like this one, and for an aave-v3 entry "
+                "that is not a refusal: the address is the pool the deployment table files "
+                "under this chain id, so the signature does not depend on the feed's "
+                "spelling"
+            )
+        else:
+            verdict = str(getattr(signal, "verdict", ""))
+            confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+            reason = str(getattr(signal, "reason", ""))
+        held = self.positions.get(address)
+        forced = False
+        note = ""
+        entering = verdict in ENTRY_VERDICTS or (
+            verdict == UNMATCHED and kind == AAVE_KIND
+        )
+        if verdict == UNMATCHED:
+            note = reason
+        if not entering:
+            if not self._forced(kind, verdict):
+                return Action(
+                    kind="hold",
+                    venue=name,
+                    address=address,
+                    verdict=verdict,
+                    confidence=confidence,
+                    reason=reason or "the hunter refused this pool",
+                )
+            forced = True
+            note = reason = (
+                f"forced past a {verdict or 'silent'} market ({ENV_FORCE}): "
+                f"{reason or 'the hunter did not measure this pool'}"
             )
         # A record the feed vouched for is a fact about a *name*. The verdict on it is real
         # and worth printing — and it is not evidence that this address implements
@@ -721,7 +844,31 @@ class Trader:
             confidence,
             held=at_venue,
             kind=kind,
+            identity=identity,
+            forced=forced,
+            note=note,
         )
+
+    def _forced(self, kind: str, verdict: str) -> bool:
+        """Whether ``FORCE_TRADE`` may carry this entry past a market that said nothing.
+
+        Three conditions, and each one is a line this file must not cross:
+
+        * the flag is on (:data:`ENV_FORCE` or ``--force-trade``);
+        * the entry is an ``aave-v3`` pool — the one kind whose address does not depend on
+          a label to be a real venue, and the only one a supply can grow rather than
+          duplicate (a vault staked twice stakes the same money twice);
+        * the verdict does not *convict*. ``THIN``, ``FORMULA`` and ``DISHONEST`` are
+          refusals with evidence behind them, and no flag on a command line outranks
+          evidence. What force buys is the absence of a verdict — ``CALM``, ``UNMEASURED``
+          or a report that never reached the pool — which is the ordinary state of a
+          healthy protocol on a quiet day.
+
+        It never lifts a ceiling (``TEST_STAKE_AMOUNT_USD`` included), never skips the
+        deployment table, and never signs in a dry run: it changes *whether the market has
+        a veto*, and nothing else.
+        """
+        return bool(self.force) and kind == AAVE_KIND and verdict not in EXIT_VERDICTS
 
     @staticmethod
     def _at_venue(balance: Any, held: Any, kind: str) -> float:
@@ -751,6 +898,9 @@ class Trader:
         *,
         held: float = 0.0,
         kind: str = "",
+        identity: Any = None,
+        forced: bool = False,
+        note: str = "",
     ) -> Action:
         """Send the stake — or, in a dry run, produce the row and touch nothing.
 
@@ -761,8 +911,27 @@ class Trader:
         ``held`` is what the entry already holds, and the position this cycle records is the
         sum: an Aave supply *grows* a position, so storing only the delta would make the loop
         forget the rest of its own money and size the next cycle as if it had none.
+
+        ``forced`` is ``FORCE_TRADE`` at work, and it prints one sentence before anything is
+        priced into a transaction — ``Force trade: I would supply $1.00 USDC to Aave.`` in a
+        dry run, ``I supplied`` once the venue says it landed. The sentence is the *reason*
+        an operator read the log for: a supply with no market verdict behind it must say so
+        in the same breath as the amount, or the log reads like an ordinary trade.
+
+        ``note`` is the market-side sentence for a row that sizing alone cannot explain —
+        "the report never named this pool", "forced past a silent market" — and it is put in
+        front of the size, because *why this was allowed* matters more than which ceiling
+        bit.
         """
         total = round(float(held) + float(size.amount), 6)
+        reason = size.reason
+        if kind == AAVE_KIND:
+            reason = (
+                f"{size.reason} — supplied through the Aave v3 Pool, so the position "
+                f"becomes {total:.6f} and its receipt is an aToken in this wallet"
+            )
+        if note:
+            reason = f"{note} — {reason}"
         action = Action(
             kind="stake",
             venue=name,
@@ -772,23 +941,20 @@ class Trader:
             verdict=verdict,
             confidence=confidence,
             bound=size.bound,
-            reason=(
-                size.reason
-                if kind != AAVE_KIND
-                else (
-                    f"{size.reason} — supplied through the Aave v3 Pool, so the position "
-                    f"becomes {total:.6f} and its receipt is an aToken in this wallet"
-                )
-            ),
+            reason=reason,
             sent=False,
         )
         if self.sizing.dry_run:
+            if forced:
+                self.printer(self._force_line(identity, size, sent=None))
             return action
         try:
             ok = bool(self.venue.execute_stake(address, size.amount))
         except Exception as exc:  # noqa: BLE001 - a failed send is a row, not a crash
             action.kind = "error"
             action.reason = f"the stake raised {type(exc).__name__}: {exc}"
+            if forced:
+                self.printer(self._force_line(identity, size, sent=False, error=action.reason))
             return action
         action.sent = ok
         if ok:
@@ -802,7 +968,37 @@ class Trader:
             )
         else:
             action.reason = self._refusal_line() or "the venue refused the stake"
+        if forced:
+            self.printer(
+                self._force_line(
+                    identity, size, sent=ok, error="" if ok else action.reason
+                )
+            )
         return action
+
+    @staticmethod
+    def _force_line(
+        identity: Any, size: TradeSize, *, sent: Optional[bool], error: str = ""
+    ) -> str:
+        """The one line ``FORCE_TRADE`` owes the log: what it did, to whom, and how much.
+
+        ``sent=None`` is a dry run, and the sentence is future tense on purpose — the same
+        rule as every other row of the cycle, and the reason an operator can rehearse the
+        exact dollar they are about to send. A refused send says so with the venue's own
+        words instead of reporting a supply that did not happen.
+        """
+        symbol = str(getattr(identity, "symbol", "") or "").strip()
+        protocol = str(getattr(identity, "protocol", "") or "").strip() or "the pool"
+        what = f"${float(size.amount):,.2f}" + (f" {symbol}" if symbol else "")
+        if sent is None:
+            return f"Force trade: I would supply {what} to {protocol}."
+        if sent:
+            return f"Force trade: I supplied {what} to {protocol}."
+        return (
+            f"Force trade: I tried to supply {what} to {protocol} and the venue refused"
+            + (f" — {error}" if error else "")
+            + "."
+        )
 
     def _refusal_line(self) -> str:
         """The venue's own reason for the last refusal, when it keeps one."""
@@ -824,10 +1020,20 @@ class Trader:
         liquidates on its own blindness is a loop that sells at the bottom of an outage.
         """
         published = {
-            str(getattr(protocol, "address", "")).lower() for protocol in protocols
+            str(getattr(protocol, "address", "")).lower(): protocol for protocol in protocols
         }
         for address, position in list(self.positions.items()):
-            signal = index.get(_normalise(position.name))
+            # The same key the entry was *opened* on: a pool recognised by its declaration
+            # rather than by its label would otherwise be impossible to leave on the verdict
+            # that recognised it, and a position that can only be entered is a trap.
+            held_protocol = published.get(address)
+            key = _match_key(
+                index,
+                position.name,
+                _identity_of(self.venue, address),
+                _kind_of(self.venue, address),
+            ) or _normalise(position.name)
+            signal = index.get(key)
             if signal is not None:
                 verdict = str(getattr(signal, "verdict", ""))
                 if verdict in EXIT_VERDICTS:
@@ -835,7 +1041,7 @@ class Trader:
                         self._exit(position, verdict, str(getattr(signal, "reason", "")))
                     )
                     continue
-            if address not in published:
+            if held_protocol is None:
                 cycle.warnings.append(
                     f"{position.name}: still holding {position.amount:.6f}, but the vault "
                     "published no record this cycle — the position is kept, not guessed at"
@@ -881,6 +1087,19 @@ class Trader:
         sentence that says why nothing happened.
         """
         claimed = {_normalise(str(getattr(protocol, "name", ""))) for protocol in protocols}
+        # A signal the identity match claimed is not unclaimed: the row was an action, and
+        # printing it here as "a dislocation with no vault" would be the report contradicting
+        # the decision it is supposed to explain.
+        for protocol in protocols:
+            address = str(getattr(protocol, "address", ""))
+            key = _match_key(
+                index,
+                str(getattr(protocol, "name", "")),
+                _identity_of(self.venue, address),
+                _kind_of(self.venue, address),
+            )
+            if key:
+                claimed.add(key)
         for key, signal in index.items():
             if key in claimed or not getattr(signal, "fired", False):
                 continue
@@ -1045,13 +1264,27 @@ def _book_report(
         stakable = bool(records) and (not foreign or kind == AAVE_KIND)
         priced_from_feed += 1 if foreign else 0
         unverified += 1 if foreign and kind != AAVE_KIND else 0
-        signal = index.get(_normalise(name))
+        # The verdict this entry *will* be judged on, which is the name and — for an
+        # ``aave-v3`` entry — the declaration: a report that only looked at the spelling
+        # would say "no pool in the report is named like this vault" about a pool the cycle
+        # then supplies into, and a diagnostic that disagrees with the decision is worse
+        # than none.
+        key = _match_key(index, name, _identity_of(venue, address), kind)
+        signal = index.get(key) if key else None
         if market is None:
             verdict = "market off"
         elif signal is not None:
             verdict = (
                 f"{getattr(signal, 'verdict', '?')} "
                 f"{float(getattr(signal, 'confidence', 0.0) or 0.0):.2f}"
+            )
+            if key != _normalise(name):
+                called = getattr(signal, "name", "?")
+                verdict += f" (matched by declaration, the feed calls it {called!r})"
+        elif kind == AAVE_KIND:
+            verdict = (
+                f"{UNMATCHED} — no pool in the report is named like this entry, and an "
+                "aave-v3 entry does not need one to be a real pool"
             )
         else:
             verdict = "no pool in the report is named like this vault"
@@ -1135,6 +1368,24 @@ def _kind_of(venue: Any, address: str) -> str:
         return str(read(address) or "")
     except Exception:  # noqa: BLE001 - same rule as above
         return ""
+
+
+def _identity_of(venue: Any, address: str) -> Any:
+    """How the venue says this entry is spelled in the feed, or ``None`` if it cannot say.
+
+    ``None`` is the strict answer and the caller treats it that way: a venue that does not
+    answer leaves the name as the only key, which is what the loop does for a vault. What
+    comes back otherwise is the venue's ``ProtocolIdentity`` — the pinned uuid, the project,
+    the symbol and the chain, with the deployment table filling in what the book left out —
+    and it is used to *find* a verdict, never to claim one.
+    """
+    read = getattr(venue, "protocol_identity", None)
+    if read is None:
+        return None
+    try:
+        return read(address)
+    except Exception:  # noqa: BLE001 - a missing identity is the strict path, not a crash
+        return None
 
 
 def _note_of(venue: Any, address: str) -> str:
@@ -1232,7 +1483,18 @@ def _parser() -> "argparse.ArgumentParser":
         default=None,
         help="sign and send — the same as DRY_RUN=0, said on the command line",
     )
+    parser.add_argument(
+        "--force-trade",
+        dest="force_trade",
+        action="store_true",
+        default=None,
+        help=(
+            "supply an aave-v3 entry even when the market has no verdict for it (a test "
+            f"tool; the same as {ENV_FORCE}=1, and it never lifts a ceiling)"
+        ),
+    )
     parser.add_argument("--max-usd", type=float, default=None, help="MAX_TRADE_SIZE_USD")
+
     parser.add_argument(
         "--max-fraction", type=float, default=None, help="MAX_TRADE_FRACTION"
     )
@@ -1258,6 +1520,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             else _count(args.hunt, "--hunt")
         )
         sizing = Sizing.from_env()
+        # The flag beats the environment, and an unset environment means "off" — the same
+        # rule as DRY_RUN, except that its default is the one that does not spend anything.
+        force = (
+            bool(args.force_trade)
+            if args.force_trade is not None
+            else _flag(os.environ.get(ENV_FORCE))
+        )
         overrides: Dict[str, Any] = {}
         if args.max_usd is not None:
             overrides["max_trade_usd"] = float(args.max_usd)
@@ -1290,6 +1559,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             sizing=sizing,
             state_path=Path(args.state) if args.state else None,
             market=_market_arm(args.market, scan_limit, measure_limit),
+            force=force,
         )
     except TradeError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1299,6 +1569,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  venue  {getattr(venue, 'name', 'venue')}")
     print(f"  market {args.market} (scan {scan_limit}, measure {measure_limit})")
     print(f"  state  {trader.state_path}")
+    if trader.force:
+        print(
+            f"  force  {ENV_FORCE} is on — an aave-v3 entry may be supplied while the "
+            "market has no verdict for it; every ceiling still applies"
+        )
     if trader.positions:
         print(f"  held   {len(trader.positions)} position(s) from earlier cycles")
 

@@ -836,9 +836,9 @@ an address this file can vouch for:
   it with Foundry. Deploy it, publish one `YieldDistributed`, and put **its** address in
   `data/book.json` with `token` set to the ERC20 it pulls, `decimals` to that token's own
   (6 for USDC) and `name` spelled like the DeFiLlama pool you want it measured against.
-  That name is matched to a verdict exactly (normalised: letters and digits), so `USDC`
-  does **not** match `aave-v3 USDC (Arbitrum)`; `pool` pins the history, `name` pairs the
-  verdict.
+  A vault is matched to a verdict by that name and nothing else, exactly (normalised:
+  letters and digits), so `USDC` does **not** match `aave-v3 USDC (Arbitrum)`; `pool` pins
+  the history, `name` pairs the verdict.
 * **Aave v3, which is already deployed and audited.** One line in the book —
   `"kind": "aave-v3"` with the Pool as `address` and USDC as `token` — and the venue
   supplies on a feed-priced record, because that address is checked against a table rather
@@ -877,6 +877,20 @@ to a different place, and it has to be a place that **refuses**:
 * a **position can be topped up**, so it is sized as a target: the same ceilings
   (`MAX_TRADE_SIZE_USD`, `MAX_TRADE_FRACTION`, `TEST_STAKE_AMOUNT_USD`) decide the
   position, each cycle carries the difference, and a difference under `$0.50` is a refusal.
+* the **match does not depend on spelling**. A book spells `aave-v3 USDC (Arbitrum)` for a
+  human and DeFiLlama spells its row `USDC` under project `aave-v3` for a database, so an
+  `aave-v3` entry may declare the feed's own words — `"project": "aave-v3"`, `"symbol":
+  "USDC"`, `"chain": "Arbitrum"` — and is recognised by the pinned `pool` uuid first, then
+  by project + symbol + chain, then by its name. Those three are checked against the
+  deployment table before a signature (an entry that pins `USDT` on the USDC pool is
+  refused, because it would be matching another row's verdict). A vault gets none of this:
+  its address is a stranger until its own log speaks, so its name still has to match.
+* **a pool the report never reached is not a refusal.** `--once` on a quiet day, or with a
+  `SCAN_LIMIT` that never saw this pool, used to print *hold — the market has no pool named
+  like this vault* about the one address the table vouches for. It now reads
+  `[UNMATCHED]` and supplies: the address does not need a label to be a real pool, and the
+  record that priced it is the feed's history of the pinned uuid. The verdict is still
+  printed, and `--book-report` says `matched by declaration` when that is how it was found.
 
 Your first dollar, end to end:
 
@@ -892,6 +906,23 @@ python -m agent.trade.loop --book-report     # "stakable: yes" on the Aave line
 python -m agent.trade.loop --once            # prints the $1 supply and signs nothing
 DRY_RUN=0 python -m agent.trade.loop --once  # signs it: approve + supply, then a receipt
 ```
+
+`FORCE_TRADE=1` (or `--force-trade`) is the flag for the run whose *only* job is to prove the
+pipe: it lets an `aave-v3` entry be supplied while the market has nothing to say about it —
+a calm day, a pool the hunter could not measure, a report that never reached it — and it
+says so out loud before the amount:
+
+```text
+   force  FORCE_TRADE is on — an aave-v3 entry may be supplied while the market has no verdict for it; every ceiling still applies
+Force trade: I would supply $1.00 USDC to Aave.
+```
+
+It is a test tool, and the limits are what make it safe to have: it never lifts a ceiling
+(`TEST_STAKE_AMOUNT_USD` still sizes the send), never signs in a dry run, never skips the
+deployment table, and never overrules a hunter that *convicted* the pool — `THIN`,
+`FORMULA` and `DISHONEST` are evidence, and a flag on a command line is not. A live run says
+`Force trade: I supplied $1.00 USDC to Aave.` only after the venue reports the supply
+landed; a refused send is quoted instead of claimed.
 
 `stake` records the *asset* amount it supplied; a withdrawal asks the Pool for that amount
 of the asset, so interest earned above it stays in the position as aToken dust until the
@@ -975,7 +1006,7 @@ python -m agent.main
 pytest
 ```
 
-821 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+839 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
@@ -1021,7 +1052,7 @@ size of the thing: nothing here needs a cluster, a broker or a database.
   (`ARBITRUM_RPC_URL`, `ARBITRUM_PRIVATE_KEY`, `ARBITRUM_CHAIN_ID`) answer for the
   canonical ones. A profile is a spelling, not a permission — 42161, 137 and 8453
   are in the mainnet lock, so an L2 still needs both yeses to sign.
-* **A suite that runs like a deployment.** 821 tests, no network, no key, no
+* **A suite that runs like a deployment.** 839 tests, no network, no key, no
   chain; a live chain is an extra (`pip install 'enrg-ai[testnet]'`) and the
   Anvil tests skip by name when foundry is absent.
 
@@ -1238,7 +1269,7 @@ because a deploy needs them. Measured on this repository's own build
   `entrain_infer` core, `axis_core` — and they say so by name rather than passing
   quietly. The trading path's own tests do run in the image:
   `docker compose exec trader pytest -q tests/test_trade_loop.py
-  tests/test_physics_real_testnet.py tests/test_physics_aave_v3.py` is green. All 821
+  tests/test_physics_real_testnet.py tests/test_physics_aave_v3.py` is green. All 839
   pass on a host that holds the workspace.
 
 
@@ -1272,6 +1303,7 @@ error with a name, never a silent fallback.
 | `ETH_USD_PRICE` | how the native balance is valued; without it the fraction applies to the stable credits only | unset → ETH unpriced |
 | `GAS_RESERVE_ETH` | below this, a stake is refused instead of sent | `0.0005` |
 | `TEST_STAKE_AMOUNT_USD` | the ceiling on one transaction while the operator is still deciding — "send one dollar first". Never lifted by a panic; on a top-up venue it caps the *step* towards the target | `0` → no micro cap; `.env.example` leaves it empty |
+| `FORCE_TRADE` | `1` lets an `aave-v3` entry be supplied while the market has no verdict for it (`--force-trade` says the same). A test tool: no ceiling lifted, no conviction outranked, nothing signed in a dry run | unset → the market keeps its veto |
 | `TRADE_INTERVAL` | seconds between trading cycles (compose) | `300` |
 | `TRADER_STATE` | where the trader remembers its positions | `data/trader_state.json` |
 | `TRADE_MARKET` | `real` (DeFiLlama), `synthetic` (drawn, no egress) or `off` | `real` |

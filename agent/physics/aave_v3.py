@@ -40,6 +40,7 @@ __all__ = [
     "AAVE_KIND",
     "DEPLOYMENTS",
     "MAX_UINT256",
+    "PROTOCOL_NAME",
     "REFERRAL_NONE",
     "SUPPLY_SIGNATURE",
     "WITHDRAW_SIGNATURE",
@@ -53,7 +54,13 @@ __all__ = [
 
 #: What the trading loop calls a book entry of this kind, and what the venue answers in
 #: ``protocol_kind()``. A string, because it travels through a JSON file and a report.
+#: It is also the feed's *project* slug for Aave v3 (DeFiLlama spells the pool
+#: ``aave-v3 USDC (Arbitrum)``), which is why a book entry may write it in ``project``.
 AAVE_KIND = "aave-v3"
+
+#: The protocol as a sentence says it — ``Force trade: I would supply $1.00 USDC to Aave.``
+#: A name for the log, not an address: what is signed into is :func:`deployment_for`'s pool.
+PROTOCOL_NAME = "Aave"
 
 #: The signatures exactly as the Pool declares them — printed in reports and used to
 #: label a transaction, never to encode one (the ABI below does the encoding).

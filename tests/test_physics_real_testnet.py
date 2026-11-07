@@ -1727,6 +1727,66 @@ def test_protocol_kind_answers_for_the_book_and_nothing_else(aave_venue):
     assert aave_venue.protocol_kind(STRANGER) == ""
 
 
+def test_the_venue_answers_the_feed_identity_of_an_aave_entry(aave_venue):
+    """A label is for a human and a feed row is for a database; this is the bridge.
+
+    The entry in the book spells ``aave-v3 USDC (Arbitrum)`` and declares nothing else, so
+    the project, the symbol and the chain come from the deployment table — which is what
+    lets the trading loop recognise DeFiLlama's row ``USDC`` as this pool's verdict.
+    """
+    identity = aave_venue.protocol_identity(AAVE_POOL)
+
+    assert identity.kind == T.AAVE_KIND
+    assert identity.project == T.AAVE_KIND          # the feed's slug, from the kind
+    assert identity.symbol == "USDC"                # from the table, not from the label
+    assert identity.chain == "Arbitrum"
+    assert identity.protocol == "Aave"
+    assert identity.pool == "d9fa8e14-0447-4207-9ae8-7810199dfa1f"
+    # an address the book does not contain answers nothing at all
+    assert aave_venue.protocol_identity(STRANGER) == T.ProtocolIdentity()
+
+
+def test_a_book_may_declare_the_feed_identity_itself(aave_world):
+    venue = RealTestnetProvider(
+        env=aave_env(
+            **{
+                "TESTNET_PROTOCOLS": json.dumps(
+                    aave_entry(project="aave-v3", symbol="usdc", chain="42161")
+                )
+            }
+        ),
+        web3=FakeWeb3(aave_world),
+        allow_mainnet=True,
+    )
+    identity = venue.protocol_identity(AAVE_POOL)
+
+    assert identity.symbol == "usdc"                # the operator's spelling is kept
+    assert identity.chain == "42161"
+    # and the entry is still one the venue would sign into: the declaration agrees with
+    # the pool, whether it is spelled in the feed's words or in the chain's number
+    assert venue.execute_stake(AAVE_POOL, 1.0) is True
+
+
+def test_a_declaration_that_contradicts_the_pool_is_refused(aave_world):
+    """A book that pins the wrong token would match another row's verdict — and sign it."""
+    venue = RealTestnetProvider(
+        env=aave_env(
+            **{"TESTNET_PROTOCOLS": json.dumps(aave_entry(symbol="USDT", chain="Ethereum"))}
+        ),
+        web3=FakeWeb3(aave_world),
+        allow_mainnet=True,
+    )
+
+    with pytest.raises(NetNotConfigured) as raised:
+        venue.execute_stake(AAVE_POOL, 1.0)
+
+    message = str(raised.value)
+    assert "'USDT'" in message and "'Ethereum'" in message
+    assert "Arbitrum" in message and "contradicts" in message
+    assert aave_world.names("build") == [] and venue.approvals == []
+
+
+
 def test_an_aave_supply_approves_the_pool_and_calls_supply(aave_venue, aave_world):
     assert aave_venue.execute_stake(AAVE_POOL, 1.0) is True
 

@@ -204,6 +204,7 @@ __all__ = [
     "HISTORY_SOURCES",
     "ProtocolBook",
     "ProtocolEntry",
+    "ProtocolIdentity",
     "RECORD_FROM_CHAIN",
     "RealTestnetProvider",
     "TestnetConfig",
@@ -467,6 +468,18 @@ class ProtocolEntry:
     #: pool by saying so: the venue asks that table, with the chain id the node reported,
     #: and refuses a pair it does not know.
     kind: str = VAULT_KIND
+    #: How the entry is recognised in the feed's own words, when the operator knows them.
+    #: ``name`` is what a *report* prints; these three are what a *match* needs, and they
+    #: exist because a label is not a key: DeFiLlama calls the row ``USDC`` under project
+    #: ``aave-v3`` on chain ``Arbitrum``, and a book that spelled the label
+    #: ``aave-v3 USDC (Arbitrum)`` would otherwise be a stranger to its own pool. A book
+    #: entry may therefore declare the identity instead of hoping a string resolves — and
+    #: for ``kind: aave-v3`` the deployment table is asked, so a declaration that
+    #: contradicts it (a different asset, another chain) is refused before anything is
+    #: signed. All three are optional: empty means "match nothing here".
+    project: str = ""
+    symbol: str = ""
+    chain: str = ""
 
     def __post_init__(self) -> None:
         if not _is_address(self.address):
@@ -501,6 +514,14 @@ class ProtocolEntry:
                 "'token' — an Aave supply takes the asset as its first argument, and "
                 "guessing it would supply the wrong coin"
             )
+        for label in ("project", "symbol", "chain"):
+            text = str(getattr(self, label) or "").strip()
+            if len(text) > 32 or any(character in "\n\r\t" for character in text):
+                raise TestnetNotConfigured(
+                    f"{self.name}: {label} {text!r} is not a label (an empty string is "
+                    "the way to say 'do not match on this')"
+                )
+            object.__setattr__(self, label, text)
         object.__setattr__(self, "address", str(self.address).lower())
         object.__setattr__(self, "token", str(self.token).lower())
         object.__setattr__(self, "claim_apy", float(self.claim_apy))
@@ -519,6 +540,44 @@ class ProtocolEntry:
             "note": self.note,
             "pool": self.pool,
             "kind": self.kind,
+            "project": self.project,
+            "symbol": self.symbol,
+            "chain": self.chain,
+        }
+
+
+@dataclass(frozen=True)
+class ProtocolIdentity:
+    """How a book entry is recognised in the feed's report — and what a sentence calls it.
+
+    The trading loop matches a hunter verdict to a book entry, and a *name* is the weakest
+    possible key for that: DeFiLlama names the row ``USDC`` under project ``aave-v3`` on
+    chain ``Arbitrum``, while the book needs a label a human can read, so the two spellings
+    drift apart and a real pool becomes "no pool in the report is named like this vault".
+
+    This value is the answer that does not depend on spelling: the project, the symbol, the
+    chain, and the pinned pool uuid, read from the operator's *declaration* in the book and,
+    for an ``aave-v3`` entry, completed from the deployment table. It is deliberately not a
+    permission — it says how to *find* the verdict, never that the entry may be signed into;
+    that is :meth:`RealTestnetProvider.protocol_kind` plus the deployment table's job.
+    """
+
+    kind: str = ""
+    project: str = ""
+    symbol: str = ""
+    chain: str = ""
+    pool: str = ""
+    #: What the sentence calls the protocol (``Aave``), when the venue knows a name for it.
+    protocol: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "project": self.project,
+            "symbol": self.symbol,
+            "chain": self.chain,
+            "pool": self.pool,
+            "protocol": self.protocol,
         }
 
 
@@ -1333,6 +1392,50 @@ class RealTestnetProvider(IWeb3Provider):
         entry = self.config.book.get(str(address).lower())
         return str(entry.kind) if entry is not None else ""
 
+    def protocol_identity(self, address: str) -> ProtocolIdentity:
+        """How the feed's report names this entry — by project, symbol, chain and uuid.
+
+        The companion of :meth:`protocol_kind`, and the answer to a problem a label cannot
+        solve: a book entry is written for a human (``aave-v3 USDC (Arbitrum)``) and the
+        feed writes its rows for a database (``USDC``, project ``aave-v3``, chain
+        ``Arbitrum``). Matching the two by spelling is what turns a real, verified pool into
+        "the market has no pool named like this vault".
+
+        So the entry's own declaration is what is returned, and for an ``aave-v3`` entry the
+        deployment table completes it: the asset's symbol (``USDC``) and the chain's name
+        come from ``aave_v3.DEPLOYMENTS``, and the feed's project slug for such a pool is
+        this kind's own name. Empty fields mean "the operator said nothing and the table
+        cannot fill it in", and a caller that matches on them must then fall back to the
+        name — which is the strict path, and still the right one for a vault.
+
+        An entry the book does not contain answers nothing — the same three-valued honesty
+        as :meth:`history_source`, because a caller about to sign deserves to know what it
+        does *not* know.
+        """
+        entry = self.config.book.get(str(address).lower())
+        if entry is None:
+            return ProtocolIdentity()
+        kind = str(entry.kind)
+        project = str(entry.project)
+        symbol = str(entry.symbol)
+        chain = str(entry.chain)
+        protocol = ""
+        if kind == AAVE_KIND:
+            deployment = self._deployment_or_none(entry)
+            project = project or AAVE_KIND
+            protocol = aave_v3.PROTOCOL_NAME
+            if deployment is not None:
+                symbol = symbol or deployment.symbol
+                chain = chain or deployment.chain
+        return ProtocolIdentity(
+            kind=kind,
+            project=project,
+            symbol=symbol,
+            chain=chain,
+            pool=str(entry.pool),
+            protocol=protocol,
+        )
+
     def _deployment(self, entry: ProtocolEntry) -> "aave_v3.AaveDeployment":
         """The Aave deployment this entry *is*, or a refusal that names the difference.
 
@@ -1359,7 +1462,56 @@ class RealTestnetProvider(IWeb3Provider):
                 "A supply in the wrong units is a revert at best and a thousandfold approval "
                 "at worst, so the mismatch is refused before anything is signed"
             )
+        self._check_declaration(entry, deployment)
         return deployment
+
+    @staticmethod
+    def _check_declaration(
+        entry: ProtocolEntry, deployment: "aave_v3.AaveDeployment"
+    ) -> None:
+        """The entry's ``project``/``symbol``/``chain`` against the pool it says it is.
+
+        These three keys exist to *match* a verdict, and a match is only worth having when
+        it agrees with the thing being matched: an entry that pins ``symbol: USDT`` on the
+        USDC pool would be looking for the wrong row's verdict, and pinning another chain
+        would be looking for another pool's. Both are silent failures — a hold, or worse a
+        signature with a sentence that names the wrong token — so they are refused here,
+        next to the decimals, where a contradiction already cannot get past.
+
+        A key the operator left empty is not a claim and is never refused: an empty string
+        is the way to say "match nothing here", and the table fills the answer in.
+        """
+        wrong: List[str] = []
+        if entry.project and entry.project.strip().lower() != AAVE_KIND:
+            wrong.append(
+                f"project {entry.project!r} is not {AAVE_KIND!r} (the feed's slug for an "
+                "Aave v3 pool)"
+            )
+        if entry.symbol and entry.symbol.strip().upper() != deployment.symbol:
+            wrong.append(
+                f"symbol {entry.symbol!r} is not {deployment.symbol!r} (the asset this "
+                "pool lends)"
+            )
+        if entry.chain:
+            spelled = entry.chain.strip()
+            digits = spelled.isdigit()
+            matches = (
+                int(spelled) == int(deployment.chain_id)
+                if digits
+                else spelled.lower() == deployment.chain.lower()
+            )
+            if not matches:
+                wrong.append(
+                    f"chain {entry.chain!r} is not {deployment.chain!r} "
+                    f"(chain id {deployment.chain_id})"
+                )
+        if wrong:
+            raise TestnetNotConfigured(
+                f"{entry.name}: the book's declaration contradicts the deployment "
+                f"({deployment.label}): " + "; ".join(wrong) + ". A declaration that names "
+                "another pool would match another pool's verdict, so it is refused before "
+                "anything is signed"
+            )
 
     def _deployment_or_none(self, entry: ProtocolEntry) -> Optional[Any]:
         """The deployment, or ``None`` where a refusal would be a report's problem.

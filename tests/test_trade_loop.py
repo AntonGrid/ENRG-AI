@@ -55,18 +55,28 @@ def signal(
     verdict: str = "PANIC",
     name: str = "Aave V3 USDC",
     reason: str = "a measured dislocation",
+    *,
+    project: str = "",
+    chain: str = "",
+    uuid: str = "",
 ) -> PanicSignal:
     """A hunter verdict with a controlled confidence.
 
     ``confidence`` is a property computed from the dislocation, so it cannot be passed:
     a PANIC with ``z`` past its saturation, a gap past its saturation and a halved depth
     is a confidence of exactly 1.0, and every other verdict is 0.0 by construction.
+
+    ``project``/``chain``/``uuid`` are the feed's own spelling of the row, which is what an
+    ``aave-v3`` book entry may be matched on when a label and a pool name disagree.
     """
     return PanicSignal(
         name=name,
         address=VAULT,
         verdict=verdict,
         reason=reason,
+        uuid=uuid,
+        project=project,
+        chain=chain,
         dislocation=Dislocation(
             resting=4.0,
             recent=12.0,
@@ -579,6 +589,8 @@ def wire(monkeypatch, venue: FakeVenue, *signals: PanicSignal) -> None:
         "MAX_TRADE_SIZE_USD",
         "MAX_TRADE_FRACTION",
         "ETH_USD_PRICE",
+        C.ENV_MICRO_CAP,
+        L.ENV_FORCE,
         L.ENV_SCAN,
         L.ENV_MEASURE,
     ):
@@ -902,6 +914,10 @@ class BookVenue(FakeVenue):
     #: ``vault`` of this interface, or an ``aave-v3`` pool the deployment table names.
     #: An address that is absent answers nothing, and the loop then takes the strict path.
     kinds: Dict[str, str] = field(default_factory=dict)
+    #: How the feed spells each entry, the way the venue answers ``protocol_identity``: the
+    #: project, symbol, chain and pinned uuid the loop may match a verdict on. An address
+    #: that is absent answers ``None``, which is the strict path — a name and nothing else.
+    identities: Dict[str, Any] = field(default_factory=dict)
     #: What the venue already holds of the entry — for Aave, the aToken balance, which is
     #: the supplied amount plus interest, and which the chain reports rather than the loop.
     position: float = 0.0
@@ -916,6 +932,9 @@ class BookVenue(FakeVenue):
 
     def protocol_kind(self, address: str) -> str:
         return self.kinds.get(str(address).lower(), "")
+
+    def protocol_identity(self, address: str) -> Any:
+        return self.identities.get(str(address).lower())
 
     def balance(self, address: Optional[str] = None) -> Balance:
         read = super().balance(address)
@@ -1099,11 +1118,31 @@ def aave_pool() -> Protocol:
     return vault(name=AAVE_NAME, address=AAVE)
 
 
+def identity(**overrides: Any) -> Any:
+    """The ``ProtocolIdentity`` a real venue answers: what the feed calls this entry.
+
+    ``aave-v3``/``USDC``/``Arbitrum`` is DeFiLlama's own spelling of the Aave row, and the
+    uuid is the one ``book.example.json`` pins, so a test says "the row the feed publishes
+    for this pool" rather than repeating a label that happens to normalise the same way.
+    """
+    fields: Dict[str, Any] = {
+        "kind": "aave-v3",
+        "project": "aave-v3",
+        "symbol": "USDC",
+        "chain": "Arbitrum",
+        "pool": "d9fa8e14-0447-4207-9ae8-7810199dfa1f",
+        "protocol": "Aave",
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def pool_venue(**overrides: Any) -> BookVenue:
     fields: Dict[str, Any] = {
         "published": [aave_pool()],
         "source": {AAVE: FEED_LABEL},
         "kinds": {AAVE: "aave-v3"},
+        "identities": {AAVE: identity()},
     }
     fields.update(overrides)
     return BookVenue(**fields)
@@ -1196,4 +1235,262 @@ def test_the_book_report_calls_a_feed_priced_pool_stakable():
     assert "supply() moves the money" in text
     assert "not stakable" not in text
     assert "each one a pool this file knows by address, so they are staked" in text
+
+
+# ── a label is not a key: the declaration the book may carry ────────────────
+#
+# The book spells its entries for a human (``aave-v3 USDC (Arbitrum)``) and DeFiLlama spells
+# its rows for a database (``USDC``, project ``aave-v3``, chain ``Arbitrum``). Matching the
+# two by spelling turned a verified pool into "the market has no pool named like this vault",
+# so an ``aave-v3`` entry may carry the feed's own words and be recognised by what it *is*.
+# The name is still tried first; a vault still has nothing but its name, and that is the
+# asymmetry these tests hold in place.
+
+
+def test_a_pool_whose_row_the_feed_spells_differently_is_still_supplied():
+    """The row is ``USDC`` under project ``aave-v3``: same pool, different spelling."""
+    venue = pool_venue()
+    cycle = trader(
+        venue,
+        signal(name="USDC", project="aave-v3", chain="Arbitrum"),
+        dry_run=False,
+    ).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "stake"
+    assert action.verdict == "PANIC"                  # the row's verdict, not a guess
+    assert action.sent is True
+    assert venue.stakes == [(AAVE, pytest.approx(13.6))]
+
+
+def test_a_pinned_uuid_finds_the_row_whatever_the_feed_calls_it():
+    """The strongest key in the book: an identity, not a similarity.
+
+    The uuid is pinned in ``book.example.json``, so a row whose label shares no words with
+    the entry is still this pool's row — and the comparison ignores case, because a uuid
+    pasted out of a web page is not always lower case.
+    """
+    venue = pool_venue()
+    cycle = trader(
+        venue,
+        signal(name="Pool #42 (whatever)", uuid="D9FA8E14-0447-4207-9AE8-7810199DFA1F"),
+        dry_run=False,
+    ).run_once()
+
+    assert cycle.actions[0].kind == "stake"
+    assert cycle.actions[0].verdict == "PANIC"
+
+
+def test_a_row_on_another_chain_is_not_this_pools_verdict():
+    """The chain is a filter: the same project and symbol elsewhere is another pool."""
+    venue = pool_venue()
+    cycle = trader(
+        venue,
+        signal(name="USDC", project="aave-v3", chain="Ethereum"),
+        dry_run=False,
+    ).run_once()
+
+    action = cycle.actions[0]
+    assert action.verdict == L.UNMATCHED     # the row was about another chain's pool
+    assert action.kind == "stake"            # and the entry does not need it to be real
+
+
+def test_an_aave_pool_the_report_never_reached_is_still_supplied():
+    """No signal at all: the deployment table, not a label, is what makes it stakeable."""
+    venue = pool_venue()
+    cycle = trader(venue, dry_run=False).run_once()      # an empty report
+
+    action = cycle.actions[0]
+    assert action.kind == "stake"
+    assert action.verdict == L.UNMATCHED
+    assert "deployment table" in action.reason
+    assert "not a refusal" in action.reason
+    assert venue.stakes == [(AAVE, pytest.approx(13.6))]
+    assert not [row for row in cycle.actions if row.kind == "signal"]
+
+
+def test_a_vault_the_report_never_reached_is_still_a_hold():
+    """The exemption is the kind: an unnamed vault stays a stranger, whatever it paid."""
+    venue = BookVenue(published=[vault()], source={VAULT: L.RECORD_FROM_CHAIN})
+    cycle = trader(venue, dry_run=False).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "hold"
+    assert "no pool named like this vault" in action.reason
+    assert venue.stakes == []
+
+
+def test_the_book_report_says_when_a_verdict_came_from_the_declaration():
+    """A diagnostic that disagreed with the decision would be worse than none."""
+    venue = pool_venue(records={AAVE: [0.0001] * 60})
+    with_book(venue, book_of(book_entry(AAVE, AAVE_NAME)), history="auto")
+    printed: List[str] = []
+
+    L._book_report(
+        venue,
+        lambda: report(signal(name="USDC", project="aave-v3", chain="Arbitrum")),
+        printed.append,
+    )
+
+    text = "\n".join(printed)
+    assert "PANIC" in text
+    assert "matched by declaration" in text
+    assert "no pool in the report is named like this entry" not in text
+
+
+# ── FORCE_TRADE: prove the pipe, not the thesis ─────────────────────────────
+#
+# A first real run has one job — approve, supply, a receipt — and the market's silence (or a
+# calm day) is no reason to postpone it. The flag therefore lifts exactly one veto, on
+# exactly one kind of entry, and prints the sentence an operator will look for in the log.
+
+
+def forced(venue: BookVenue, *signals: PanicSignal, dry_run: bool = True, micro: float = 1.0):
+    """A trader with ``FORCE_TRADE`` on, recording every line it prints."""
+    printed: List[str] = []
+    cycle = L.Trader(
+        venue=venue,
+        sizing=sizing(dry_run=dry_run, micro_cap_usd=micro),
+        market=lambda: report(*signals),
+        now=lambda: 1_700_000_000.0,
+        force=True,
+        printer=printed.append,
+    ).run_once()
+    return cycle, printed
+
+
+def test_force_trade_is_off_unless_the_operator_asks():
+    """The default is the one that cannot spend: an unset flag is not an instruction."""
+    venue = pool_venue()
+    cycle = trader(
+        venue, signal(verdict="UNMEASURED", name=AAVE_NAME), dry_run=False
+    ).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "hold"
+    assert action.verdict == "UNMEASURED"
+    assert venue.stakes == []
+
+
+def test_force_trade_supplies_through_a_verdict_that_is_not_an_entry():
+    """``UNMEASURED`` is not a conviction, so the flag may carry a pool it cannot measure."""
+    venue = pool_venue()
+    cycle, printed = forced(
+        venue, signal(verdict="UNMEASURED", name=AAVE_NAME), dry_run=False
+    )
+
+    action = cycle.actions[0]
+    assert action.kind == "stake"
+    assert action.sent is True
+    assert action.amount == pytest.approx(1.0)             # the micro cap still decides
+    assert action.bound == C.ENV_MICRO_CAP
+    assert venue.stakes == [(AAVE, pytest.approx(1.0))]
+    assert "FORCE_TRADE" in action.reason
+    assert printed == ["Force trade: I supplied $1.00 USDC to Aave."]
+
+
+def test_force_trade_in_a_dry_run_says_what_it_would_supply():
+    """The rehearsal line, word for word — and the venue is never called."""
+    venue = pool_venue()
+    cycle, printed = forced(venue, signal(verdict="UNMEASURED", name=AAVE_NAME))
+
+    assert printed == ["Force trade: I would supply $1.00 USDC to Aave."]
+    assert venue.stakes == []
+    assert cycle.actions[0].sent is False
+    assert cycle.dry_run is True
+
+
+def test_force_trade_still_respects_a_tighter_ceiling():
+    """It lifts a verdict, never an amount: a $0.50 micro cap sends $0.50."""
+    venue = pool_venue()
+    cycle, printed = forced(
+        venue, signal(verdict="UNMEASURED", name=AAVE_NAME), dry_run=False, micro=0.5
+    )
+
+    assert cycle.actions[0].amount == pytest.approx(0.5)
+    assert venue.stakes == [(AAVE, pytest.approx(0.5))]
+    assert printed == ["Force trade: I supplied $0.50 USDC to Aave."]
+
+
+def test_force_trade_does_not_outrank_a_conviction():
+    """``DISHONEST`` is evidence about a pool; a flag on a command line is not."""
+    printed: List[str] = []
+    venue = pool_venue()
+    cycle = L.Trader(
+        venue=venue,
+        sizing=sizing(dry_run=False, micro_cap_usd=1.0),
+        market=lambda: report(signal(verdict="DISHONEST", name=AAVE_NAME)),
+        now=lambda: 1_700_000_000.0,
+        force=True,
+        printer=printed.append,
+    ).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "hold"
+    assert action.verdict == "DISHONEST"
+    assert venue.stakes == []
+    assert printed == []
+
+
+def test_force_trade_does_not_reach_a_vault():
+    """A vault staked twice stakes the same money twice; the flag is Aave's alone."""
+    venue = BookVenue(published=[vault()], source={VAULT: FEED_LABEL})
+    cycle, printed = forced(venue, signal(verdict="UNMEASURED"), dry_run=False)
+
+    assert cycle.actions[0].kind == "hold"
+    assert venue.stakes == []
+    assert printed == []
+
+
+def test_force_trade_reports_a_refused_supply_honestly():
+    """A refused send is not a supply: the line quotes the venue instead of claiming one."""
+    venue = pool_venue(refuse=True)
+    cycle, printed = forced(
+        venue, signal(verdict="UNMEASURED", name=AAVE_NAME), dry_run=False
+    )
+
+    action = cycle.actions[0]
+    assert action.sent is False
+    assert "not in the address book" in action.reason
+    assert printed == [
+        "Force trade: I tried to supply $1.00 USDC to Aave and the venue refused — "
+        "not in the address book."
+    ]
+
+
+def test_the_cli_force_flag_dry_runs_the_supply(monkeypatch, tmp_path, capsys):
+    """``--force-trade --once`` is the rehearsal an operator runs before the first dollar."""
+    venue = pool_venue()
+    wire(monkeypatch, venue, signal(verdict="UNMEASURED", name=AAVE_NAME))
+    monkeypatch.setenv(C.ENV_MICRO_CAP, "1.0")
+
+    assert L.main(["--once", "--force-trade", "--state", str(tmp_path / "s.json")]) == 0
+
+    printed = capsys.readouterr().out
+    assert "Force trade: I would supply $1.00 USDC to Aave." in printed
+    assert "FORCE_TRADE is on" in printed
+    assert venue.stakes == []                          # DRY_RUN is still the default
+
+
+def test_force_trade_comes_from_the_environment_and_the_flag_wins(
+    monkeypatch, tmp_path, capsys
+):
+    """``FORCE_TRADE=1`` in ``.env``, and ``--force-trade`` on the run that needs it."""
+    venue = pool_venue()
+    wire(monkeypatch, venue, signal(verdict="UNMEASURED", name=AAVE_NAME))
+    monkeypatch.setenv(C.ENV_MICRO_CAP, "1.0")
+    monkeypatch.setenv(L.ENV_FORCE, "1")
+
+    assert L.main(["--once", "--state", str(tmp_path / "a.json")]) == 0
+    assert "Force trade: I would supply $1.00 USDC to Aave." in capsys.readouterr().out
+
+    # the environment says no, the flag says yes, and the flag is the one that was typed
+    monkeypatch.setenv(L.ENV_FORCE, "0")
+    assert L.main(["--once", "--force-trade", "--state", str(tmp_path / "b.json")]) == 0
+    assert "Force trade: I would supply $1.00 USDC to Aave." in capsys.readouterr().out
+
+    # and with neither, nothing is forced — the quiet default is the safe one
+    monkeypatch.delenv(L.ENV_FORCE)
+    assert L.main(["--once", "--state", str(tmp_path / "c.json")]) == 0
+    assert "Force trade" not in capsys.readouterr().out
 

@@ -37,14 +37,24 @@
     "at all; without it, 'name' has to be spelled like the pool.",
     "",
     "Keys the loader reads: address, name, bucket, claim_apy, decimals, token, note, pool,",
-    "kind.",
+    "kind, project, symbol, chain.",
     "  address   0x + 40 hex — the vault, or (kind aave-v3) the lending POOL. Checked, and",
     "            lower-cased. For Aave it is the Pool, NOT the aToken: the pool is what",
     "            pulls the asset and what a withdraw is sent to, and the aToken is only the",
     "            receipt the position grows into.",
-    "  name      the pool's own label: 'project symbol (chain)' exactly as DeFiLlama spells",
-    "            it. The cycle matches a verdict to a vault by this name (normalised: letters",
-    "            and digits), so 'USDC' does NOT match 'aave-v3 USDC (Arbitrum)'.",
+    "  name      the label a human reads: 'aave-v3 USDC (Arbitrum)' or anything else. It is",
+    "            still the first thing the cycle matches on (normalised: letters and digits).",
+    "  project,",
+    "  symbol,",
+    "  chain     the entry's identity in the FEED's own words — DeFiLlama spells the Aave",
+    "            row project 'aave-v3', symbol 'USDC', chain 'Arbitrum'. A label and a feed",
+    "            row are written for different readers and drift apart, so these three are",
+    "            what a match needs: with them, an Aave pool is recognised by what it IS",
+    "            rather than by how its name is spelled. For 'kind: aave-v3' they are also",
+    "            checked against agent/physics/aave_v3.py before anything is signed — a book",
+    "            that pins symbol 'USDT' on the USDC pool is refused, because it would be",
+    "            matching another row's verdict. Leave any of them empty to match nothing.",
+    "            A vault ignores them: its address is a stranger until its own log speaks.",
     "  bucket    safe | active | experimental (agent.physics.portfolio.BUCKETS).",
     "  decimals  credits per token unit: 6 for USDC, 18 for an 18-decimal token.",
     "  token     the ERC20 the venue pulls: on stake() for a vault, as supply's asset for",
@@ -67,6 +77,9 @@
     "decimals": 6,
     "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
     "pool": "",
+    "project": "",
+    "symbol": "",
+    "chain": "",
     "note": "the vault this loop is allowed to stake into, and nothing else"
   },
   "protocols": [
@@ -79,7 +92,10 @@
       "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
       "kind": "aave-v3",
       "pool": "d9fa8e14-0447-4207-9ae8-7810199dfa1f",
-      "note": "the Aave v3 Pool on Arbitrum One, over native USDC — a real, audited protocol, and the one entry this loop can supply on a feed-priced record because the deployment table in agent/physics/aave_v3.py names it by chain id; the receipt is aUSDC (0x724dc807…8c637), the pool uuid is DeFiLlama's aave-v3 USDC (Arbitrum)"
+      "project": "aave-v3",
+      "symbol": "USDC",
+      "chain": "Arbitrum",
+      "note": "the Aave v3 Pool on Arbitrum One, over native USDC — a real, audited protocol, and the one entry this loop can supply on a feed-priced record because the deployment table in agent/physics/aave_v3.py names it by chain id; the receipt is aUSDC (0x724dc807…8c637), the pool uuid is DeFiLlama's aave-v3 USDC (Arbitrum), and project/symbol/chain are how the feed spells that same row"
     },
     {
       "address": "0xC6962004f452bE9203591991D15f6b388e09E8D0",
@@ -89,7 +105,10 @@
       "decimals": 6,
       "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
       "pool": "a14bd201-764c-40a5-86b8-2928b2461232",
-      "note": "Uniswap V3 USDC/WETH 0.05% pool on Arbitrum (read back from the factory's getPool) — not a vault of this interface and not an Aave pool, so it stays a diagnosis: the record is the feed's and the loop holds it; the pool uuid is DeFiLlama's uniswap-v3 WETH-USDC (Arbitrum, 0.05%)"
+      "project": "uniswap-v3",
+      "symbol": "WETH-USDC",
+      "chain": "Arbitrum",
+      "note": "Uniswap V3 USDC/WETH 0.05% pool on Arbitrum (read back from the factory's getPool) — not a vault of this interface and not an Aave pool, so it stays a diagnosis: the record is the feed's and the loop holds it; the pool uuid is DeFiLlama's uniswap-v3 WETH-USDC (Arbitrum, 0.05%). Its project/symbol/chain are declared for the report's sake and are never used to sign: only an aave-v3 entry may be matched by declaration"
     }
   ]
 }
