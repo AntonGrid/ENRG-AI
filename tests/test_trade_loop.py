@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -258,6 +258,89 @@ def test_a_misspelt_number_is_an_error_not_a_zero():
         C.Sizing.from_env({C.ENV_MAX_TRADE_USD: "fifty"})
     with pytest.raises(C.SizingError):
         C.Sizing(max_fraction=0.0)
+
+
+# ── the micro cap, and a position that can be topped up ─────────────────────
+#
+# Two ceilings the operator asked for by name. ``TEST_STAKE_AMOUNT_USD`` is the one a
+# first, unproven loop cannot argue with: it lowers every transaction, is never lifted by
+# a panic, and is off unless it is set. ``held_usd`` is the same number in the other
+# direction: a pool whose ``supply`` grows a position is sized against a *target*, and the
+# transaction carries the difference — with a floor below which a fee is not worth paying.
+
+
+def test_the_micro_cap_is_a_ceiling_like_the_others():
+    size = C.size_trade(
+        token_balance=50.0, native_eth=0.008, sizing=sizing(micro_cap_usd=1.0)
+    )
+
+    assert size.ok
+    assert size.amount == pytest.approx(1.0)
+    assert size.bound == C.ENV_MICRO_CAP
+    assert size.bound in size.reason
+
+
+def test_the_micro_cap_is_never_lifted_by_a_panic():
+    calm = C.size_trade(
+        token_balance=50.0,
+        native_eth=0.008,
+        sizing=sizing(micro_cap_usd=1.0),
+        confidence=0.0,
+    )
+    panic = C.size_trade(
+        token_balance=50.0,
+        native_eth=0.008,
+        sizing=sizing(micro_cap_usd=1.0),
+        confidence=1.0,
+    )
+
+    assert panic.amount == pytest.approx(calm.amount) == pytest.approx(1.0)
+
+
+def test_an_unset_micro_cap_is_not_a_cap_of_zero():
+    """The ordinary case: no micro cap configured, and the fraction decides as before."""
+    assert C.Sizing.from_env({}).micro_cap_usd == 0.0
+    assert C.Sizing.from_env({C.ENV_MICRO_CAP: "1.5"}).micro_cap_usd == pytest.approx(1.5)
+    with pytest.raises(C.SizingError):
+        C.Sizing.from_env({C.ENV_MICRO_CAP: "one dollar"})
+    with pytest.raises(C.SizingError):
+        C.Sizing(micro_cap_usd=-1.0)
+
+
+def test_a_held_position_is_sized_as_a_target_and_moved_as_a_difference():
+    """$1 already supplied, a $13.82 wallet: the transaction carries what is missing."""
+    size = C.size_trade(
+        token_balance=12.82,
+        native_eth=0.00195,
+        sizing=sizing(eth_price_usd=0.0),
+        held_usd=1.0,
+    )
+
+    assert size.ok
+    assert size.usd == pytest.approx(size.amount) == pytest.approx(1.764)
+    assert "top_up" in size.bound
+    assert "already supplied" in size.reason
+
+
+def test_a_position_that_is_already_at_the_ceiling_is_nothing_to_do():
+    """The fixed point of "a fifth of the wallet": 17 held, and a fifth of 85 is 17."""
+    size = C.size_trade(
+        token_balance=50.0, native_eth=0.008, sizing=sizing(), held_usd=17.0
+    )
+
+    assert size.ok is False
+    assert size.bound == "top_up"
+    assert "already at the ceiling" in size.refusal
+
+
+def test_a_top_up_below_the_minimum_is_a_refusal_not_a_transaction():
+    size = C.size_trade(
+        token_balance=50.0, native_eth=0.008, sizing=sizing(), held_usd=16.7
+    )
+
+    assert size.ok is False
+    assert "minimum top-up" in size.refusal
+    assert C.MIN_TOP_UP_USD == pytest.approx(0.5)
 
 # ── the cycle: what it signs, and what it refuses ───────────────────────────
 
@@ -815,6 +898,13 @@ class BookVenue(FakeVenue):
     #: Where each address's record came from, the way ``RealTestnetProvider`` answers it:
     #: ``chain`` for the address's own log, the feed's label otherwise.
     source: Dict[str, str] = field(default_factory=dict)
+    #: How money reaches each address, the way the venue answers ``protocol_kind``: a
+    #: ``vault`` of this interface, or an ``aave-v3`` pool the deployment table names.
+    #: An address that is absent answers nothing, and the loop then takes the strict path.
+    kinds: Dict[str, str] = field(default_factory=dict)
+    #: What the venue already holds of the entry — for Aave, the aToken balance, which is
+    #: the supplied amount plus interest, and which the chain reports rather than the loop.
+    position: float = 0.0
 
     def fetch_protocol_history(
         self, address: str, steps: Optional[int] = None
@@ -823,6 +913,21 @@ class BookVenue(FakeVenue):
 
     def history_source(self, address: str) -> str:
         return self.source.get(str(address).lower(), "")
+
+    def protocol_kind(self, address: str) -> str:
+        return self.kinds.get(str(address).lower(), "")
+
+    def balance(self, address: Optional[str] = None) -> Balance:
+        read = super().balance(address)
+        if self.protocol_kind(str(address or "")) != "aave-v3":
+            return read
+        units = int(round(float(self.position) * 10 ** 6))
+        return replace(
+            read,
+            position_token=TOKEN,
+            position_units=units,
+            position_balance=units / 10 ** 6,
+        )
 
 
 def test_the_book_report_says_which_entry_has_no_record():
@@ -973,3 +1078,122 @@ def test_the_book_report_points_at_the_switch_when_the_feed_was_not_asked():
     text = "\n".join(printed)
     assert "the feed was not asked" in text
     assert "TESTNET_HISTORY=auto" in text
+
+
+# ── an Aave position: the record is the feed's, the signature is the pool's ──
+#
+# The one exemption to "a feed record is never signed", and the reason it is safe is a
+# property of the *address* rather than of the record: an ``aave-v3`` entry names a pool
+# the venue verified against its deployment table on the chain id the node reported. So
+# the question "is this address a stranger whose interface I cannot see" has an answer,
+# and it is not the operator's optimism. What follows tests the three consequences: the
+# supply is signed, the position is topped up to the ceiling rather than re-staked, and
+# the amount held is read from the chain rather than remembered.
+
+AAVE = "0x" + "55" * 20
+AAVE_NAME = "Aave V3 USDC (Arbitrum)"
+
+
+def aave_pool() -> Protocol:
+    """The pool as the venue publishes it: a name, a record, and the pool's address."""
+    return vault(name=AAVE_NAME, address=AAVE)
+
+
+def pool_venue(**overrides: Any) -> BookVenue:
+    fields: Dict[str, Any] = {
+        "published": [aave_pool()],
+        "source": {AAVE: FEED_LABEL},
+        "kinds": {AAVE: "aave-v3"},
+    }
+    fields.update(overrides)
+    return BookVenue(**fields)
+
+
+def test_a_feed_priced_aave_pool_is_staked():
+    """The verdict is about the name, and the address is a pool this file can name."""
+    venue = pool_venue()
+    cycle = trader(venue, signal(name=AAVE_NAME), dry_run=False).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "stake"
+    assert action.sent is True
+    assert venue.stakes == [(AAVE, pytest.approx(13.6))]
+    assert "Aave v3 Pool" in action.reason
+    assert "aToken" in action.reason
+    assert cycle.book[0]["kind"] == "aave-v3"
+
+
+def test_the_same_record_on_a_vault_is_still_not_signed():
+    """The exemption is the kind, not the record: a vault of unknown interface is held."""
+    venue = pool_venue(kinds={AAVE: "vault"})
+    cycle = trader(venue, signal(name=AAVE_NAME), dry_run=False).run_once()
+
+    assert cycle.actions[0].kind == "hold"
+    assert FEED_LABEL in cycle.actions[0].reason
+    assert venue.stakes == []
+
+
+def test_a_position_is_topped_up_not_staked_twice(tmp_path):
+    """$1 already in the pool: the cycle moves the difference to the ceiling, and no more."""
+    state = tmp_path / "trader_state.json"
+    venue = pool_venue(position=1.0)
+    cycle = trader(venue, signal(name=AAVE_NAME), dry_run=False, state=state).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "stake"
+    assert action.amount == pytest.approx(12.8)  # 20% of (50 free + 1 held + 18 gas), minus 1
+    assert "top_up" in action.bound
+    stored = json.loads(state.read_text())
+    assert stored["positions"][AAVE]["amount"] == pytest.approx(13.8)
+
+
+def test_a_position_at_the_ceiling_is_a_hold():
+    """The chain says 17 supplied and a fifth of 85 is 17: there is nothing to add."""
+    venue = pool_venue(position=17.0)
+    cycle = trader(venue, signal(name=AAVE_NAME), dry_run=False).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "hold"
+    assert "already at the ceiling" in action.reason
+    assert venue.stakes == []
+
+
+def test_the_position_is_read_from_the_chain_and_not_from_the_state_file():
+    """A lost state file is not a reason to supply the same dollars again."""
+    venue = pool_venue(position=17.0)
+    cycle = trader(venue, signal(name=AAVE_NAME), dry_run=False).run_once()
+
+    assert cycle.actions[0].kind == "hold"
+    assert venue.stakes == []
+
+
+def test_the_micro_cap_sizes_the_first_supply():
+    venue = pool_venue()
+    cycle = L.Trader(
+        venue=venue,
+        sizing=sizing(dry_run=False, micro_cap_usd=1.0),
+        market=lambda: report(signal(name=AAVE_NAME)),
+        now=lambda: 1_700_000_000.0,
+    ).run_once()
+
+    action = cycle.actions[0]
+    assert action.kind == "stake"
+    assert action.amount == pytest.approx(1.0)
+    assert action.bound == C.ENV_MICRO_CAP
+    assert venue.stakes == [(AAVE, pytest.approx(1.0))]
+
+
+def test_the_book_report_calls_a_feed_priced_pool_stakable():
+    venue = pool_venue(records={AAVE: [0.0001] * 60})
+    with_book(venue, book_of(book_entry(AAVE, AAVE_NAME)), history="auto")
+    printed: List[str] = []
+
+    assert L._book_report(venue, None, printed.append) == 0
+
+    text = "\n".join(printed)
+    assert "aave-v3" in text
+    assert "stakable: yes" in text
+    assert "supply() moves the money" in text
+    assert "not stakable" not in text
+    assert "each one a pool this file knows by address, so they are staked" in text
+

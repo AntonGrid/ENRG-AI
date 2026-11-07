@@ -688,9 +688,15 @@ Two facts follow, and both of them surprise a first run:
   the hunter will not size a position on nothing. The cycle now says which entry failed
   instead of one word about the whole book:
   `aave-v3 USDC (Arbitrum) (0x724d…c637): no YieldDistributed(uint256,uint256) log in the last 5000 blocks`.
-* **a dApp is not a vault.** Aave's `aUSDC`, a Uniswap V3 pool, a Curve gauge: real
-  addresses, real money, and none of them answer `stake(uint256)` or emit our event. They
-  belong in a book about *them*, not in this one.
+* **a dApp is not a vault — unless the book says what it is.** Aave's `aUSDC`, a Uniswap
+  V3 pool, a Curve gauge: real addresses, real money, and none of them answer
+  `stake(uint256)` or emit our event. Two of those are now *usable* rather than merely
+  diagnosable, and only because the book can say what they are:
+  `"kind": "aave-v3"` names a lending pool whose address is checked against
+  `agent/physics/aave_v3.py` (a table keyed by chain id), and the money then moves with
+  `supply(asset, amount, onBehalfOf, referralCode)` instead of `stake`. Everything else —
+  a Uniswap pool, a gauge, an aToken — stays a diagnosis, because nothing in this file can
+  name the contract that would answer for it.
 
 ### The second source: `TESTNET_HISTORY`, or why the book is no longer empty
 
@@ -716,26 +722,40 @@ that came from the feed is a fact about a *name*; `stake(uint256)` is a fact abo
 * `RealTestnetProvider.history_source(address)` answers `chain` for a record read from the
   address itself and the feed's label — `the feed aave-v3 USDC (Arbitrum) [d9fa8e]`, or
   `the feed pool [d9fa8e14] (pinned by the book)` — otherwise;
+* `RealTestnetProvider.protocol_kind(address)` answers what money into that address
+  *calls*: `vault` for `stake(uint256)`, `aave-v3` for `supply(…)`, `""` for an address the
+  book does not contain. The two answers are the whole story a signature needs;
 * the protocol's `note` carries the same sentence;
-* the cycle prints it on the book line and **holds** instead of signing — this is one
-  dry-run cycle of the two-entry example book with the market arm answering `PANIC` for the
-  first pool (the block below is verbatim from the run described under *how that was
-  produced*, except that the provenance lines are shown in full):
+* the cycle prints provenance on the book line and **holds** instead of signing — this is
+  one dry-run cycle of the two-entry example book with the market arm answering `PANIC`
+  for the first pool (the block below is verbatim from the run described under *how that
+  was produced*, except that the provenance lines are shown in full):
 
 ```text
-── cycle 1 · 2026-10-03 07:00:00 · DRY RUN (nothing will be signed) · chain 31337 · block 20000000
-   book  aave-v3 USDC (Arbitrum)  +2.89% implied · the feed pool [d9fa8e14] (pinned by the book)
+── cycle 1 · 2025-10-03 17:00:00 · DRY RUN (nothing will be signed) · chain 42161 · block 20000000
+   book  aave-v3 USDC (Arbitrum)  +2.89% implied · the feed pool [d9fa8e14] (pinned by the book) · aave-v3
    book  uniswap-v3 WETH-USDC (Arbitrum) +18.77% implied · the feed pool [a14bd201] (pinned by the book)
-   market 1 pools read · panics 1 · verdicts {'PANIC': 1}
-   hold     aave-v3 USDC (Arbitrum)  [PANIC 1.00] — priced from the feed pool [d9fa8e14] (pinned by the book), not from this address's own log: the verdict is about the pool's name, and this loop signs only into a vault whose record it has read itself
+   market 2 pools read · panics 1 · verdicts {'PANIC': 1}
+   would stake  aave-v3 USDC (Arbitrum)  1.000000 ($1.00)  [PANIC 1.00] — TEST_STAKE_AMOUNT_USD decides it: 7.2% of the wallet, stable credits only — no ETH_USD_PRICE, so the 0.001950 ETH is not valued — supplied through the Aave v3 Pool, so the position becomes 1.000000 and its receipt is an aToken in this wallet
    hold     uniswap-v3 WETH-USDC (Arbitrum) — the market has no pool named like this vault — a signal about a pool is not a signal about this address, and this loop does not guess which contract implements which pool
 ```
 
-The book is priced, the verdict is real (`+2.89% implied`, `PANIC 1.00`), and the signature
-waits for a vault whose own log proves it implements the interface. Deploy that vault
+One entry is signed and the other is held, on the *same* feed and the *same* wallet, and
+the difference is the kind: the Aave pool's address is not inferred from a name — it is the
+pool the deployment table files under chain `42161`, checked before the first byte is
+signed — so the feed's rate is allowed to price what that address pays. The Uniswap pool
+has nobody to vouch for it, so its record stays a measurement. Deploy your own vault
 (`tests/test_physics_real_testnet.py` carries the reference contract and compiles it with
-Foundry), publish one `YieldDistributed`, and the same cycle stakes — the `hold` above
-becomes a `stake` with no configuration change, because the source became `chain`.
+Foundry), publish one `YieldDistributed`, and a `hold` of that kind becomes a `stake` with
+no configuration change, because the source becomes `chain`.
+
+The `stake` line above is also where the two ceilings the operator asked for show up by
+name: `TEST_STAKE_AMOUNT_USD=1.0` (send one dollar before trusting the loop with thirteen)
+and `MAX_TRADE_FRACTION` (a fifth of the wallet, never lifted by a panic). On a venue that
+can be **topped up** — an Aave `supply` grows an aToken position — those ceilings size the
+*position* and a cycle carries the difference, so raising the cap later adds to the
+position instead of opening a second one, and a difference under `$0.50` is refused rather
+than paid for in fees.
 
 **How a name becomes a pool.** `agent/physics/defillama_adapter.FeedHistory` ranks the
 catalogue by evidence and counts the ties: an exact symbol, then the whole
@@ -764,11 +784,13 @@ With `TESTNET_HISTORY=chain` (the code's default) the answer is "nothing to pric
 in this step, the line that says why and what to do about it:
 
 ```text
-book report — 2 entry/entries · lookback 5000 blocks · chain 31337 · TESTNET_HISTORY=chain
-  aave-v3 USDC (Arbitrum)  0x724dc807b04555b71ed48a6896b6f41593b8c637  no record
+book report — 2 entry/entries · lookback 5000 blocks · chain 42161 · TESTNET_HISTORY=chain
+  aave-v3 USDC (Arbitrum)  0x794a61358d6845594f94dc1db02a252b5b4814ad  aave-v3  no record
                            market: market off
-  uniswap-v3 WETH-USDC (Arbitrum) 0xc6962004f452be9203591991d15f6b388e09e8d0  no record
+                           stakable: no
+  uniswap-v3 WETH-USDC (Arbitrum) 0xc6962004f452be9203591991d15f6b388e09e8d0  vault  no record
                            market: market off
+                           stakable: no
   nothing to price: an entry has to emit YieldDistributed(uint256,uint256) (and a cycle has to see it inside the lookback window) before the hunter can measure it
   the feed was not asked — TESTNET_HISTORY=auto prices an entry from DeFiLlama's daily history of its name when the vault itself published nothing, and =feed asks only the feed
 ```
@@ -777,14 +799,16 @@ With `TESTNET_HISTORY=auto` (what `.env.example` ships) the same book is priced,
 report says where each record came from:
 
 ```text
-book report — 2 entry/entries · lookback 5000 blocks · chain 31337 · TESTNET_HISTORY=auto
-  aave-v3 USDC (Arbitrum)  0x724dc807b04555b71ed48a6896b6f41593b8c637  120 record(s) · the feed pool [d9fa8e14] (pinned by the book)
+book report — 2 entry/entries · lookback 5000 blocks · chain 42161 · TESTNET_HISTORY=auto
+  aave-v3 USDC (Arbitrum)  0x794a61358d6845594f94dc1db02a252b5b4814ad  aave-v3  120 record(s) · the feed pool [d9fa8e14] (pinned by the book)
+                           stakable: the address is the Aave pool this file knows for this chain, so the feed names the rate and supply() moves the money — the deployment is verified, not inferred from the name
+                           market: market off
+                           stakable: yes
+  uniswap-v3 WETH-USDC (Arbitrum) 0xc6962004f452be9203591991d15f6b388e09e8d0  vault  120 record(s) · the feed pool [a14bd201] (pinned by the book)
                            not stakable as-is: the record above is the feed's about this name, and this loop signs only into a vault whose own log it has read
                            market: market off
-  uniswap-v3 WETH-USDC (Arbitrum) 0xc6962004f452be9203591991d15f6b388e09e8d0  120 record(s) · the feed pool [a14bd201] (pinned by the book)
-                           not stakable as-is: the record above is the feed's about this name, and this loop signs only into a vault whose own log it has read
-                           market: market off
-  2 of 2 record(s) came from the feed, not from an address's own log: measured, and deliberately not staked
+                           stakable: no
+  2 of 2 record(s) came from the feed, not from an address's own log — 1 of them about a name the venue cannot verify as a vault, and those are not staked
 ```
 
 How those two blocks were produced, exactly. Real: `book.example.json` loaded by the
@@ -793,26 +817,85 @@ shipping loader; the pool catalogue from the feed's own **cached** document on t
 independently resolves to `a14bd201-…` — `uniswap-v3 WETH-USDC (Arbitrum)`, $36.7 M, the
 deepest of 18 pools carrying that pair — which is the uuid the book pins; the APY→rate
 conversion, `loop._book_report` and the cycle above. Stubbed, because this box has no
-egress: the two `/chart/{uuid}` documents (seeded noise around each pool's own published
-APY, 2.89 % and 18.66 %), the node (chain 31337, answering nothing), and the market arm
-(one `PANIC` handed over instead of the funnel's two hundred pools and fifty measured).
-`tests/test_physics_defillama.py` and `tests/test_trade_loop.py` pin the same behaviour
-against a fully mocked wire; `tests/test_physics_real_testnet.py` pins the policy.
+egress: the two `/chart/{uuid}` series (120 daily points at each pool's own published APY —
+2.89 % for Aave USDC, 18.77 % for the Uniswap pool), the node (a double answering chain
+`42161` and no logs, which is what `history_source` and `protocol_kind` are asked about),
+and the market arm (one `PANIC` handed over instead of the funnel's two hundred pools and
+fifty measured). `tests/test_physics_defillama.py` and `tests/test_trade_loop.py` pin the
+same behaviour against a fully mocked wire; `tests/test_physics_real_testnet.py` pins the
+policy and `tests/test_physics_aave_v3.py` pins the deployment table.
 
 `--book-report` exits `4` when nothing can be priced — the same code the hunter uses for
 "nothing to hunt in" — so a script can tell an empty book from a broken node.
 
-`--book-report` exits `4` when nothing can be priced — the same code the hunter uses for
-"nothing to hunt in" — so a script can tell an empty book from a broken node.
+There are now two ways to get a book that prices *and* can be funded, and both of them are
+an address this file can vouch for:
 
-To get a book that prices *and* can be staked, deploy the vault —
-`tests/test_physics_real_testnet.py` carries the reference contract (`TestVault.sol`:
-`publish(rateE18)`, `stake`, `withdraw`, the four events) and compiles it with Foundry —
-publish one `YieldDistributed`, and put **its** address in `data/book.json` with `token` set
-to the ERC20 it pulls, `decimals` to that token's own (6 for USDC) and `name` spelled like
-the DeFiLlama pool you want it measured against. That name is matched to a verdict exactly
-(normalised: letters and digits), so `USDC` does **not** match `aave-v3 USDC (Arbitrum)`;
-`pool` pins the history, `name` pairs the verdict.
+* **your own vault.** `tests/test_physics_real_testnet.py` carries the reference contract
+  (`TestVault.sol`: `publish(rateE18)`, `stake`, `withdraw`, the four events) and compiles
+  it with Foundry. Deploy it, publish one `YieldDistributed`, and put **its** address in
+  `data/book.json` with `token` set to the ERC20 it pulls, `decimals` to that token's own
+  (6 for USDC) and `name` spelled like the DeFiLlama pool you want it measured against.
+  That name is matched to a verdict exactly (normalised: letters and digits), so `USDC`
+  does **not** match `aave-v3 USDC (Arbitrum)`; `pool` pins the history, `name` pairs the
+  verdict.
+* **Aave v3, which is already deployed and audited.** One line in the book —
+  `"kind": "aave-v3"` with the Pool as `address` and USDC as `token` — and the venue
+  supplies on a feed-priced record, because that address is checked against a table rather
+  than guessed from a name. See *Aave v3* below.
+
+### Aave v3: somebody else's interface, and the table that vouches for it
+
+A vault is trusted because it published its own record. A lending pool cannot be: it emits
+no `YieldDistributed`, and it does not answer `stake(uint256)` at all. So the trust moves
+to a different place, and it has to be a place that **refuses**:
+
+```python
+# agent/physics/aave_v3.py — the only pools this file will sign into, by chain id
+42161: AaveDeployment(pool="0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+                      asset="0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # native USDC
+                      symbol="USDC", decimals=6,
+                      a_token="0x724dc807b04555b71ed48a6896b6f41593b8c637")
+```
+
+* a book entry with `"kind": "aave-v3"` is checked as a **pair** — this pool *and* this
+  asset, on the chain id the *node* reported — and refused before a single byte is signed
+  if the pair is not in the table. A book cannot declare a venue into existence, which is
+  the whole reason `kind` is safe to have;
+* the call is Aave's: `supply(asset, amount, onBehalfOf, referralCode)` with the signer as
+  its own beneficiary and `referralCode = 0` (this loop is nobody's affiliate), and
+  `withdraw(asset, amount, to)` paying the signer. An `approve` to the Pool comes first,
+  and is awaited like any other transaction;
+* the **position is read off the aToken**, not remembered: `balance()` reports
+  `position_token` / `position_balance`, which is the supplied amount plus every interest
+  payment since — so a lost state file, a second operator, or a withdrawal made by hand
+  changes the number the next cycle sizes against;
+* the **rate is the feed's**: `claim_apy` is the book's claim (a Pool has no
+  `claimApyE18`), and the record is DeFiLlama's history of the pinned pool uuid. That is
+  what an `aave-v3` entry needs `TESTNET_HISTORY=auto` for, and the venue says so by name
+  when the policy is `chain`;
+* a **position can be topped up**, so it is sized as a target: the same ceilings
+  (`MAX_TRADE_SIZE_USD`, `MAX_TRADE_FRACTION`, `TEST_STAKE_AMOUNT_USD`) decide the
+  position, each cycle carries the difference, and a difference under `$0.50` is a refusal.
+
+Your first dollar, end to end:
+
+```bash
+# .env — Arbitrum One, a funded key, the example book with its Aave entry
+TESTNET_PROFILE=arbitrum
+TESTNET_ALLOW_MAINNET=1          # plus allow_mainnet=True in the caller: two yeses
+TESTNET_HISTORY=auto
+TEST_STAKE_AMOUNT_USD=1.0        # one dollar first, whatever the other ceilings allow
+DRY_RUN=1                        # look before signing
+
+python -m agent.trade.loop --book-report     # "stakable: yes" on the Aave line
+python -m agent.trade.loop --once            # prints the $1 supply and signs nothing
+DRY_RUN=0 python -m agent.trade.loop --once  # signs it: approve + supply, then a receipt
+```
+
+`stake` records the *asset* amount it supplied; a withdrawal asks the Pool for that amount
+of the asset, so interest earned above it stays in the position as aToken dust until the
+operator takes it out.
 
 ### Dry run is the default, and it is not a flag inside the venue
 
@@ -892,7 +975,7 @@ python -m agent.main
 pytest
 ```
 
-733 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+821 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
@@ -938,7 +1021,7 @@ size of the thing: nothing here needs a cluster, a broker or a database.
   (`ARBITRUM_RPC_URL`, `ARBITRUM_PRIVATE_KEY`, `ARBITRUM_CHAIN_ID`) answer for the
   canonical ones. A profile is a spelling, not a permission — 42161, 137 and 8453
   are in the mainnet lock, so an L2 still needs both yeses to sign.
-* **A suite that runs like a deployment.** 692 tests, no network, no key, no
+* **A suite that runs like a deployment.** 821 tests, no network, no key, no
   chain; a live chain is an extra (`pip install 'enrg-ai[testnet]'`) and the
   Anvil tests skip by name when foundry is absent.
 
@@ -1155,8 +1238,8 @@ because a deploy needs them. Measured on this repository's own build
   `entrain_infer` core, `axis_core` — and they say so by name rather than passing
   quietly. The trading path's own tests do run in the image:
   `docker compose exec trader pytest -q tests/test_trade_loop.py
-  tests/test_physics_real_testnet.py` is green. All 733 pass on a host that holds the
-  workspace.
+  tests/test_physics_real_testnet.py tests/test_physics_aave_v3.py` is green. All 821
+  pass on a host that holds the workspace.
 
 
 ### Environment variables
@@ -1173,7 +1256,7 @@ error with a name, never a silent fallback.
 | `TESTNET_CHAIN_ID` | asserted against the node's own chain id; a mismatch refuses to connect | none → accepts what the node reports |
 | `TESTNET_PROFILE` | `arbitrum` (42161), `base` (8453), `polygon` (137) or `sepolia` (11155111): names the chain, so the provider's own spellings answer and the id need not be written down | unset → `TESTNET_*` only |
 | `ARBITRUM_RPC_URL` / `ARBITRUM_PRIVATE_KEY` / `ARBITRUM_CHAIN_ID` | the same three values under a node provider's names — read only when `TESTNET_PROFILE=arbitrum` **and** the canonical name is empty | the canonical name always wins |
-| `TESTNET_PROTOCOLS_FILE` / `TESTNET_PROTOCOLS` | the operator's address book — the whitelist | empty book (nothing stakeable) |
+| `TESTNET_PROTOCOLS_FILE` / `TESTNET_PROTOCOLS` | the operator's address book — the whitelist. An entry's `kind` says what it is: `vault` (default) or `aave-v3` | empty book (nothing stakeable) |
 | `TESTNET_HISTORY` | where a record comes from: `chain` (the vault's own `YieldDistributed` logs), `feed` (DeFiLlama's daily APY series for the entry's `name` or pinned `pool` uuid — no node read) or `auto` (log first, feed when the log is silent) | `chain`; `.env.example` ships `auto` |
 | `TESTNET_DECIMALS` | credits per token unit | `6` |
 | `TESTNET_LOOKBACK` | blocks scanned for a record | `5000` |
@@ -1188,6 +1271,7 @@ error with a name, never a silent fallback.
 | `MAX_TRADE_FRACTION` | a share of the wallet, read from the chain on the same cycle | `0.20` |
 | `ETH_USD_PRICE` | how the native balance is valued; without it the fraction applies to the stable credits only | unset → ETH unpriced |
 | `GAS_RESERVE_ETH` | below this, a stake is refused instead of sent | `0.0005` |
+| `TEST_STAKE_AMOUNT_USD` | the ceiling on one transaction while the operator is still deciding — "send one dollar first". Never lifted by a panic; on a top-up venue it caps the *step* towards the target | `0` → no micro cap; `.env.example` leaves it empty |
 | `TRADE_INTERVAL` | seconds between trading cycles (compose) | `300` |
 | `TRADER_STATE` | where the trader remembers its positions | `data/trader_state.json` |
 | `TRADE_MARKET` | `real` (DeFiLlama), `synthetic` (drawn, no egress) or `off` | `real` |

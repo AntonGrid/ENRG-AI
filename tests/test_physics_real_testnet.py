@@ -124,6 +124,9 @@ class World:
         self.counts: List[Tuple[str, str]] = []
         self.sent: List[Any] = []
         self.waits: List[Any] = []
+        #: The ``to`` of the last transaction a call was built for — so ``send_raw`` can say
+        #: where the money went without the signed bytes having to be decoded.
+        self.built_to = ""
 
     # -- assertion helpers --------------------------------------------------- #
 
@@ -139,8 +142,11 @@ class World:
 class FakeCall:
     """One contract function call: ``stake(units)``, and what would happen to it."""
 
-    def __init__(self, world: World, name: str, args: Tuple[Any, ...]) -> None:
+    def __init__(
+        self, world: World, contract: str, name: str, args: Tuple[Any, ...]
+    ) -> None:
         self.world = world
+        self.contract = str(contract)
         self.name = name
         self.args = args
 
@@ -166,9 +172,10 @@ class FakeCall:
 
     def build_transaction(self, tx: Dict[str, Any]) -> Dict[str, Any]:
         self.world.calls.append(("build", self.name, self.args, dict(tx)))
+        self.world.built_to = self.contract
         return {
             **tx,
-            "to": VAULT,
+            "to": self.contract,
             "data": "0x" + self.name.encode().hex(),
             "value": 0,
         }
@@ -177,12 +184,13 @@ class FakeCall:
 class FakeFunctions:
     """``contract.functions``: any attribute is a function of that name."""
 
-    def __init__(self, world: World) -> None:
+    def __init__(self, world: World, address: str = "") -> None:
         self._world = world
+        self._address = str(address)
 
     def __getattr__(self, name: str) -> Any:
         def factory(*args: Any) -> FakeCall:
-            return FakeCall(self._world, name, args)
+            return FakeCall(self._world, self._address, name, args)
 
         return factory
 
@@ -193,7 +201,7 @@ class FakeContract:
     def __init__(self, world: World, address: str, abi: Any) -> None:
         self.address = address
         self.abi = abi
-        self.functions = FakeFunctions(world)
+        self.functions = FakeFunctions(world, address)
 
 
 class FakeAccount:
@@ -251,7 +259,9 @@ class FakeEth:
         return FakeContract(self._world, address, abi)
 
     def send_raw_transaction(self, raw: Any) -> bytes:
-        self._world.sent.append({"raw": raw, "to": VAULT})
+        self._world.sent.append(
+            {"raw": raw, "to": self._world.built_to or VAULT}
+        )
         self._world.height += 1  # instant mining: a sent transaction is a block
         return b"\x02" * 32
 
@@ -1619,4 +1629,251 @@ def test_auto_prices_a_silent_vault_from_the_feed(world):
     assert feed.calls == [{"name": "VaultA", "steps": None, "uuid": ""}]
     assert quiet.history_source(VAULT).startswith("the feed aave-v3 USDC (Arbitrum)")
     assert quiet.history_source(VAULT) != T.RECORD_FROM_CHAIN
+
+
+# ── Aave v3: somebody else's interface, and the table that vouches for it ────
+#
+# A vault is trusted because it published its own record; a lending pool cannot be —
+# it has no ``YieldDistributed`` to emit. So the trust moves to a different place, and
+# these tests pin down where: the deployment table in ``agent.physics.aave_v3``, keyed by
+# the chain id the *node* reported. What follows is that a supply is Aave's call on
+# Aave's pool, that a pair outside the table is refused before the approval that would
+# have paid for it, and that the position is read back off the aToken rather than
+# remembered.
+
+#: The pool and the asset, exactly as Arbitrum One spells them.
+AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+AAVE_USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+AAVE_ATOKEN = "0x724dc807b04555b71ed48a6896b6f41593b8c637"
+STRANGER = "0x" + "77" * 20
+
+
+def aave_entry(**overrides: Any) -> Dict[str, Any]:
+    """One book entry that is an Aave pool rather than a vault of this interface."""
+    entry = {
+        "address": AAVE_POOL,
+        "name": "aave-v3 USDC (Arbitrum)",
+        "bucket": "active",
+        "claim_apy": 0.05,
+        "decimals": 6,
+        "token": AAVE_USDC,
+        "pool": "d9fa8e14-0447-4207-9ae8-7810199dfa1f",
+        "kind": T.AAVE_KIND,
+        "note": "the real Aave v3 pool on Arbitrum One",
+    }
+    entry.update(overrides)
+    return {"protocols": [entry]}
+
+
+def aave_env(**overrides: str) -> Dict[str, str]:
+    """Mainnet, with both yeses: the flag below and ``allow_mainnet=True`` at the venue."""
+    env = {
+        "TESTNET_RPC_URL": "http://127.0.0.1:8545/v2/secret-key-in-the-path",
+        "TESTNET_PRIVATE_KEY": KEY,
+        "TESTNET_PROTOCOLS": json.dumps(aave_entry()),
+        "TESTNET_ALLOW_MAINNET": "1",
+        "TESTNET_BLOCK_TIMEOUT": "0.05",
+        "TESTNET_RECEIPT_TIMEOUT": "5",
+    }
+    env.update(overrides)
+    return env
+
+
+@pytest.fixture()
+def aave_world(world: World) -> World:
+    """A world sitting on Arbitrum One, which is where the table has an answer."""
+    world.chain = ARBITRUM
+    return world
+
+
+@pytest.fixture()
+def aave_venue(aave_world: World) -> RealTestnetProvider:
+    return RealTestnetProvider(
+        env=aave_env(), web3=FakeWeb3(aave_world), allow_mainnet=True
+    )
+
+
+
+
+def test_an_aave_entry_has_to_name_the_asset_it_supplies():
+    """``supply`` takes the asset as its first argument; guessing one supplies the wrong coin."""
+    with pytest.raises(NetNotConfigured) as raised:
+        ProtocolEntry(
+            address=AAVE_POOL, name="aave", kind=T.AAVE_KIND, token="", decimals=6
+        )
+    assert "token" in str(raised.value)
+
+
+def test_a_kind_outside_the_book_s_vocabulary_is_refused():
+    with pytest.raises(NetNotConfigured) as raised:
+        ProtocolEntry(address=VAULT, name="VaultA", kind="curve-v2")
+    message = str(raised.value)
+    assert "curve-v2" in message and T.AAVE_KIND in message and T.VAULT_KIND in message
+
+
+def test_the_kind_survives_the_json_the_operator_writes():
+    book = ProtocolBook.from_payload(aave_entry())
+
+    assert book.get(AAVE_POOL).kind == T.AAVE_KIND
+    assert book.get(AAVE_POOL).as_dict()["kind"] == T.AAVE_KIND
+    # an entry that says nothing is a vault, which is what every entry used to be
+    plain = ProtocolBook.from_payload(book_payload()).get(VAULT)
+    assert plain.kind == T.VAULT_KIND
+
+
+def test_protocol_kind_answers_for_the_book_and_nothing_else(aave_venue):
+    assert aave_venue.protocol_kind(AAVE_POOL) == T.AAVE_KIND
+    assert aave_venue.protocol_kind(AAVE_POOL.lower()) == T.AAVE_KIND
+    assert aave_venue.protocol_kind(STRANGER) == ""
+
+
+def test_an_aave_supply_approves_the_pool_and_calls_supply(aave_venue, aave_world):
+    assert aave_venue.execute_stake(AAVE_POOL, 1.0) is True
+
+    pool = AAVE_POOL.lower()
+    usdc = AAVE_USDC.lower()
+    # the spender is the pool, because the pool is what pulls the asset
+    assert ("call", "allowance", (SIGNER, pool), {"from": SIGNER}) in aave_world.calls
+    assert aave_world.names("build") == ["approve", "supply"]
+    approve, supply = [call for call in aave_world.calls if call[0] == "build"]
+    assert approve[2] == (pool, 1_000_000)
+    assert supply[2] == (usdc, 1_000_000, SIGNER, 0)  # no referral, the signer's position
+
+    assert aave_world.sent_to() == [usdc, pool]
+    assert len(aave_world.waits) == 2
+    assert {tx.get("chainId") for tx in (approve[3], supply[3])} == {ARBITRUM}
+
+    assert len(aave_venue.stakes) == 1
+    assert aave_venue.stakes[0]["action"] == "supply"
+    assert aave_venue.stakes[0]["units"] == 1_000_000
+    assert aave_venue.stakes[0]["status"] == 1
+    assert aave_venue.refusals == []
+
+
+def test_an_aave_pair_the_table_does_not_know_is_refused_before_any_approval(world):
+    """The whole safety story: a pool this file cannot name is a pool it cannot sign into."""
+    world.chain = ARBITRUM
+    venue = RealTestnetProvider(
+        env=aave_env(**{"TESTNET_PROTOCOLS": json.dumps(aave_entry(address=STRANGER))}),
+        web3=FakeWeb3(world),
+        allow_mainnet=True,
+    )
+
+    with pytest.raises(NetNotConfigured) as raised:
+        venue.execute_stake(STRANGER, 1.0)
+
+    message = str(raised.value)
+    assert STRANGER in message and str(ARBITRUM) in message
+    assert world.names("build") == [] and venue.approvals == [] and venue.stakes == []
+
+
+def test_a_known_pool_over_an_unknown_asset_is_refused_too(world):
+    """The pair is checked, not the pool alone: the wrong asset is a supply of the wrong coin."""
+    world.chain = ARBITRUM
+    venue = RealTestnetProvider(
+        env=aave_env(**{"TESTNET_PROTOCOLS": json.dumps(aave_entry(token=TOKEN))}),
+        web3=FakeWeb3(world),
+        allow_mainnet=True,
+    )
+
+    with pytest.raises(NetNotConfigured) as raised:
+        venue.execute_stake(AAVE_POOL, 1.0)
+    assert TOKEN in str(raised.value) and world.names("build") == []
+
+
+def test_an_aave_withdraw_returns_the_asset_to_the_signer(aave_venue, aave_world):
+    assert aave_venue.withdraw(AAVE_POOL, 2.5) is True
+
+    assert aave_world.names("build") == ["withdraw"]
+    withdraw = [call for call in aave_world.calls if call[0] == "build"][0]
+    assert withdraw[2] == (AAVE_USDC.lower(), 2_500_000, SIGNER)
+    assert aave_world.sent_to() == [AAVE_POOL.lower()]
+    assert aave_venue.withdrawals[0]["action"] == "withdraw"
+    assert aave_venue.approvals == []  # nothing to approve on the way out
+
+
+def test_the_balance_reports_the_a_token_position(aave_venue, aave_world):
+    """A position is a receipt in the wallet, so the wallet can be asked about it."""
+    aave_world.token_balance = int(1.5 * 10 ** 6)
+
+    read = aave_venue.balance(AAVE_POOL)
+
+    assert read.ok and read.staked
+    assert read.token == AAVE_USDC.lower() and read.token_balance == pytest.approx(1.5)
+    assert read.position_token == AAVE_ATOKEN.lower()
+    assert read.position_balance == pytest.approx(1.5)
+    assert "in the venue" in str(read)
+    assert read.as_dict()["position_units"] == 1_500_000
+
+
+def test_a_vault_reports_no_a_token_position(provider):
+    """A vault keeps its own accounting; inventing a receipt for it would be a guess."""
+    read = provider.balance(VAULT)
+    assert read.position_token == "" and read.position_units == 0 and not read.staked
+
+
+def test_a_dry_run_of_a_supply_simulates_the_pool(aave_venue, aave_world):
+    run = aave_venue.dry_run("stake", AAVE_POOL, 1.0)
+
+    assert run.ok and run.units == 1_000_000 and run.sender == SIGNER
+    assert aave_world.names("call") == ["supply"]
+    assert "stake" not in aave_world.names("estimate_gas")
+    assert aave_world.sent == []  # a simulation signs nothing
+
+
+def test_a_proof_has_no_aave_equivalent(aave_venue):
+    run = aave_venue.dry_run("proof", AAVE_POOL, 0.0, {"verdict": "CALM"})
+
+    assert run.ok is False
+    assert "evidence call" in (run.revert or "")
+
+
+def test_the_chain_policy_tells_the_operator_to_ask_the_feed(world):
+    """An Aave position emits nothing, so ``=chain`` cannot price it — and the log says so."""
+    world.chain = ARBITRUM
+    venue = RealTestnetProvider(
+        env=aave_env(**{T.ENV_HISTORY: T.HISTORY_CHAIN}),
+        web3=FakeWeb3(world),
+        allow_mainnet=True,
+    )
+
+    assert venue.get_protocol_list() == []
+    assert any(T.ENV_HISTORY in line and "Aave" in line for line in venue.errors)
+
+
+def test_a_book_that_counts_decimals_wrong_is_refused(world):
+    """``decimals`` is what turns $1 into units: 18 on a 6-decimal asset is a ×10¹² approval."""
+    world.chain = ARBITRUM
+    venue = RealTestnetProvider(
+        env=aave_env(**{"TESTNET_PROTOCOLS": json.dumps(aave_entry(decimals=18))}),
+        web3=FakeWeb3(world),
+        allow_mainnet=True,
+    )
+
+    with pytest.raises(NetNotConfigured) as raised:
+        venue.execute_stake(AAVE_POOL, 1.0)
+    message = str(raised.value)
+    assert "18" in message and "6" in message and world.names("build") == []
+
+
+def test_a_feed_priced_aave_entry_is_published_with_the_pool_in_its_note(world):
+    world.chain = ARBITRUM
+    world.logs = []
+    venue = RealTestnetProvider(
+        env=aave_env(**{T.ENV_HISTORY: T.HISTORY_AUTO}),
+        web3=FakeWeb3(world),
+        feed=FakeFeed(),
+        allow_mainnet=True,
+    )
+
+    published = venue.get_protocol_list()
+
+    assert len(published) == 1
+    protocol = published[0]
+    assert protocol.address == AAVE_POOL.lower()
+    assert protocol.claim_apy == pytest.approx(0.05)  # the book's claim, not a chain read
+    assert "claimApyE18" not in world.names("call")
+    assert "supply(" in protocol.note and "Aave v3 USDC (Arbitrum)" in protocol.note
+    assert venue.protocol_kind(AAVE_POOL) == T.AAVE_KIND
+    assert venue.history_source(AAVE_POOL) != T.RECORD_FROM_CHAIN
 

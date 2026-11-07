@@ -19,6 +19,9 @@ Three ceilings, and the smallest wins
 ``token balance``        the credits the vault can actually pull. A loop that sizes past
                          this one reverts, and a revert costs gas for nothing.
 
+(A fourth, ``TEST_STAKE_AMOUNT_USD``, is described below — it is a ceiling of the same
+kind, and the smallest of the four still wins.)
+
 The gas reserve is a *refusal*, not a ceiling
 =============================================
 
@@ -26,6 +29,25 @@ A stake spends the vault's ERC20 and costs a little of the native coin. If the w
 cannot pay the fee, the trade is not small — it is impossible, and this file says so with
 a sentence instead of letting the node say it with a revert. ``GAS_RESERVE_ETH`` defaults
 to a figure that covers an ``approve`` **and** a ``stake`` on an L2 with room to spare.
+
+The first stake, and what a position already holds
+==================================================
+
+``TEST_STAKE_AMOUNT_USD`` is a fourth ceiling with one purpose: a wallet that has just
+been funded should be able to send one dollar before anyone trusts it with thirteen. It is
+a *ceiling* like the others — it never raises a size, only lowers it — and it is empty by
+default, because a loop that shipped with a one-dollar cap would look like a loop that
+worked while doing nothing.
+
+``held_usd`` is the same idea in the other direction. A venue whose position can be topped
+up (an Aave ``supply`` puts an aToken in the wallet; a second ``supply`` just grows it)
+is sized against a **target**, and the transaction carries the difference between the
+target and what is already there. Two rules make that safe: the fraction is taken of the
+whole position plus the free balance, so a top-up can never walk past "a fifth of the
+wallet"; and a difference below ``MIN_TOP_UP_USD`` is a refusal, because a cent of
+movement costs a fee of its own. A venue that cannot be topped up (a vault with one
+position per address) never passes ``held_usd`` at all — it is a *hold*, decided by the
+caller, and this file does not soften it.
 
 What the confidence does
 ========================
@@ -64,6 +86,8 @@ __all__ = [
     "ENV_GAS_RESERVE",
     "ENV_MAX_FRACTION",
     "ENV_MAX_TRADE_USD",
+    "ENV_MICRO_CAP",
+    "MIN_TOP_UP_USD",
     "Sizing",
     "SizingError",
     "TradeSize",
@@ -75,6 +99,17 @@ ENV_MAX_TRADE_USD = "MAX_TRADE_SIZE_USD"
 ENV_MAX_FRACTION = "MAX_TRADE_FRACTION"
 ENV_ETH_PRICE = "ETH_USD_PRICE"
 ENV_GAS_RESERVE = "GAS_RESERVE_ETH"
+
+#: The ceiling on a *single* transaction while the operator is still deciding whether to
+#: trust the loop: "send one dollar first" as a number instead of a promise. Zero means
+#: no such ceiling — the ordinary case, and the default.
+ENV_MICRO_CAP = "TEST_STAKE_AMOUNT_USD"
+
+#: The smallest difference between a target position and what is already supplied that is
+#: worth a transaction. Half a dollar on an L2 is roughly a thousand times the fee, which
+#: is the margin this number is meant to hold: a top-up exists to move capital, not to
+#: demonstrate that the loop can sign.
+MIN_TOP_UP_USD = 0.50
 
 #: A fifth of the wallet. Chosen so that a wallet that is wrong about its own size is
 #: still wrong five times before it is empty.
@@ -146,6 +181,11 @@ class Sizing:
     eth_price_usd: float = 0.0
     gas_reserve_eth: float = DEFAULT_GAS_RESERVE_ETH
     dry_run: bool = True
+    #: ``TEST_STAKE_AMOUNT_USD``: the ceiling for one transaction while the operator is
+    #: still deciding. Zero is "no micro cap", which is not the same as "cap of zero" — a
+    #: zero cap would be a loop that can never trade, and a missing ceiling is a loop that
+    #: can trade its ordinary size.
+    micro_cap_usd: float = 0.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.max_trade_usd)) or float(self.max_trade_usd) < 0:
@@ -156,6 +196,8 @@ class Sizing:
             raise SizingError(f"{ENV_ETH_PRICE} must be a number >= 0")
         if not math.isfinite(float(self.gas_reserve_eth)) or float(self.gas_reserve_eth) < 0:
             raise SizingError(f"{ENV_GAS_RESERVE} must be a number >= 0")
+        if not math.isfinite(float(self.micro_cap_usd)) or float(self.micro_cap_usd) < 0:
+            raise SizingError(f"{ENV_MICRO_CAP} must be a number >= 0")
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Sizing":
@@ -176,6 +218,7 @@ class Sizing:
                 source.get(ENV_GAS_RESERVE), DEFAULT_GAS_RESERVE_ETH, ENV_GAS_RESERVE
             ),
             dry_run=_flag(source.get(ENV_DRY_RUN), default=True),
+            micro_cap_usd=_number(source.get(ENV_MICRO_CAP), 0.0, ENV_MICRO_CAP),
         )
 
     def replace(self, **changes: Any) -> "Sizing":
@@ -186,6 +229,7 @@ class Sizing:
             "eth_price_usd": self.eth_price_usd,
             "gas_reserve_eth": self.gas_reserve_eth,
             "dry_run": self.dry_run,
+            "micro_cap_usd": self.micro_cap_usd,
         }
         fields.update(changes)
         return Sizing(**fields)
@@ -197,6 +241,7 @@ class Sizing:
             "eth_price_usd": float(self.eth_price_usd),
             "gas_reserve_eth": float(self.gas_reserve_eth),
             "dry_run": bool(self.dry_run),
+            "micro_cap_usd": float(self.micro_cap_usd),
         }
 
     def __str__(self) -> str:
@@ -211,8 +256,12 @@ class Sizing:
             else f"ETH ${self.eth_price_usd:,.2f}"
         )
         mode = "dry run" if self.dry_run else "LIVE"
+        micro = (
+            "" if self.micro_cap_usd <= 0.0
+            else f", micro cap ${self.micro_cap_usd:,.2f} per transaction"
+        )
         return (
-            f"{mode}: min({usd}, {self.max_fraction:.0%} of the wallet) — {price}, "
+            f"{mode}: min({usd}, {self.max_fraction:.0%} of the wallet){micro} — {price}, "
             f"gas reserve {self.gas_reserve_eth:g} ETH"
         )
 
@@ -260,18 +309,29 @@ def size_trade(
     native_eth: float,
     sizing: Sizing,
     confidence: float = 0.0,
+    held_usd: float = 0.0,
 ) -> TradeSize:
-    """The size of one trade: the smallest of three ceilings, or a named refusal.
+    """The size of one trade: the smallest of the ceilings, or a named refusal.
 
     ``token_balance`` is the credit the vault pulls (what ``execute_stake`` spends) and
     ``native_eth`` is the gas money. They are separate arguments on purpose: a wallet with
     ether and no credits cannot stake, and the most common way a first trading run fails
     quietly is by confusing the two.
+
+    ``held_usd`` is what the venue *already* holds of this entry, and it changes what the
+    number means: with nothing held, the ceilings size a transaction; with something held,
+    they size a **position** and the transaction carries the difference. The distinction is
+    the caller's to make — a vault that allows one position per address must pass ``0.0``
+    and treat the position as a hold, which is exactly what the trading loop does.
     """
     token = max(float(token_balance), 0.0)
     native = max(float(native_eth), 0.0)
+    held = max(float(held_usd), 0.0)
     price = float(sizing.eth_price_usd)
-    equity = token + (native * price if price > 0.0 else 0.0)
+    # A position is part of the wallet it was bought with: the fraction has to see the
+    # money that is already lent out, or "a fifth of the wallet" would leave the fifth in
+    # the pool and spend another fifth of the remainder, cycle after cycle.
+    equity = token + held + (native * price if price > 0.0 else 0.0)
 
     # 1. can the wallet pay for the transaction at all?
     if native < float(sizing.gas_reserve_eth):
@@ -285,7 +345,9 @@ def size_trade(
         )
 
     # 2. how much is the ceiling, in dollars? A panic may lift the operator's dollar
-    #    ceiling by at most half — and never the fraction, which is the survival cap.
+    #    ceiling by at most half — and never the fraction, which is the survival cap. The
+    #    micro cap is never lifted by anything: its whole purpose is to be the number a
+    #    first, unproven loop cannot argue with.
     boost = 1.0 + ALPHA_BOOST * min(max(float(confidence), 0.0), 1.0)
     ceilings = []
     if sizing.max_trade_usd > 0.0:
@@ -294,6 +356,8 @@ def size_trade(
         )
     if sizing.max_fraction > 0.0:
         ceilings.append((equity * float(sizing.max_fraction), ENV_MAX_FRACTION))
+    if sizing.micro_cap_usd > 0.0:
+        ceilings.append((float(sizing.micro_cap_usd), ENV_MICRO_CAP))
     if not ceilings:
         return TradeSize(
             equity_usd=equity,
@@ -303,6 +367,8 @@ def size_trade(
             ),
         )
     cap, bound = min(ceilings, key=lambda pair: pair[0])
+    if held > 0.0:
+        return _top_up(cap, bound, held, token, equity, native)
     wanted = cap
 
     # 3. what the wallet can actually move.
@@ -339,3 +405,66 @@ def size_trade(
         bound=bound,
         reason=reason,
     )
+
+
+def _top_up(
+    cap: float,
+    bound: str,
+    held: float,
+    token: float,
+    equity: float,
+    native: float,
+) -> TradeSize:
+    """What is missing between the ceiling and the position — when it is worth a fee.
+
+    Three refusals and one number. The position already *at* the ceiling is the common case
+    after a loop's first cycle and it is not an error: it is the loop doing nothing, which
+    is what a ceiling is for. The position *near* the ceiling is the case a naive
+    implementation turns into a train of three-cent transactions, which is why
+    :data:`MIN_TOP_UP_USD` exists. And a delta larger than the free balance is clamped to the
+    balance, the same way an ordinary size is: the ceiling decides *how much*, the wallet
+    decides *whether*.
+    """
+    room = float(cap) - float(held)
+    if room <= 0.0:
+        return TradeSize(
+            equity_usd=equity,
+            bound="top_up",
+            refusal=(
+                f"holding {held:.6f} of the {cap:.6f} that {bound} allows: the position is "
+                "already at the ceiling, so there is nothing to add"
+            ),
+        )
+    if room < MIN_TOP_UP_USD:
+        return TradeSize(
+            equity_usd=equity,
+            bound="top_up",
+            refusal=(
+                f"{bound} allows a {cap:.6f} position and {held:.6f} is already supplied: "
+                f"the remaining {room:.6f} is below the {MIN_TOP_UP_USD:g} minimum top-up, "
+                "which would spend a real fee on a rounding error"
+            ),
+        )
+    amount, bound_name = room, f"{bound}+top_up"
+    if amount > token:
+        amount, bound_name = token, "token_balance"
+    if amount <= 0.0:
+        return TradeSize(
+            equity_usd=equity,
+            bound=bound_name,
+            refusal=(
+                f"the wallet holds {native:.6f} ETH of gas money and no credits to top the "
+                f"{held:.6f} already supplied up to {cap:.6f}"
+            ),
+        )
+    return TradeSize(
+        amount=round(float(amount), 6),
+        usd=float(amount),
+        equity_usd=equity,
+        bound=bound_name,
+        reason=(
+            f"top-up to the {cap:.6f} that {bound} allows: {held:.6f} is already supplied, "
+            f"so this transaction carries {amount:.6f}"
+        ),
+    )
+

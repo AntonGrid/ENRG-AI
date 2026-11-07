@@ -179,6 +179,7 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
+from agent.physics import aave_v3
 from agent.physics.interfaces import IWeb3Provider
 from agent.physics.portfolio import (
     BUCKETS,
@@ -192,6 +193,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, and web3 is optional at run
     from web3 import Web3
 
 __all__ = [
+    "AAVE_KIND",
+    "VAULT_KIND",
+    "KINDS",
     "Balance",
     "DryRun",
     "HISTORY_AUTO",
@@ -321,6 +325,22 @@ YIELD_EVENT_SIGNATURE = "YieldDistributed(uint256,uint256)"
 #: What ``1e18``-scaled means: a rate of ``0.0002`` per epoch arrives as ``2e14``.
 RATE_SCALE = 1e18
 
+#: The two kinds of venue a book entry may be. ``vault`` is the interface *this file*
+#: wrote: ``stake(uint256)``, ``withdraw(uint256)``, and a rate the address published
+#: itself. ``aave-v3`` is somebody else's interface — ``supply(asset, amount, onBehalfOf,
+#: referralCode)`` into a Pool that a book cannot choose, because
+#: :mod:`agent.physics.aave_v3` holds the only pools this file will sign into and the
+#: venue checks the entry against that table by chain id.
+#:
+#: The distinction is not cosmetic. For a ``vault`` the address *is* the claim: a record
+#: read from it proves it implements the interface, and a record from the feed proves
+#: nothing. For ``aave-v3`` the address is a line in a table this file maintains, so the
+#: proof arrives at load time, and the feed is then only asked what the position *earns* —
+#: a question the protocol, not the operator, answers.
+VAULT_KIND = "vault"
+AAVE_KIND = aave_v3.AAVE_KIND
+KINDS = (VAULT_KIND, AAVE_KIND)
+
 #: The vault this provider speaks to. Four calls, and every one of them has an obvious
 #: meaning on a chain: money in, money out, evidence, and the claim.
 VAULT_ABI: List[Dict[str, Any]] = [
@@ -440,6 +460,13 @@ class ProtocolEntry:
     #: prices it instead of hoping a label resolves — and it is optional because most
     #: operators meet a pool through its label first.
     pool: str = ""
+    #: How money actually moves into this address. ``vault`` (the default) means the
+    #: interface this file wrote — ``stake(uint256)``. ``aave-v3`` means an Aave Pool, whose
+    #: calls are ``supply``/``withdraw`` and whose whitelist is the deployment table in
+    #: :mod:`agent.physics.aave_v3` rather than this file. An entry cannot become an Aave
+    #: pool by saying so: the venue asks that table, with the chain id the node reported,
+    #: and refuses a pair it does not know.
+    kind: str = VAULT_KIND
 
     def __post_init__(self) -> None:
         if not _is_address(self.address):
@@ -463,11 +490,23 @@ class ProtocolEntry:
         pool = str(self.pool or "").strip()
         if len(pool) > 64 or any(character.isspace() for character in pool):
             raise TestnetNotConfigured(f"{self.name}: {pool!r} is not a pool uuid")
+        kind = str(self.kind or VAULT_KIND).strip().lower()
+        if kind not in KINDS:
+            raise TestnetNotConfigured(
+                f"{self.name}: kind must be one of {KINDS}, got {self.kind!r}"
+            )
+        if kind == AAVE_KIND and not _is_address(self.token):
+            raise TestnetNotConfigured(
+                f"{self.name}: an {AAVE_KIND} entry must name the asset it supplies in "
+                "'token' — an Aave supply takes the asset as its first argument, and "
+                "guessing it would supply the wrong coin"
+            )
         object.__setattr__(self, "address", str(self.address).lower())
         object.__setattr__(self, "token", str(self.token).lower())
         object.__setattr__(self, "claim_apy", float(self.claim_apy))
         object.__setattr__(self, "decimals", int(self.decimals))
         object.__setattr__(self, "pool", pool)
+        object.__setattr__(self, "kind", kind)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -479,17 +518,7 @@ class ProtocolEntry:
             "token": self.token,
             "note": self.note,
             "pool": self.pool,
-        }
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "address": self.address,
-            "name": self.name,
-            "bucket": self.bucket,
-            "claim_apy": self.claim_apy,
-            "decimals": self.decimals,
-            "token": self.token,
-            "note": self.note,
+            "kind": self.kind,
         }
 
 
@@ -671,10 +700,23 @@ class Balance:
     chain_id: int = 0
     block: int = 0
     error: str = ""
+    #: What is *already* in the venue, when the venue can say: for an Aave position, the
+    #: aToken balance, which is the supplied amount plus every interest payment since. Zero
+    #: for a vault — a ``vault`` reports its own accounting through its record, not through
+    #: an ERC20 the wallet holds — and the two numbers are separate because "the wallet has
+    #: 13.82 USDC" and "1.00 of it is lent out" are different facts about the same cent.
+    position_token: str = ""
+    position_balance: float = 0.0
+    position_units: int = 0
 
     @property
     def ok(self) -> bool:
         return not self.error
+
+    @property
+    def staked(self) -> bool:
+        """Whether the venue already holds something of this entry."""
+        return self.position_units > 0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -688,6 +730,9 @@ class Balance:
             "chain_id": int(self.chain_id),
             "block": int(self.block),
             "error": self.error,
+            "position_token": self.position_token,
+            "position_balance": round(float(self.position_balance), 6),
+            "position_units": int(self.position_units),
         }
 
     def __str__(self) -> str:
@@ -696,6 +741,8 @@ class Balance:
         line = f"{self.native_eth:.6f} ETH"
         if self.token:
             line += f" + {self.token_balance:.6f} of {self.token}"
+        if self.position_token:
+            line += f" ({self.position_balance:.6f} of {self.position_token} in the venue)"
         return f"balance of {self.address or 'the signer'}: {line}"
 
 
@@ -1271,6 +1318,64 @@ class RealTestnetProvider(IWeb3Provider):
 
     # -- what is on offer --------------------------------------------------- #
 
+    def protocol_kind(self, address: str) -> str:
+        """How money reaches this address, as the operator's book declares it.
+
+        ``vault`` for the interface this file wrote, ``aave-v3`` for a Pool the deployment
+        table names, and ``""`` for an address the book does not contain — the same
+        three-valued answer :meth:`history_source` gives about a record, because a caller
+        that is about to sign deserves to know both *what I read* and *what I would call*.
+
+        Reading the book is all this does. Whether the declared kind is *true* is
+        :meth:`_deployment`'s question, and it is asked on the chain's chain id, so an
+        entry cannot become an Aave pool by spelling its kind that way.
+        """
+        entry = self.config.book.get(str(address).lower())
+        return str(entry.kind) if entry is not None else ""
+
+    def _deployment(self, entry: ProtocolEntry) -> "aave_v3.AaveDeployment":
+        """The Aave deployment this entry *is*, or a refusal that names the difference.
+
+        The check is a table lookup on ``(chain_id, pool, asset)`` and nothing else: no
+        heuristic, no "looks like Aave", no probe of the contract's bytecode. A pool this
+        file has not written down is a pool whose ``supply`` is an unknown function on an
+        unknown contract, and the honest answer to that is to refuse before the approval
+        that would have paid for it.
+        """
+        self._connect()
+        deployment = aave_v3.deployment_for(self._chain_id, entry.address, entry.token)
+        if deployment is None:
+            raise TestnetNotConfigured(
+                f"{entry.name}: {entry.address} over {entry.token or 'no asset'} is not an "
+                f"Aave v3 deployment this file knows on chain {self._chain_id}. The pool "
+                f"and the asset have to be the pair in agent.physics.aave_v3.DEPLOYMENTS "
+                f"(known here: {', '.join(str(key) for key in sorted(aave_v3.DEPLOYMENTS))})"
+                " — a book cannot declare a venue into existence"
+            )
+        if int(entry.decimals) != int(deployment.decimals):
+            raise TestnetNotConfigured(
+                f"{entry.name}: the book says {int(entry.decimals)} decimals and "
+                f"{deployment.symbol} on {deployment.chain} has {int(deployment.decimals)}. "
+                "A supply in the wrong units is a revert at best and a thousandfold approval "
+                "at worst, so the mismatch is refused before anything is signed"
+            )
+        return deployment
+
+    def _deployment_or_none(self, entry: ProtocolEntry) -> Optional[Any]:
+        """The deployment, or ``None`` where a refusal would be a report's problem.
+
+        Used by :meth:`balance` and :meth:`_note`, which have to answer even about a book
+        this venue would refuse to *sign* into: "I hold nothing here" and "I will not stake
+        here" are two different sentences, and a balance report that conflated them would
+        hide the second. The lookup is the same table; the difference is that a missing
+        answer is reported instead of raised.
+        """
+        try:
+            self._connect()
+        except TestnetError:
+            return None
+        return aave_v3.deployment_for(self._chain_id, entry.address, entry.token)
+
     def get_protocol_list(self) -> List[Protocol]:
         """Every book entry that has a record — its own, or one the feed vouches for.
 
@@ -1281,13 +1386,21 @@ class RealTestnetProvider(IWeb3Provider):
         record (correctly), and a record nobody published is not a measurement.
 
         The distinction travels with the object: :meth:`history_source` answers ``chain`` for
-        a record read from the address itself and the feed's label otherwise, and the trading
-        loop signs only into the first kind.
+        a record read from the address itself and the feed's label otherwise, and
+        :meth:`protocol_kind` says what a stake into that address would call. The trading
+        loop signs into a ``vault`` only on its own record, and into an ``aave-v3`` pool on
+        the deployment table's word — never the other way round.
         """
         self._connect()
         self._refresh_block()
         published: List[Protocol] = []
         for entry in self.config.book:
+            if str(entry.kind) == AAVE_KIND and str(self.config.history) == HISTORY_CHAIN:
+                self.errors.append(
+                    f"{entry.name}: an Aave position emits no {YIELD_EVENT_SIGNATURE} — set "
+                    f"{ENV_HISTORY}=auto (or feed) so the feed prices the pool it supplies"
+                )
+                continue
             record = self.fetch_protocol_history(entry.address)
             if not record:
                 continue
@@ -1329,10 +1442,20 @@ class RealTestnetProvider(IWeb3Provider):
         about it would let an operator believe the address had published it.
         """
         source = self._history.get(entry.address, "")
-        if not source or source == RECORD_FROM_CHAIN:
+        if str(entry.kind) == AAVE_KIND:
+            deployment = self._deployment_or_none(entry)
+            where = str(deployment) if deployment is not None else (
+                f"{entry.address} is not an Aave deployment this file knows on chain "
+                f"{self._chain_id}"
+            )
+            extra = f"{where}; calls {aave_v3.SUPPLY_SIGNATURE} / {aave_v3.WITHDRAW_SIGNATURE}"
+            note = f"{entry.note} · {extra}" if entry.note else extra
+        elif not source or source == RECORD_FROM_CHAIN:
             return entry.note
-        extra = f"record from {source}: this address published no log"
-        return f"{entry.note} · {extra}" if entry.note else extra
+        else:
+            extra = f"record from {source}: this address published no log"
+            note = f"{entry.note} · {extra}" if entry.note else extra
+        return note
 
     def _yield_topic(self) -> str:
         """``keccak("YieldDistributed(uint256,uint256)")``, computed once."""
@@ -1505,6 +1628,12 @@ class RealTestnetProvider(IWeb3Provider):
         it again on every review would be a request for a number that never changes.
         """
         if entry.address in self._claims:
+            return self._claims[entry.address]
+        if str(entry.kind) == AAVE_KIND:
+            # Aave's Pool has no ``claimApyE18``: the rate is published by the protocol,
+            # not declared by the contract, so the book's number is the only claim there is
+            # — and the *record* (the feed's history) is what the assessment measures.
+            self._claims[entry.address] = float(entry.claim_apy)
             return self._claims[entry.address]
         claim = float(entry.claim_apy)
         try:
@@ -1810,7 +1939,42 @@ class RealTestnetProvider(IWeb3Provider):
             token_units=raw,
             token_balance=raw / (10 ** decimals),
             decimals=decimals,
+            **self._position_of(entry, owner),
         )
+
+    def _position_of(self, entry: ProtocolEntry, owner: str) -> Dict[str, Any]:
+        """What the venue already holds of this entry — the aToken balance, when there is one.
+
+        Only an ``aave-v3`` entry has a receipt a wallet can be asked about: the supplied
+        asset leaves as USDC and comes back as aToken, which is why the amount grew. A vault
+        keeps its own accounting, and a balance report that invented a receipt for it would be
+        guessing at a contract's internals.
+
+        A read that fails is a *position of unknown size*, and that is said with an error on
+        the balance rather than a zero — the loop treats a non-empty error as a refusal to
+        trade, which is the right response to "I do not know what I already have in there".
+        """
+        if str(entry.kind) != AAVE_KIND:
+            return {}
+        deployment = self._deployment_or_none(entry)
+        if deployment is None or not deployment.a_token:
+            return {}
+        try:
+            raw = int(
+                self._token_contract(deployment.a_token)
+                .functions.balanceOf(self._checksum(owner))
+                .call({"from": self._checksum(owner)})
+            )
+        except Exception as exc:  # noqa: BLE001 - the same rule as a native read
+            return {
+                "position_token": deployment.a_token,
+                "error": f"position balance: {_failure_kind(exc)} ({self._reason(exc)})",
+            }
+        return {
+            "position_token": deployment.a_token,
+            "position_units": raw,
+            "position_balance": raw / (10 ** int(deployment.decimals)),
+        }
 
     # -- capital in, capital out -------------------------------------------- #
 
@@ -1848,6 +2012,8 @@ class RealTestnetProvider(IWeb3Provider):
             )
         self._connect()
         units = self._units(value, entry.decimals)
+        if str(entry.kind) == AAVE_KIND:
+            return self._move_aave(action, entry, value, units)
         if action == "stake":
             self._ensure_allowance(entry, units)
             function = self._vault(entry.address).functions.stake(units)
@@ -1873,12 +2039,55 @@ class RealTestnetProvider(IWeb3Provider):
             )
         return True
 
+    def _move_aave(
+        self, action: str, entry: ProtocolEntry, value: float, units: int
+    ) -> bool:
+        """Aave's two calls, with the same guards the vault path goes through.
+
+        ``supply`` needs the Pool to be allowed to pull the asset, so the approval this file
+        already knows how to make is made first — to ``entry.address``, which *is* the Pool,
+        which is why an Aave entry's address cannot be the aToken (a claim on the pool cannot
+        pull the asset) and cannot be invented (the table in :mod:`agent.physics.aave_v3`
+        holds the pairs this venue will sign into).
+
+        The record of a supply says ``supply`` and not ``stake``: the two are different
+        functions on different contracts, and a log that used one word for both would be the
+        first place a report started lying.
+        """
+        deployment = self._deployment(entry)
+        owner = self._signer_address()
+        pool = self._contract(deployment.pool, aave_v3.pool_abi()).functions
+        if action == "stake":
+            self._ensure_allowance(entry, units)
+            self.stakes.append(
+                self._send(
+                    pool.supply(*aave_v3.supply_args(deployment, units, owner)),
+                    action="supply",
+                    address=entry.address,
+                    amount=value,
+                    units=units,
+                )
+            )
+        else:
+            self.withdrawals.append(
+                self._send(
+                    pool.withdraw(*aave_v3.withdraw_args(deployment, units, owner)),
+                    action="withdraw",
+                    address=entry.address,
+                    amount=value,
+                    units=units,
+                )
+            )
+        return True
+
     def _ensure_allowance(self, entry: ProtocolEntry, units: int) -> None:
-        """Let the vault pull ``units`` — once, and only if it cannot already.
+        """Let the venue pull ``units`` — once, and only if it cannot already.
 
         An ``approve`` is a transaction like any other and is awaited like one; a stake
         that assumed its own approval had landed is the classic way a stake reverts on a
-        chain that is one block behind.
+        chain that is one block behind. The spender is ``entry.address``, which is the vault
+        for a ``vault`` entry and the Aave Pool for an ``aave-v3`` one — both are the contract
+        that pulls the asset, and neither can be anything else.
         """
         token = self._token_of(entry)
         owner = self._checksum(self._signer_address())
@@ -2041,6 +2250,19 @@ class RealTestnetProvider(IWeb3Provider):
         self, kind: str, entry: ProtocolEntry, units: int, proof: Mapping[str, Any]
     ) -> Any:
         """The exact contract function a real call of this kind would send."""
+        if str(entry.kind) == AAVE_KIND:
+            deployment = self._deployment(entry)
+            owner = self._sender_or_zero()
+            pool = self._contract(deployment.pool, aave_v3.pool_abi()).functions
+            if kind == "stake":
+                return pool.supply(*aave_v3.supply_args(deployment, units, owner))
+            if kind == "withdraw":
+                return pool.withdraw(*aave_v3.withdraw_args(deployment, units, owner))
+            raise TestnetNotConfigured(
+                f"{entry.name}: an Aave position has no evidence call — there is no "
+                "submitValidationProof on a Pool, and inventing one would be a dry run of "
+                "a function nobody will ever answer"
+            )
         vault = self._vault(entry.address).functions
         if kind == "stake":
             return vault.stake(units)
@@ -2078,6 +2300,8 @@ class RealTestnetProvider(IWeb3Provider):
             "failures": len(self.failures),
             "dry_runs": len(self.dry_runs),
             "book": [entry.name for entry in self.config.book],
+            "kinds": {entry.name: str(entry.kind) for entry in self.config.book},
+            "aave": list(aave_v3.describe(self._chain_id)),
             "history": str(self.config.history),
             "records": self._record_labels(),
             "config": self.config.describe(),

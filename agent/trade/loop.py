@@ -11,7 +11,13 @@ in this order, each of which can stop the cycle:
    are different faults, and the message names the one that happened. A record can also be
    the *feed's* (``TESTNET_HISTORY=auto``/``feed``), and then it is a fact about a name
    rather than about the address: this loop prints it and holds, because a signature is
-   the one thing that needs the second kind.
+   the one thing that needs the second kind. The exception is an entry whose ``kind`` is
+   ``aave-v3``: that address is not inferred from a name at all — the venue verifies the
+   pool and its asset against ``agent/physics/aave_v3.DEPLOYMENTS`` on the chain id the
+   node reported, and refuses the pair before any signature otherwise — so the feed is
+   answering *what the position earns*, which is the protocol's own statement, and
+   ``supply()`` is the call that earns it. A position there is read back from the aToken
+   (``balance.position_balance``) and topped up to its ceiling instead of staked again.
 2. **What does the market say about it?** ``DiscoveryEngine`` reads DeFiLlama, the two
    gates screen it, and ``VolatilityHunter`` measures each approved pool — ``PANIC``,
    ``CALM``, ``THIN``, ``FORMULA``, ``DISHONEST``, ``UNMEASURED``. Those are the verdicts
@@ -21,8 +27,11 @@ in this order, each of which can stop the cycle:
    over them, and ``--book-report`` to say per entry why nothing was priced.
 3. **How much?** The balance is read from the chain *on the same cycle*
    (``provider.balance``) and :func:`agent.trade.capital.size_trade` cuts the amount to the
-   smaller of ``MAX_TRADE_SIZE_USD`` and ``MAX_TRADE_FRACTION`` of the wallet — so an $18
-   wallet cannot place a $50 trade because a file said it could.
+   smaller of ``MAX_TRADE_SIZE_USD``, ``MAX_TRADE_FRACTION`` of the wallet and
+   ``TEST_STAKE_AMOUNT_USD`` (the micro cap) — so an $18 wallet cannot place a $50 trade
+   because a file said it could, and a first run can be told to send one dollar. On a venue
+   that can be topped up the same ceilings size the *position*, and the transaction carries
+   the difference.
 4. **Sign, or say what it would have done?** ``DRY_RUN`` decides. In a dry run the cycle
    computes the amount, prints the sentence it would have printed, records it in the state
    file and **never calls** ``execute_stake``. The decision and the signature are two
@@ -64,8 +73,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from agent.physics.real_testnet_provider import (
+    AAVE_KIND,
     ENV_HISTORY,
     RECORD_FROM_CHAIN,
+    VAULT_KIND,
     YIELD_EVENT_SIGNATURE,
 )
 from agent.physics.volatility_hunter import PanicSignal
@@ -311,6 +322,9 @@ class Cycle:
                 source = str(row.get("source") or "")
                 if source and source != RECORD_FROM_CHAIN:
                     line += f" · {source}"
+                kind = str(row.get("kind") or "")
+                if kind and kind != VAULT_KIND:
+                    line += f" · {kind}"
                 lines.append(line)
         else:
             lines.append("   book  empty — no vault published a record, so nothing is priced")
@@ -459,6 +473,7 @@ class Trader:
                     "claim_apy": float(getattr(protocol, "claim_apy", 0.0) or 0.0),
                     "implied_apy": None if apy is None else round(float(apy), 6),
                     "source": self._record_source(address),
+                    "kind": _kind_of(self.venue, address),
                 }
             )
         return protocols
@@ -495,8 +510,16 @@ class Trader:
             return
         lookback = int(getattr(config, "lookback", 0) or 0)
         for entry in entries:
+            address = str(getattr(entry, "address", "?"))
+            if _kind_of(self.venue, address) == AAVE_KIND:
+                cycle.warnings.append(
+                    f"{getattr(entry, 'name', '?')} ({address}): an Aave position emits no "
+                    f"{YIELD_EVENT_SIGNATURE} — its rate is the protocol's, published to the "
+                    f"feed, so it needs {ENV_HISTORY}=auto (or =feed) to be priced at all"
+                )
+                continue
             cycle.warnings.append(
-                f"{getattr(entry, 'name', '?')} ({getattr(entry, 'address', '?')}): no "
+                f"{getattr(entry, 'name', '?')} ({address}): no "
                 f"{YIELD_EVENT_SIGNATURE} log in the last {lookback} blocks — an entry is "
                 "a vault of this interface, not a lending pool's share token"
             )
@@ -598,6 +621,7 @@ class Trader:
         confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
         reason = str(getattr(signal, "reason", ""))
         held = self.positions.get(address)
+        kind = _kind_of(self.venue, address)
 
         if verdict not in ENTRY_VERDICTS:
             return Action(
@@ -611,8 +635,17 @@ class Trader:
         # A record the feed vouched for is a fact about a *name*. The verdict on it is real
         # and worth printing — and it is not evidence that this address implements
         # `stake(uint256)`, which is the one thing a signature would need to be true.
+        #
+        # One kind of entry is exempt, and for a reason that is checkable rather than
+        # convenient: an `aave-v3` entry's address is not inferred from a name at all. The
+        # venue verifies (pool, asset) against the deployment table on the chain id the node
+        # reported, and refuses the entry before any signature if the pair is not in it. So
+        # the premise of the hold — "this address is a stranger whose interface I cannot
+        # see" — is false for exactly that kind, and true for every other. The record still
+        # has to come from *somewhere* (a vault with no record is not published at all), and
+        # the position is verified on chain afterwards by the aToken balance.
         source = self._record_source(address)
-        if source and source != RECORD_FROM_CHAIN:
+        if source and source != RECORD_FROM_CHAIN and kind != AAVE_KIND:
             return Action(
                 kind="hold",
                 venue=name,
@@ -625,7 +658,11 @@ class Trader:
                     "record it has read itself"
                 ),
             )
-        if held is not None:
+        # One position per address, because a vault's `stake` is not a deposit and repeating
+        # it is how the same cent gets committed twice. A pool's `supply` *is* a deposit, so
+        # an Aave entry is sized against a target and topped up to it — with the delta, the
+        # same ceilings and a minimum worth a fee (see agent.trade.capital).
+        if held is not None and kind != AAVE_KIND:
             return Action(
                 kind="hold",
                 venue=name,
@@ -658,11 +695,13 @@ class Trader:
                 reason=f"the wallet could not be read — {balance.error}",
             )
 
+        at_venue = self._at_venue(balance, held, kind)
         size = size_trade(
             token_balance=balance.token_balance,
             native_eth=balance.native_eth,
             sizing=self.sizing,
             confidence=confidence if verdict == "PANIC" else 0.0,
+            held_usd=at_venue,
         )
         if not size.ok:
             return Action(
@@ -674,7 +713,33 @@ class Trader:
                 bound=size.bound,
                 reason=size.refusal,
             )
-        return self._stake(name, address, size, verdict, confidence)
+        return self._stake(
+            name,
+            address,
+            size,
+            verdict,
+            confidence,
+            held=at_venue,
+            kind=kind,
+        )
+
+    @staticmethod
+    def _at_venue(balance: Any, held: Any, kind: str) -> float:
+        """What this entry already holds, preferring the chain over the loop's own memory.
+
+        Two sources, and for an Aave position the chain is the better one: the aToken
+        balance *is* the position — supplied principal plus every interest payment since —
+        and it survives a lost state file, a second operator, or a withdrawal made by hand.
+        The recorded amount is the fallback for a vault (which has no receipt a wallet can be
+        asked about) and for a deployment whose aToken this file does not know.
+
+        A zero from the chain is a fact and not a missing value: it means the money is not
+        there, whatever the state file says.
+        """
+        recorded = float(getattr(held, "amount", 0.0) or 0.0) if held is not None else 0.0
+        if kind != AAVE_KIND or not str(getattr(balance, "position_token", "")):
+            return recorded
+        return float(getattr(balance, "position_balance", 0.0) or 0.0)
 
     def _stake(
         self,
@@ -683,13 +748,21 @@ class Trader:
         size: TradeSize,
         verdict: str,
         confidence: float,
+        *,
+        held: float = 0.0,
+        kind: str = "",
     ) -> Action:
         """Send the stake — or, in a dry run, produce the row and touch nothing.
 
         The dry-run branch returns *before* the venue is called at all, which is the only
         version of this guarantee a reader can check: there is no flag inside
         ``execute_stake`` that could be wrong, because in a dry run the call never happens.
+
+        ``held`` is what the entry already holds, and the position this cycle records is the
+        sum: an Aave supply *grows* a position, so storing only the delta would make the loop
+        forget the rest of its own money and size the next cycle as if it had none.
         """
+        total = round(float(held) + float(size.amount), 6)
         action = Action(
             kind="stake",
             venue=name,
@@ -699,7 +772,14 @@ class Trader:
             verdict=verdict,
             confidence=confidence,
             bound=size.bound,
-            reason=size.reason,
+            reason=(
+                size.reason
+                if kind != AAVE_KIND
+                else (
+                    f"{size.reason} — supplied through the Aave v3 Pool, so the position "
+                    f"becomes {total:.6f} and its receipt is an aToken in this wallet"
+                )
+            ),
             sent=False,
         )
         if self.sizing.dry_run:
@@ -715,7 +795,7 @@ class Trader:
             self.positions[address] = Position(
                 address=address,
                 name=name,
-                amount=float(size.amount),
+                amount=total,
                 at=float(self.now()),
                 verdict=verdict,
                 confidence=confidence,
@@ -944,6 +1024,7 @@ def _book_report(
 
     published = 0
     priced_from_feed = 0
+    unverified = 0
     for entry in entries:
         name = str(getattr(entry, "name", ""))
         address = str(getattr(entry, "address", ""))
@@ -959,8 +1040,11 @@ def _book_report(
                 note = f"the record could not be read ({type(exc).__name__}: {exc})"
         published += 1 if records else 0
         source = _source_of(venue, address)
+        kind = _kind_of(venue, address)
         foreign = bool(source) and source != RECORD_FROM_CHAIN
+        stakable = bool(records) and (not foreign or kind == AAVE_KIND)
         priced_from_feed += 1 if foreign else 0
+        unverified += 1 if foreign and kind != AAVE_KIND else 0
         signal = index.get(_normalise(name))
         if market is None:
             verdict = "market off"
@@ -977,13 +1061,20 @@ def _book_report(
         else:
             why = note or _note_of(venue, address)
             record = "no record" + (f" — {why}" if why else "")
-        printer(f"  {name:<24} {address}  {record}")
-        if foreign:
+        printer(f"  {name:<24} {address}  {kind or 'kind?'}  {record}")
+        if foreign and kind == AAVE_KIND:
+            printer(
+                f"  {'':<24} stakable: the address is the Aave pool this file knows for this "
+                "chain, so the feed names the rate and supply() moves the money — the "
+                "deployment is verified, not inferred from the name"
+            )
+        elif foreign:
             printer(
                 f"  {'':<24} not stakable as-is: the record above is the feed's about this "
                 "name, and this loop signs only into a vault whose own log it has read"
             )
         printer(f"  {'':<24} market: {verdict}")
+        printer(f"  {'':<24} stakable: {'yes' if stakable else 'no'}")
     if not published:
         if policy in {"", "(unset → chain)", RECORD_FROM_CHAIN}:
             printer(
@@ -1003,9 +1094,15 @@ def _book_report(
                 f"emitted {YIELD_EVENT_SIGNATURE} inside the lookback window"
             )
     elif priced_from_feed:
+        tail = (
+            f" — {unverified} of them about a name the venue cannot verify as a vault, and "
+            "those are not staked"
+            if unverified
+            else " — each one a pool this file knows by address, so they are staked"
+        )
         printer(
             f"  {priced_from_feed} of {published} record(s) came from the feed, not from an "
-            "address's own log: measured, and deliberately not staked"
+            f"address's own log{tail}"
         )
     return 0 if published else 4
 
@@ -1018,6 +1115,25 @@ def _source_of(venue: Any, address: str) -> str:
     try:
         return str(read(address) or "")
     except Exception:  # noqa: BLE001 - a report line is not worth an exception
+        return ""
+
+
+def _kind_of(venue: Any, address: str) -> str:
+    """What the venue says money into this address *calls*, or ``""`` if it cannot say.
+
+    The companion of :func:`_source_of`, and the pair is the whole safety story: a record
+    about a name is not a signature, and a signature is not free. ``vault`` means
+    ``stake(uint256)`` on an address whose own log vouched for the interface; ``aave-v3``
+    means ``supply(…)`` on a pool the venue verified against its deployment table by chain
+    id. Neither answer is inferred here — a venue that does not answer yields ``""``, and
+    this loop then treats the entry the strict way.
+    """
+    read = getattr(venue, "protocol_kind", None)
+    if read is None:
+        return ""
+    try:
+        return str(read(address) or "")
+    except Exception:  # noqa: BLE001 - same rule as above
         return ""
 
 
