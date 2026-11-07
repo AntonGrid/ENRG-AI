@@ -1,243 +1,902 @@
-"""Closed economic loop (Phase 3) — signals → recommendation → policy → action → reward.
+"""The trading cycle: what the wallet holds → what the market says → a size → a tick.
 
-The loop connects the layers that already exist:
+This is the live loop. It is the file the container runs, and it answers four questions
+in this order, each of which can stop the cycle:
 
-1. **Signals** — ``agent.signals`` produces the generation forecast and the
-   market price (USD/kWh).
-2. **Recommender** — ``axis_core.ai.recommender`` ranks ``SELL / STORE / BUY /
-   HOLD`` with confidence (a signal, never an action by itself — C-4).
-3. **Policy Engine** — ``axis_core.policy.engine.PolicyEngine.evaluate_trade``
-   gates the action: trading right, volume limits, DAO approval (ADR-0003).
-4. **Reward** — an allowed SELL/BUY produces simulated revenue; a successful
-   trade feeds ERS, and every decision is recorded as *experience* for future
-   learning (GLOBAL_AI_ARCHITECTURE §7: the model learns economics).
+1. **What may be traded?** The operator's address book
+   (``TESTNET_PROTOCOLS``) and the record each vault has published on chain
+   (``RealTestnetProvider.get_protocol_list``). This file never chooses an address: a
+   venue with an empty book trades nothing, and says so in one line.
+2. **What does the market say about it?** ``DiscoveryEngine`` reads DeFiLlama, the two
+   gates screen it, and ``VolatilityHunter`` measures each approved pool — ``PANIC``,
+   ``CALM``, ``THIN``, ``FORMULA``, ``DISHONEST``, ``UNMEASURED``. Those are the verdicts
+   of :mod:`agent.physics.volatility_hunter`, unchanged: this loop **consumes** them and
+   does not re-implement a single threshold.
+3. **How much?** The balance is read from the chain *on the same cycle*
+   (``provider.balance``) and :func:`agent.trade.capital.size_trade` cuts the amount to the
+   smaller of ``MAX_TRADE_SIZE_USD`` and ``MAX_TRADE_FRACTION`` of the wallet — so an $18
+   wallet cannot place a $50 trade because a file said it could.
+4. **Sign, or say what it would have done?** ``DRY_RUN`` decides. In a dry run the cycle
+   computes the amount, prints the sentence it would have printed, records it in the state
+   file and **never calls** ``execute_stake``. The decision and the signature are two
+   different events, and the second one needs the operator to have written ``DRY_RUN=0``.
 
-Requires the ``axis-core`` reference implementation on ``PYTHONPATH``
-(``pip install -e ../Axis-core``).
+What this loop cannot do, and says out loud
+===========================================
+
+A DeFiLlama pool is not a vault. The feed publishes a *pool* — a project, a chain, a
+UUID — and the operator's book publishes a *contract address*; this file has no way to
+prove the second implements the first, and inventing that mapping is the sort of
+plausibility that costs money. So a signal is acted on only when the pool and a book
+entry share a name (the operator's own declaration, matched on normalised words). A
+``PANIC`` with no matching vault is recorded as a **signal**, not an action:
+
+    signal   aave-v3-usdc  [PANIC 0.42] — a measured dislocation, but no vault in the
+             operator's book implements this pool: nothing was sized and nothing signed
+
+That line is the honest answer, and on a first run it is usually the answer.
+
+The state file, and why a corrupt one stops the loop
+====================================================
+
+Positions are written to ``TRADER_STATE`` (``/data/trader_state.json`` in the container)
+after every cycle. A file that cannot be read is **not** treated as an empty book: an
+empty book means "no position, so the stake is new", which is how a loop stakes the same
+money twice. A corrupt state file stops the process, and the message says which file.
 """
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import re
+import sys
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from axis_core.ai.recommender import recommend
-from axis_core.policy.engine import PolicyEngine
-from axis_core.policy.models import PolicyRegistry, ProducerState
+from agent.physics.volatility_hunter import PanicSignal
+from agent.trade.capital import Sizing, TradeSize, _flag, size_trade
 
-from agent.signals import Signal, collect_all
+__all__ = [
+    "Action",
+    "Cycle",
+    "ENV_INTERVAL",
+    "ENV_STATE",
+    "EXIT_VERDICTS",
+    "ENTRY_VERDICTS",
+    "Position",
+    "TradeError",
+    "Trader",
+    "main",
+]
 
-#: ERS gain for an executed trade (soft rise toward 1).
-ERS_TRADE_GAIN = 0.02
-#: Expected price growth factor fed to the recommender's STORE check.
-PRICE_RISE_FACTOR = 1.02
+ENV_STATE = "TRADER_STATE"
+ENV_INTERVAL = "TRADE_INTERVAL"
+ENV_MARKET = "TRADE_MARKET"
+
+#: The state the loop writes, and the default the container mounts. A relative path
+#: because a host run should not need ``/data`` to exist.
+DEFAULT_STATE = "data/trader_state.json"
+DEFAULT_INTERVAL = 300
+
+#: Verdicts a position may be opened on. ``PANIC`` is the hunt; ``CALM`` and ``GROWTH``
+#: are an ordinary day in a pool whose record the two gates approved — carry, not alpha.
+#: ``THIN``/``FORMULA``/``DISHONEST``/``UNMEASURED`` are the refusals the hunter already
+#: wrote, and this file does not soften any of them.
+ENTRY_VERDICTS = frozenset({"PANIC", "CALM", "GROWTH"})
+
+#: Verdicts that make a held position leave: the pool stopped being what it was bought
+#: as. ``UNMEASURED`` is deliberately *not* here — "I cannot measure it today" is not
+#: "get out", and a feed outage must not be able to liquidate a good position.
+EXIT_VERDICTS = frozenset({"FORMULA", "DISHONEST", "THIN"})
+
+
+class TradeError(RuntimeError):
+    """The loop cannot run: a state file it cannot read, or a policy it cannot apply."""
+
+
+def _normalise(name: object) -> str:
+    """A pool or vault name as comparable words: lower case, letters and digits only."""
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
 
 
 @dataclass
-class TradeStep:
-    """One loop iteration: decision + simulated result."""
+class Position:
+    """One stake this loop put somewhere, as the state file remembers it."""
 
-    round_no: int
-    action: str
-    volume_wh: float
-    confidence: float
-    price_now: float
-    allowed: bool
-    reason: str
-    revenue_usd: float = 0.0
-    ers: float = 0.0
-    storage_wh: float = 0.0
+    address: str
+    name: str = ""
+    amount: float = 0.0
+    at: float = 0.0
+    verdict: str = ""
+    confidence: float = 0.0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> Dict[str, Any]:
         return {
-            "round": self.round_no,
-            "action": self.action,
-            "volume_wh": round(self.volume_wh, 2),
-            "confidence": round(self.confidence, 3),
-            "price_now": round(self.price_now, 4),
-            "allowed": self.allowed,
+            "address": self.address,
+            "name": self.name,
+            "amount": round(float(self.amount), 6),
+            "at": float(self.at),
+            "verdict": self.verdict,
+            "confidence": round(float(self.confidence), 4),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "Position":
+        return cls(
+            address=str(payload.get("address", "")).lower(),
+            name=str(payload.get("name", "")),
+            amount=float(payload.get("amount", 0.0) or 0.0),
+            at=float(payload.get("at", 0.0) or 0.0),
+            verdict=str(payload.get("verdict", "")),
+            confidence=float(payload.get("confidence", 0.0) or 0.0),
+        )
+
+
+@dataclass
+class Action:
+    """One decision of one cycle: what it was, how much, why, and whether it was sent.
+
+    ``kind`` is the *decision*, not the transaction: ``stake`` and ``withdraw`` are
+    transactions, ``signal`` is a verdict with nothing behind it in the book, ``hold`` is
+    a refusal with a reason, and ``error`` is a thing that broke. ``sent`` is the only
+    field that says money moved, and in a dry run it is ``False`` on every row.
+    """
+
+    kind: str
+    venue: str = ""
+    address: str = ""
+    amount: float = 0.0
+    usd: float = 0.0
+    verdict: str = ""
+    confidence: float = 0.0
+    bound: str = ""
+    reason: str = ""
+    sent: bool = False
+    tx: Optional[Dict[str, Any]] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "vault": self.venue,
+            "address": self.address,
+            "amount": round(float(self.amount), 6),
+            "usd": round(float(self.usd), 4),
+            "verdict": self.verdict,
+            "confidence": round(float(self.confidence), 4),
+            "bound": self.bound,
             "reason": self.reason,
-            "revenue_usd": round(self.revenue_usd, 4),
-            "ers": round(self.ers, 4),
-            "storage_wh": round(self.storage_wh, 2),
+            "sent": bool(self.sent),
+            "tx": self.tx,
         }
+
+    def line(self, dry_run: bool = True) -> str:
+        """The operator's one line: the verb, the number, and the sentence behind it."""
+        head = f"{self.kind:<8} {self.venue or self.address}"
+        if self.kind in {"stake", "withdraw"} and self.amount > 0.0:
+            verb = "would " + self.kind if dry_run else self.kind
+            head = f"{verb:<12} {self.venue or self.address}  {self.amount:.6f} (${self.usd:.2f})"
+        if self.verdict:
+            head += f"  [{self.verdict}"
+            head += f" {self.confidence:.2f}]" if self.confidence > 0.0 else "]"
+        if self.reason:
+            head += f" — {self.reason}"
+        if self.kind in {"stake", "withdraw"} and not dry_run:
+            head += " · signed" if self.sent else " · NOT sent"
+        return head
 
 
 @dataclass
-class TradeRun:
-    """Result of a multi-round closed-loop simulation."""
+class Cycle:
+    """One iteration, as a report: the book, the market, the wallet, and the decisions."""
 
-    steps: List[TradeStep] = field(default_factory=list)
-    ers: float = 0.5
-    storage_wh: float = 0.0
-    total_revenue_usd: float = 0.0
-    experience: List[Dict[str, Any]] = field(default_factory=list)
+    number: int = 0
+    at: float = 0.0
+    dry_run: bool = True
+    block: int = 0
+    chain_id: int = 0
+    book: List[Dict[str, Any]] = field(default_factory=list)
+    balances: List[Dict[str, Any]] = field(default_factory=list)
+    market: Dict[str, Any] = field(default_factory=dict)
+    actions: List[Action] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def sent(self) -> int:
+        return sum(1 for action in self.actions if action.sent)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "ers": round(self.ers, 4),
-            "storage_wh": round(self.storage_wh, 2),
-            "total_revenue_usd": round(self.total_revenue_usd, 4),
-            "steps": [s.to_dict() for s in self.steps],
-            "experience_count": len(self.experience),
+            "cycle": int(self.number),
+            "at": float(self.at),
+            "dry_run": bool(self.dry_run),
+            "chain_id": int(self.chain_id),
+            "block": int(self.block),
+            "book": list(self.book),
+            "balances": list(self.balances),
+            "market": dict(self.market),
+            "actions": [action.as_dict() for action in self.actions],
+            "warnings": list(self.warnings),
+            "sent": self.sent,
         }
 
+    def summary_text(self) -> str:
+        """The whole cycle as lines: what was read, what was decided, what was sent."""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.at or time.time()))
+        mode = "DRY RUN (nothing will be signed)" if self.dry_run else "LIVE"
+        lines = [
+            f"── cycle {self.number} · {stamp} · {mode} · chain {self.chain_id or '?'} "
+            f"· block {self.block or '?'}"
+        ]
+        if self.book:
+            for row in self.book:
+                apy = row.get("implied_apy")
+                shown = "unmeasured" if apy is None else f"{float(apy):+.2%} implied"
+                lines.append(f"   book  {row.get('name', '?'):<24} {shown}")
+        else:
+            lines.append("   book  empty — no vault published a record, so nothing is priced")
+        if self.market:
+            if self.market.get("error"):
+                lines.append(f"   market no scan — {self.market['error']}")
+            else:
+                lines.append(
+                    f"   market {self.market.get('scanned', 0)} pools read · "
+                    f"panics {self.market.get('fired', 0)} · "
+                    f"verdicts {self.market.get('verdicts', {})}"
+                )
+        for action in self.actions:
+            lines.append("   " + action.line(dry_run=self.dry_run))
+        for warning in self.warnings:
+            lines.append(f"   warn  {warning}")
+        return "\n".join(lines)
 
-def _market_price(signals: List[Signal]) -> float:
-    for s in signals:
-        if s.kind == "market_forecast" and s.meta.get("market_source") == "dayahead":
-            return float(s.value)
-    return 0.12
 
+@dataclass
+class Trader:
+    """The cycle itself: a venue, a policy, a place to remember, and a market to read.
 
-def _forecast_next(signals: List[Signal]) -> float:
-    for s in signals:
-        if s.kind == "generation_forecast":
-            return float(s.value)
-    return 0.0
+    Every collaborator is injected, which is what makes this file testable without a
+    chain: ``venue`` is anything answering the venue calls a loop needs
+    (``get_protocol_list``, ``balance``, ``execute_stake``, ``withdraw``), ``market`` is a
+    callable returning a ``PanicReport``, ``now`` is the clock, and ``printer`` is where
+    the cycle's lines go. The default of every one of them is the real thing.
+    """
 
+    venue: Any
+    sizing: Sizing = field(default_factory=Sizing.from_env)
+    state_path: Optional[Path] = None
+    market: Optional[Callable[[], Any]] = None
+    now: Callable[[], float] = time.time
+    printer: Callable[[str], None] = print
+    cycles: int = 0
+    positions: Dict[str, Position] = field(default_factory=dict)
 
-def simulate_rounds(
-    n_rounds: int = 4,
-    *,
-    capacity_wh: float = 1000.0,
-    storage_init_wh: float = 0.0,
-    ers_init: float = 0.5,
-    trade_enabled: bool = True,
-    trade_max_volume_wh: int = 0,
-    trade_requires_dao: bool = False,
-    dao_approved: bool = False,
-    source: str = "offline",
-) -> TradeRun:
-    """Run the closed loop for ``n_rounds`` and return the trade history."""
-    run = TradeRun(ers=ers_init, storage_wh=storage_init_wh)
-    policy = PolicyRegistry(
-        enforce_trade_limits=trade_max_volume_wh > 0,
-        trade_max_volume_wh=trade_max_volume_wh,
-        trade_requires_dao=trade_requires_dao,
-    )
-    producer = ProducerState(device_id="gateway_00", trade_enabled=trade_enabled)
+    def __post_init__(self) -> None:
+        if isinstance(self.state_path, str):
+            self.state_path = Path(self.state_path)
+        if self.state_path is not None:
+            self._load()
 
-    for round_no in range(1, n_rounds + 1):
-        bundle = collect_all(source=source, horizon_steps=1, market_steps=1)
-        signals = bundle.signals
-        price_now = _market_price(signals)
+    # -- what it remembers --------------------------------------------------- #
 
-        recommendation = recommend(
-            forecast_wh=_forecast_next(signals),
-            storage_wh=run.storage_wh,
-            capacity_wh=capacity_wh,
-            price_now=price_now,
-            price_forecast=price_now * PRICE_RISE_FACTOR,
-            avg_price=price_now,
-        )
+    def _load(self) -> None:
+        """Read the positions this loop already holds; refuse to guess if it cannot.
 
-        decision = PolicyEngine.evaluate_trade(
-            policy=policy,
-            recommendation=recommendation,
-            producer=producer,
-            dao_approved=dao_approved,
-        )
-
-        allowed = bool(decision.allowed)
-        volume = float(recommendation.volume_wh) if allowed else 0.0
-        revenue = 0.0
-        if allowed and recommendation.action == "SELL":
-            revenue = (volume / 1000.0) * price_now  # Wh → kWh × USD/kWh
-        if allowed and recommendation.action == "BUY":
-            revenue = -((volume / 1000.0) * price_now)
-
-        ers_delta = 0.0
-        if allowed and recommendation.action in ("SELL", "BUY"):
-            ers_delta = ERS_TRADE_GAIN * (1.0 - run.ers)
-            run.ers = round(run.ers + ers_delta, 4)
-
-        # Storage bookkeeping: generation fills, SELL drains, BUY tops up.
-        if recommendation.action == "BUY" and allowed:
-            run.storage_wh += volume
-        if recommendation.action == "SELL" and allowed:
-            run.storage_wh = max(0.0, run.storage_wh - volume)
-        run.storage_wh = min(capacity_wh, run.storage_wh + _forecast_next(signals))
-        run.storage_wh = max(0.0, run.storage_wh)
-
-        run.total_revenue_usd += revenue
-        run.experience.append(
-            {
-                "round": round_no,
-                "action": recommendation.action,
-                "allowed": allowed,
-                "reason": decision.reason,
-                "volume_wh": round(volume, 2),
-                "price_now": round(price_now, 4),
-                "revenue_usd": round(revenue, 4),
+        A missing file is a first run. An *unreadable* one is not an empty portfolio: an
+        empty portfolio means the next stake is a new one, and that is how the same money
+        gets committed twice. So a corrupt file stops the process instead.
+        """
+        path = self.state_path
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            stored = dict(payload.get("positions", {}) or {})
+            self.positions = {
+                str(address).lower(): Position.from_dict(
+                    {**row, "address": row.get("address", address)}
+                )
+                for address, row in stored.items()
             }
-        )
-        run.steps.append(
-            TradeStep(
-                round_no=round_no,
-                action=recommendation.action,
-                volume_wh=volume,
-                confidence=float(recommendation.confidence),
-                price_now=price_now,
-                allowed=allowed,
-                reason=decision.reason,
-                revenue_usd=revenue,
-                ers=run.ers,
-                storage_wh=run.storage_wh,
+            self.cycles = int(payload.get("cycles", 0) or 0)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise TradeError(
+                f"the state file {path} cannot be read ({type(exc).__name__}: {exc}). "
+                "Remove it to start with no positions — this loop will not guess which "
+                "stakes it already holds, because guessing means staking them again."
+            ) from exc
+
+    def _save(self, cycle: Cycle) -> None:
+        """Write the positions and the last cycle. The file is the loop's heartbeat."""
+        path = self.state_path
+        if path is None:
+            return
+        payload = {
+            "version": 1,
+            "cycles": int(self.cycles),
+            "updated": float(self.now()),
+            "dry_run": bool(self.sizing.dry_run),
+            "positions": {
+                address: position.as_dict() for address, position in self.positions.items()
+            },
+            "last": cycle.to_dict(),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
             )
+        except OSError as exc:
+            # A live loop that cannot write its positions would stake the same money
+            # again on the next cycle, so this is fatal in live mode and a warning in a
+            # dry run — where the file is a report and nothing is at risk.
+            message = f"the state file {path} could not be written: {exc}"
+            if not self.sizing.dry_run:
+                raise TradeError(
+                    message + " — a live loop that cannot remember a position would "
+                    "stake it again on the next cycle, so it stops instead"
+                ) from exc
+            cycle.warnings.append(message + " (dry run: nothing is at risk)")
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "venue": str(getattr(self.venue, "name", "venue")),
+            "sizing": self.sizing.describe(),
+            "state": None if self.state_path is None else str(self.state_path),
+            "cycles": int(self.cycles),
+            "positions": [position.as_dict() for position in self.positions.values()],
+        }
+
+    # -- what it reads ------------------------------------------------------- #
+
+    def _book(self, cycle: Cycle) -> List[Any]:
+        """The vaults that have published a record — the only things that can be priced."""
+        read = getattr(self.venue, "get_protocol_list", None)
+        if read is None:  # pragma: no cover - every venue has it; a stub might not
+            cycle.warnings.append("the venue answers no get_protocol_list: nothing to price")
+            return []
+        try:
+            protocols = list(read())
+        except Exception as exc:  # noqa: BLE001 - a cycle reports, it does not crash
+            cycle.warnings.append(
+                f"the book could not be read ({type(exc).__name__}: {exc})"
+            )
+            return []
+        for protocol in protocols:
+            apy = getattr(protocol, "implied_apy", None)
+            record = getattr(protocol, "returns", None)
+            try:
+                points = int(len(record))
+            except TypeError:  # a venue that publishes no record at all
+                points = 0
+            cycle.book.append(
+                {
+                    "name": str(getattr(protocol, "name", "")),
+                    "address": str(getattr(protocol, "address", "")),
+                    "points": points,
+                    "claim_apy": float(getattr(protocol, "claim_apy", 0.0) or 0.0),
+                    "implied_apy": None if apy is None else round(float(apy), 6),
+                }
+            )
+        return protocols
+
+    def _market(self, cycle: Cycle) -> Any:
+        """Read the wild market once; a dead feed is a warning, never an exception."""
+        if self.market is None:
+            cycle.warnings.append(
+                "the market arm is off: only the operator's book was read, so no pool "
+                "was judged and no signal can fire"
+            )
+            return None
+        try:
+            report = self.market()
+        except Exception as exc:  # noqa: BLE001 - the loop outlives the feed
+            cycle.warnings.append(
+                f"the market arm failed ({type(exc).__name__}: {exc})"
+            )
+            return None
+        if report is None:
+            return None
+        payload = report.as_dict()
+        cycle.market = {
+            "venue": payload.get("venue", ""),
+            "scanned": payload.get("scanned", 0),
+            "measured": payload.get("measured", 0),
+            "fired": payload.get("fired", 0),
+            "verdicts": payload.get("verdicts", {}),
+            "error": payload.get("error", ""),
+        }
+        for warning in list(payload.get("warnings", []))[:3]:
+            cycle.warnings.append(str(warning))
+        return report
+
+    @staticmethod
+    def _index(report: Any) -> Dict[str, PanicSignal]:
+        """The report's signals by normalised pool name — a ``PANIC`` wins a name clash.
+
+        The hunter returns one signal per approved pool, so a name is normally unique.
+        When two pools normalise to the same words, the one that fired is the one that
+        matters to a book: it is the only verdict that sizes a trade.
+        """
+        index: Dict[str, PanicSignal] = {}
+        for signal in getattr(report, "signals", ()) or ():
+            key = _normalise(getattr(signal, "name", ""))
+            if not key:
+                continue
+            known = index.get(key)
+            if known is None or (
+                getattr(signal, "fired", False) and not getattr(known, "fired", False)
+            ):
+                index[key] = signal
+        return index
+
+    def _balance(self, address: str, cycle: Cycle) -> Any:
+        """The wallet, read now. ``None`` means the loop cannot see it and will not size."""
+        read = getattr(self.venue, "balance", None)
+        if read is None:  # pragma: no cover - the provider has it; a stub might not
+            cycle.warnings.append("the venue cannot read a balance: nothing can be sized")
+            return None
+        try:
+            balance = read(address)
+        except Exception as exc:  # noqa: BLE001 - a refused read is a refused trade
+            cycle.warnings.append(
+                f"the wallet could not be read ({type(exc).__name__}: {exc}): "
+                "no size is computed without one"
+            )
+            return None
+        cycle.balances.append(balance.as_dict())
+        return balance
+
+    # -- what it decides ----------------------------------------------------- #
+
+    def _consider(
+        self, protocol: Any, index: Dict[str, PanicSignal], cycle: Cycle
+    ) -> Action:
+        """One vault: does the market say buy it, and can the wallet afford a fifth?"""
+        name = str(getattr(protocol, "name", ""))
+        address = str(getattr(protocol, "address", "")).lower()
+        signal = index.get(_normalise(name))
+        if signal is None:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                reason=(
+                    "the market has no pool named like this vault — a signal about a pool "
+                    "is not a signal about this address, and this loop does not guess which "
+                    "contract implements which pool"
+                ),
+            )
+
+        verdict = str(getattr(signal, "verdict", ""))
+        confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+        reason = str(getattr(signal, "reason", ""))
+        held = self.positions.get(address)
+
+        if verdict not in ENTRY_VERDICTS:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                confidence=confidence,
+                reason=reason or "the hunter refused this pool",
+            )
+        if held is not None:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                confidence=confidence,
+                reason=(
+                    f"already holding {held.amount:.6f} opened at "
+                    f"{held.verdict or 'unknown'}: one position per vault"
+                ),
+            )
+
+        balance = self._balance(address, cycle)
+        if balance is None:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                confidence=confidence,
+                reason="the wallet could not be read on this cycle",
+            )
+        if not balance.ok:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                confidence=confidence,
+                reason=f"the wallet could not be read — {balance.error}",
+            )
+
+        size = size_trade(
+            token_balance=balance.token_balance,
+            native_eth=balance.native_eth,
+            sizing=self.sizing,
+            confidence=confidence if verdict == "PANIC" else 0.0,
         )
+        if not size.ok:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                confidence=confidence,
+                bound=size.bound,
+                reason=size.refusal,
+            )
+        return self._stake(name, address, size, verdict, confidence)
 
-    return run
+    def _stake(
+        self,
+        name: str,
+        address: str,
+        size: TradeSize,
+        verdict: str,
+        confidence: float,
+    ) -> Action:
+        """Send the stake — or, in a dry run, produce the row and touch nothing.
 
-
-def print_run(run: TradeRun) -> None:
-    print("Closed economic loop (Phase 3) — signals → policy → action → reward")
-    print("=" * 86)
-    header = (
-        f"{'#':>3} {'action':<7} {'volume Wh':>10} {'conf':>6} {'price':>7} "
-        f"{'allowed':>7} {'reason':<22} {'revenue $':>10} {'ers':>6}"
-    )
-    print(header)
-    print("-" * len(header))
-    for step in run.steps:
-        print(
-            f"{step.round_no:>3} {step.action:<7} {step.volume_wh:>10.1f} "
-            f"{step.confidence:>6.2f} {step.price_now:>7.3f} "
-            f"{str(step.allowed):>7} {step.reason:<22} {step.revenue_usd:>10.4f} "
-            f"{step.ers:>6.3f}"
+        The dry-run branch returns *before* the venue is called at all, which is the only
+        version of this guarantee a reader can check: there is no flag inside
+        ``execute_stake`` that could be wrong, because in a dry run the call never happens.
+        """
+        action = Action(
+            kind="stake",
+            venue=name,
+            address=address,
+            amount=float(size.amount),
+            usd=float(size.usd),
+            verdict=verdict,
+            confidence=confidence,
+            bound=size.bound,
+            reason=size.reason,
+            sent=False,
         )
-    print("-" * len(header))
-    print(
-        f"total revenue ${run.total_revenue_usd:.4f} · ers {run.ers:.3f} · "
-        f"storage {run.storage_wh:.1f} Wh · experience {len(run.experience)} events"
+        if self.sizing.dry_run:
+            return action
+        try:
+            ok = bool(self.venue.execute_stake(address, size.amount))
+        except Exception as exc:  # noqa: BLE001 - a failed send is a row, not a crash
+            action.kind = "error"
+            action.reason = f"the stake raised {type(exc).__name__}: {exc}"
+            return action
+        action.sent = ok
+        if ok:
+            self.positions[address] = Position(
+                address=address,
+                name=name,
+                amount=float(size.amount),
+                at=float(self.now()),
+                verdict=verdict,
+                confidence=confidence,
+            )
+        else:
+            action.reason = self._refusal_line() or "the venue refused the stake"
+        return action
+
+    def _refusal_line(self) -> str:
+        """The venue's own reason for the last refusal, when it keeps one."""
+        entries = getattr(self.venue, "refusals", None) or []
+        if not entries:
+            return ""
+        last = entries[-1]
+        if isinstance(last, Mapping):
+            return str(last.get("reason", "") or "")
+        return str(last)
+
+    def _revisit(
+        self, protocols: List[Any], index: Dict[str, PanicSignal], cycle: Cycle
+    ) -> None:
+        """Positions the market has since disowned: leave, with the verdict as the reason.
+
+        Only the verdicts that *convict* a pool close a position. ``UNMEASURED`` does not:
+        a feed that stopped publishing is not evidence against a record, and a loop that
+        liquidates on its own blindness is a loop that sells at the bottom of an outage.
+        """
+        published = {
+            str(getattr(protocol, "address", "")).lower() for protocol in protocols
+        }
+        for address, position in list(self.positions.items()):
+            signal = index.get(_normalise(position.name))
+            if signal is not None:
+                verdict = str(getattr(signal, "verdict", ""))
+                if verdict in EXIT_VERDICTS:
+                    cycle.actions.append(
+                        self._exit(position, verdict, str(getattr(signal, "reason", "")))
+                    )
+                    continue
+            if address not in published:
+                cycle.warnings.append(
+                    f"{position.name}: still holding {position.amount:.6f}, but the vault "
+                    "published no record this cycle — the position is kept, not guessed at"
+                )
+
+    def _exit(self, position: Position, verdict: str, reason: str) -> Action:
+        """Close a position — the same dry-run rule as a stake, in the other direction."""
+        action = Action(
+            kind="withdraw",
+            venue=position.name,
+            address=position.address,
+            amount=float(position.amount),
+            usd=float(position.amount),
+            verdict=verdict,
+            confidence=float(position.confidence),
+            reason=reason or "the pool is no longer what it was bought as",
+            sent=False,
+        )
+        if self.sizing.dry_run:
+            return action
+        try:
+            ok = bool(self.venue.withdraw(position.address, position.amount))
+        except Exception as exc:  # noqa: BLE001 - same rule as the stake
+            action.kind = "error"
+            action.reason = f"the withdrawal raised {type(exc).__name__}: {exc}"
+            return action
+        action.sent = ok
+        if ok:
+            self.positions.pop(position.address, None)
+        else:
+            action.reason = self._refusal_line() or "the venue refused the withdrawal"
+        return action
+
+    def _unclaimed(
+        self, protocols: List[Any], index: Dict[str, PanicSignal], cycle: Cycle
+    ) -> None:
+        """Panics the book cannot express: reported as **signals**, never sized.
+
+        A dislocation the operator has no vault for is the most interesting thing this
+        loop can see and the one thing it must not trade. No amount is computed, because
+        without a vault there is no token to stake and a dollar figure would be a
+        number about nothing — the row carries the verdict, the confidence and the
+        sentence that says why nothing happened.
+        """
+        claimed = {_normalise(str(getattr(protocol, "name", ""))) for protocol in protocols}
+        for key, signal in index.items():
+            if key in claimed or not getattr(signal, "fired", False):
+                continue
+            cycle.actions.append(
+                Action(
+                    kind="signal",
+                    venue=str(getattr(signal, "name", "")),
+                    address=str(getattr(signal, "address", "")),
+                    verdict=str(getattr(signal, "verdict", "")),
+                    confidence=float(getattr(signal, "confidence", 0.0) or 0.0),
+                    reason=(
+                        "a measured dislocation, but no vault in the operator's book "
+                        "implements this pool: nothing was sized and nothing was signed"
+                    ),
+                )
+            )
+
+    # -- one cycle, and then another ----------------------------------------- #
+
+    def run_once(self) -> Cycle:
+        """Read, judge, size, act — once. Never raises for a venue, a feed or a vault."""
+        cycle = Cycle(
+            number=int(self.cycles) + 1,
+            at=float(self.now()),
+            dry_run=bool(self.sizing.dry_run),
+            chain_id=int(getattr(self.venue, "chain_id", 0) or 0),
+            block=int(getattr(self.venue, "block_number", 0) or 0),
+        )
+        report = self._market(cycle)
+        index = self._index(report)
+        protocols = self._book(cycle)
+        if not protocols and not cycle.warnings:
+            cycle.warnings.append(
+                "no vault in the operator's book has published a record: there is nothing "
+                "to price and nothing to stake"
+            )
+        for protocol in protocols:
+            cycle.actions.append(self._consider(protocol, index, cycle))
+        self._unclaimed(protocols, index, cycle)
+        self._revisit(protocols, index, cycle)
+        self.cycles = cycle.number
+        self._save(cycle)
+        return cycle
+
+    def run(
+        self,
+        *,
+        cycles: Optional[int] = None,
+        interval: float = DEFAULT_INTERVAL,
+    ) -> int:
+        """Cycle forever (``cycles=None``) or a bounded number of times; returns the count."""
+        done = 0
+        while cycles is None or done < int(cycles):
+            cycle = self.run_once()
+            self.printer(cycle.summary_text())
+            done += 1
+            if cycles is not None and done >= int(cycles):
+                break
+            try:
+                time.sleep(max(float(interval), 0.0))
+            except KeyboardInterrupt:  # pragma: no cover - a terminal signal
+                self.printer("interrupted: the state file holds this loop's positions")
+                break
+        return done
+
+
+# ── the collaborators, built from the environment ───────────────────────────
+
+
+def _market_arm(mode: str, limit: int, hunt: int) -> Optional[Callable[[], Any]]:
+    """The market arm as a callable: DeFiLlama → two gates → :class:`VolatilityHunter`.
+
+    The composition is not written here — it is the one ``agent.physics.volatility_hunter``
+    already ships in its own CLI (``DiscoveryEngine.run`` then ``VolatilityHunter.scan``),
+    so a verdict this loop acts on is the same verdict that CLI prints. ``synthetic``
+    reads the drawn market instead of the feed, which is how a box with no egress can
+    still exercise the whole path.
+    """
+    name = str(mode or "").strip().lower()
+    if name in {"off", "none", "no", "0", ""}:
+        return None
+    from agent.physics.defillama_adapter import (
+        MODE_REAL,
+        MODE_SYNTHETIC,
+        DiscoveryEngine,
     )
+    from agent.physics.volatility_hunter import VolatilityHunter
+
+    engine = DiscoveryEngine(mode=MODE_SYNTHETIC if name == "synthetic" else MODE_REAL)
+    hunter = VolatilityHunter(scanner=engine.scanner)
+
+    def once() -> Any:
+        funnel = engine.run(int(limit))
+        return hunter.scan(funnel, limit=int(hunt))
+
+    return once
+
+
+def _venue_from_env() -> Any:
+    """The real venue. An L2 is a mainnet here, so the two-key lock still applies."""
+    from agent.physics.real_testnet_provider import RealTestnetProvider
+
+    return RealTestnetProvider.from_env(
+        allow_mainnet=_flag(os.environ.get("TESTNET_ALLOW_MAINNET"))
+    )
+
+
+def _parser() -> "argparse.ArgumentParser":
+    parser = argparse.ArgumentParser(
+        prog="python -m agent.trade.loop",
+        description=(
+            "The ENRG-AI trading cycle: the operator's vault book, the DeFiLlama market, "
+            "the hunter's verdict, a size cut to a fifth of the wallet, and a tick — or, "
+            "with DRY_RUN on, the tick that would have been sent."
+        ),
+    )
+    parser.add_argument(
+        "--once", action="store_true", help="one cycle and exit (the container default)"
+    )
+    parser.add_argument(
+        "--loop", action="store_true", help="cycle until stopped (with --interval)"
+    )
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=None,
+        help="a bounded number of cycles, for a rehearsal",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=float(os.environ.get(ENV_INTERVAL) or DEFAULT_INTERVAL),
+        help=f"seconds between cycles (default {DEFAULT_INTERVAL}, env {ENV_INTERVAL})",
+    )
+    parser.add_argument(
+        "--market",
+        choices=["real", "synthetic", "off"],
+        default=str(os.environ.get(ENV_MARKET) or "real").lower(),
+        help=f"which market to read (default real, env {ENV_MARKET})",
+    )
+    parser.add_argument("--limit", type=int, default=50, help="pools the funnel scans")
+    parser.add_argument("--hunt", type=int, default=10, help="approved pools to measure")
+    parser.add_argument(
+        "--state",
+        default=os.environ.get(ENV_STATE) or DEFAULT_STATE,
+        help=f"where positions are remembered (default {DEFAULT_STATE}, env {ENV_STATE})",
+    )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=None,
+        help="compute and log, sign nothing (the default unless DRY_RUN=0)",
+    )
+    parser.add_argument(
+        "--live",
+        dest="dry_run",
+        action="store_false",
+        default=None,
+        help="sign and send — the same as DRY_RUN=0, said on the command line",
+    )
+    parser.add_argument("--max-usd", type=float, default=None, help="MAX_TRADE_SIZE_USD")
+    parser.add_argument(
+        "--max-fraction", type=float, default=None, help="MAX_TRADE_FRACTION"
+    )
+    parser.add_argument("--eth-price", type=float, default=None, help="ETH_USD_PRICE")
+    parser.add_argument("--json", default="", help="write this cycle's report here")
+    return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rounds", type=int, default=4)
-    parser.add_argument("--capacity-wh", type=float, default=1000.0)
-    parser.add_argument("--storage-init-wh", type=float, default=0.0)
-    parser.add_argument("--ers-init", type=float, default=0.5)
-    parser.add_argument("--max-volume-wh", type=int, default=0)
-    parser.add_argument("--dao-gated", action="store_true")
-    parser.add_argument("--source", choices=["offline", "online"], default="offline")
-    args = parser.parse_args(argv)
+    """``python -m agent.trade.loop --loop --interval 300`` — the container's entry point."""
+    args = _parser().parse_args(argv)
 
-    run = simulate_rounds(
-        n_rounds=args.rounds,
-        capacity_wh=args.capacity_wh,
-        storage_init_wh=args.storage_init_wh,
-        ers_init=args.ers_init,
-        trade_max_volume_wh=args.max_volume_wh,
-        trade_requires_dao=args.dao_gated,
-        source=args.source,
-    )
-    print_run(run)
+    try:
+        sizing = Sizing.from_env()
+        overrides: Dict[str, Any] = {}
+        if args.max_usd is not None:
+            overrides["max_trade_usd"] = float(args.max_usd)
+        if args.max_fraction is not None:
+            overrides["max_fraction"] = float(args.max_fraction)
+        if args.eth_price is not None:
+            overrides["eth_price_usd"] = float(args.eth_price)
+        if args.dry_run is not None:
+            overrides["dry_run"] = bool(args.dry_run)
+        if overrides:
+            sizing = sizing.replace(**overrides)
+    except Exception as exc:  # noqa: BLE001 - a configuration error is one sentence
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        venue = _venue_from_env()
+    except Exception as exc:  # noqa: BLE001 - a venue that cannot be configured
+        print(f"error: the venue cannot be configured — {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        trader = Trader(
+            venue=venue,
+            sizing=sizing,
+            state_path=Path(args.state) if args.state else None,
+            market=_market_arm(args.market, args.limit, args.hunt),
+        )
+    except TradeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"ENRG-AI trader — {sizing}")
+    print(f"  venue  {getattr(venue, 'name', 'venue')}")
+    print(f"  market {args.market} (scan {args.limit}, measure {args.hunt})")
+    print(f"  state  {trader.state_path}")
+    if trader.positions:
+        print(f"  held   {len(trader.positions)} position(s) from earlier cycles")
+
+    bounded = args.cycles if args.cycles is not None else (1 if args.once else None)
+    try:
+        trader.run(cycles=bounded, interval=args.interval)
+    except TradeError as exc:  # pragma: no cover - raised before the first cycle
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json and trader.state_path is not None:
+        payload: Dict[str, Any] = {}
+        try:
+            payload = json.loads(trader.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):  # pragma: no cover - the file was just written
+            payload = {}
+        try:
+            Path(args.json).write_text(
+                json.dumps(payload.get("last", {}), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"warning: {args.json} could not be written: {exc}", file=sys.stderr)
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - the module is normally imported
     raise SystemExit(main())
-
-

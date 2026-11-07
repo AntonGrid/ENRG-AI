@@ -110,6 +110,10 @@ class World:
         self.allowance = 0
         self.claim = int(0.07 * 10 ** 18)
         self.token = TOKEN
+        #: What the wallet holds: 0.008 ETH of gas money and 50 credits. Read by
+        #: ``eth_getBalance`` and ``balanceOf`` — the two calls a sizing loop makes.
+        self.native = int(0.008 * 10 ** 18)
+        self.token_balance = int(50 * 10 ** 6)
         self.reverts: Dict[str, Exception] = {}
         self.gas_refusals: Dict[str, Exception] = {}
         self.receipt_error: Optional[Exception] = None
@@ -145,6 +149,8 @@ class FakeCall:
             raise self.world.reverts[self.name]
         if self.name == "allowance":
             return self.world.allowance
+        if self.name == "balanceOf":
+            return self.world.token_balance
         if self.name == "claimApyE18":
             return self.world.claim
         if self.name == "token":
@@ -229,6 +235,12 @@ class FakeEth:
     def get_transaction_count(self, address: str, block: str = "latest") -> int:
         self._world.counts.append((str(address), block))
         return int(self._world.nonce)
+
+    def get_balance(self, address: str, block: str = "latest") -> int:
+        self._world.counts.append((str(address), f"balance:{block}"))
+        if "get_balance" in self._world.reverts:
+            raise self._world.reverts["get_balance"]
+        return int(self._world.native)
 
     def get_logs(self, filter_: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._world.filters.append(dict(filter_))
@@ -1325,3 +1337,63 @@ def test_a_local_chain_answers_the_same_seam(tmp_path):
         assert token.functions.balanceOf(vault.address).call() == 10_000_000
         assert book.cash == pytest.approx(996.0)
 
+
+# ── the wallet, read rather than assumed ────────────────────────────────────
+
+
+def test_the_balance_is_two_budgets_in_two_decimals(provider, world):
+    """Gas money and credits are separate reads, and neither is a small integer."""
+    balance = provider.balance(VAULT)
+
+    assert isinstance(balance, T.Balance)
+    assert balance.ok and balance.error == ""
+    assert balance.native_units == int(0.008 * 10 ** 18)
+    assert balance.native_eth == pytest.approx(0.008)
+    assert balance.token == TOKEN
+    assert balance.token_units == 50_000_000
+    assert balance.token_balance == pytest.approx(50.0)
+    assert balance.decimals == 6
+    assert balance.chain_id == SEPOLIA
+    assert "balanceOf" in world.names("call")
+    assert balance.as_dict()["native_eth"] == pytest.approx(0.008)
+
+
+def test_a_balance_without_a_vault_reads_only_the_native_coin(provider):
+    """No vault means no token to ask about: one read, and no invented credit."""
+    balance = provider.balance()
+    assert balance.ok
+    assert balance.token == "" and balance.token_balance == 0.0
+    assert balance.native_eth == pytest.approx(0.008)
+
+
+def test_a_read_only_venue_cannot_be_asked_whose_wallet_it_is(read_only):
+    """No signer is no address — an error with a name, not the zero address."""
+    with pytest.raises(NetNotConfigured):
+        read_only.balance()
+
+
+def test_a_balance_that_cannot_be_read_is_an_error_not_a_zero(provider, world):
+    """The number a loop sizes against must be absent when it is unknown, not 0.0."""
+    world.reverts["get_balance"] = InsufficientFunds("the node says no")
+    balance = provider.balance(VAULT)
+
+    assert balance.ok is False
+    assert "native balance" in balance.error
+    assert balance.native_eth == 0.0
+    assert "unread" in str(balance)
+
+
+def test_a_vault_outside_the_book_has_no_credit_to_report(provider):
+    balance = provider.balance(OTHER)
+    assert balance.ok is False
+    assert "address book" in balance.error
+
+
+def test_a_token_read_that_fails_keeps_the_gas_number(provider, world):
+    """Half an answer is still an answer: the native read succeeded and is reported."""
+    world.reverts["balanceOf"] = ContractLogicError("reverted")
+    balance = provider.balance(VAULT)
+
+    assert balance.native_eth == pytest.approx(0.008)
+    assert balance.token_balance == 0.0
+    assert "token balance" in balance.error

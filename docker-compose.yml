@@ -3,32 +3,73 @@
 #   cp .env.example .env      # fill in only what the workload needs
 #   mkdir -p data && sudo chown 10001:10001 data   # the image runs as uid 10001
 #   docker compose up -d --build
-#   docker compose logs -f trainer
+#   docker compose logs -f trader
 #
-# Two services share one image. `trainer` is the long-running one (the
-# background self-training loop); `coherence` is a one-shot job behind the
-# `jobs` profile, so `docker compose up` never runs it by accident:
+# One image, three services, and the default one hunts:
 #
-#   docker compose run --rm coherence
-#   docker compose run --rm trainer python -m agent.forecast --source offline --output /data/forecast.json
+#   trader   (default)  the trading cycle: vault book → DeFiLlama → the hunter's verdict
+#                       → a size cut to a fifth of the wallet → a stake, or the log of
+#                       the stake it would have sent. `DRY_RUN` in `.env` decides which.
+#   trainer  (profile)  the self-training loop. Behind `--profile training`, because a
+#                       box that is hunting should not also be re-fitting itself every
+#                       hour unless someone asked for it:
+#                         docker compose --profile training up -d trainer
+#   coherence (profile) a one-shot job, on demand, never by accident:
+#                         docker compose run --rm coherence
 #
 # Compose v2 (`docker compose`) is assumed; every key here exists in 2.20+
 name: enrg-ai
 
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: enrg-ai:local
+  # `.env` is gitignored and is where the operator's values live. It must
+  # exist: `cp .env.example .env` is step one of every deployment.
+  env_file:
+    - .env
+  environment:
+    ENRG_CACHE_DIR: /data/.cache
+  volumes:
+    - ./data:/data
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
+  # The hunt. A cycle every `TRADE_INTERVAL` seconds (default 300): read the book from
+  # the chain, read the market, size against the wallet **as it is now**, and either
+  # sign or print what it would have signed. `DRY_RUN=1` (or unset) signs nothing.
+  trader:
+    <<: *common
+    command:
+      - python
+      - -m
+      - agent.trade.loop
+      - --loop
+      - --interval
+      - "${TRADE_INTERVAL:-300}"
+      - --state
+      - /data/trader_state.json
+      - --json
+      - /data/trader_cycle.json
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+
+  # The mathematics, on a schedule. Kept on purpose: the trader decides with the model
+  # this job trains, and a box that can run both should be able to say so.
   trainer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: enrg-ai:local
-    # `.env` is gitignored and is where the operator's values live. It must
-    # exist: `cp .env.example .env` is step one of every deployment.
-    env_file:
-      - .env
-    environment:
-      ENRG_CACHE_DIR: /data/.cache
-    volumes:
-      - ./data:/data
+    <<: *common
+    profiles:
+      - training
     command:
       - python
       - -m
@@ -41,32 +82,14 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 
   # One shot, on demand: the same seam the notebook shows, written as a file.
   # `--source online` reads the live oracle and degrades to the deterministic
   # park when the oracle is unreachable, so the job always produces an answer.
   coherence:
+    <<: *common
     profiles:
       - jobs
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: enrg-ai:local
-    env_file:
-      - .env
-    environment:
-      ENRG_CACHE_DIR: /data/.cache
-    volumes:
-      - ./data:/data
     command:
       - python
       - -m
@@ -76,7 +99,4 @@ services:
       - --output
       - /data/coherence.json
     restart: "no"
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+

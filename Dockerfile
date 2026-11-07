@@ -1,9 +1,9 @@
 # ENRG-AI — runtime image.
 #
-# One image, every entry point the repository has: the self-training loop (the
-# default command), the coherence CLI, the forecast CLI, and the suite the host
-# runs — so the image can be measured rather than believed. Nothing in it holds
-# a key: a venue is configured from the environment at run time, nowhere else.
+# One image, every entry point the repository has: the trading cycle (the default
+# command), the self-training loop, the coherence CLI, and the suite the host runs
+# — so the image can be measured rather than believed. Nothing in it holds a key:
+# a venue is configured from the environment at run time, nowhere else.
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
@@ -40,12 +40,16 @@ RUN useradd --create-home --uid 10001 enrg \
  && chown -R enrg:enrg /app /data
 USER enrg
 
-# A loop that stopped writing its state file is a loop that is not working;
-# the file is written at the end of every cycle, so its age is the heartbeat.
+# A loop that stopped writing its state file is a loop that is not working; both
+# loops write one at the end of every cycle, so the age of *either* file is the
+# heartbeat of whichever loop this container was told to run.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=3 \
-    CMD ["python", "-c", "import os,sys,time; p='/data/digital_state.json'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 10800 else 1)"]
+    CMD ["python", "-c", "import os,sys,time; ps=['/data/trader_state.json','/data/digital_state.json']; sys.exit(0 if any(os.path.exists(p) and time.time()-os.path.getmtime(p) < 5400 for p in ps) else 1)"]
 
-# Default service: the background self-training loop, one cycle an hour.
-# `--offline` is the air-gapped variant (deterministic feeds, no egress).
-CMD ["python", "-m", "agent.digital_train.pipeline", \
-     "--loop", "--interval", "3600", "--state", "/data/digital_state.json"]
+# Default service: one trading cycle every five minutes, remembered in `/data`.
+# It signs nothing unless `DRY_RUN=0` is in the environment — the image cannot make
+# that decision, and the loop prints which mode it is in on every cycle.
+# `--market synthetic` is the air-gapped rehearsal (a drawn market, no egress).
+CMD ["python", "-m", "agent.trade.loop", \
+     "--loop", "--interval", "300", "--state", "/data/trader_state.json", \
+     "--json", "/data/trader_cycle.json"]

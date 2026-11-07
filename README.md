@@ -48,6 +48,8 @@ agent/
 ├── pilot/             # closed-loop DePIN simulation (device→model→action→reward)
 ├── multidomain/       # shared backbone + per-domain heads (transfer learning)
 ├── evolution/         # DAO-driven self-evolution (propose→vote→A/B→canonicalize)
+├── physics/           # coherence, curiosity, the economic agent, the DeFiLlama venue
+├── trade/             # the trading cycle: book → market → hunter → size → a stake
 └── llm.py             # Ollama client (qwen2.5-coder:7b)
 tests/                 # pytest suite
 ```
@@ -575,6 +577,95 @@ the floors, each arm refusing alone, the resting claim, no look-ahead in the rep
 and the cash floor, and the assertion that nothing here can sign, stake or transfer.
 
 
+## The trading cycle: from a verdict to a signature (Phase 8)
+
+Everything above this section *measures*. `agent/trade/loop.py` is the file that signs —
+and the file the container runs. One cycle answers four questions in this order, and every
+answer can stop it:
+
+| # | question | answered by | what stops the cycle |
+|---|---|---|---|
+| 1 | what may be traded? | `TESTNET_PROTOCOLS` — the operator's book — plus the record each vault published (`RealTestnetProvider.get_protocol_list`) | an empty book: *nothing to price* |
+| 2 | what does the market say? | `DiscoveryEngine` (DeFiLlama, two gates) → `VolatilityHunter`: the **same** verdicts its own CLI prints | `THIN`, `FORMULA`, `DISHONEST`, `UNMEASURED` |
+| 3 | how much? | `provider.balance()` — read *on that cycle* — then `agent/trade/capital.size_trade` | no credits, no gas, no ceiling, an unreadable wallet |
+| 4 | sign, or say it? | `DRY_RUN` | unset means **dry** |
+
+```bash
+python -m agent.trade.loop --once --market synthetic --dry-run   # rehearse, no egress
+python -m agent.trade.loop --once --dry-run --json cycle.json    # one cycle, as a file
+python -m agent.trade.loop --loop --interval 300                 # the container's command
+```
+
+### Two ceilings, and a wallet smaller than both
+
+`MAX_TRADE_SIZE_USD` is what the operator will risk on a single transaction.
+`MAX_TRADE_FRACTION` (default `0.20`) is a share of what the wallet holds **at that
+moment** — the balance is read from the node on the same cycle that sizes the trade, never
+remembered from a previous one. The smaller number wins, so `MAX_TRADE_SIZE_USD=50` on the
+`$18` wallet this was written for produces `$3.60`, and the log says which ceiling decided:
+
+```text
+── cycle 1 · DRY RUN (nothing will be signed) · chain 11155111 · block 101
+   book  Aave V3 USDC             +3.72% implied
+   market 1 pools read · panics 1 · verdicts {'PANIC': 1}
+   would stake  Aave V3 USDC  13.600000 ($13.60)  [PANIC 1.00] — MAX_TRADE_FRACTION
+                decides it: 20.0% of the wallet at $13.60 of $68.00
+```
+
+(Those four lines are the test double from `tests/test_trade_loop.py`, not a live chain:
+a `$50` ceiling, a `$68` wallet — 50 credits and 0.008 ETH priced at $2,250.)
+
+Three refusals matter more than the number:
+
+* **ether is not a balance.** A stake spends the vault's ERC20 and *costs* a little of the
+  native coin; a wallet with $18 of ETH and no credits cannot stake, and the cycle says
+  exactly that instead of sending a transaction that reverts.
+* **the gas reserve is a refusal, not a ceiling.** Below `GAS_RESERVE_ETH` (default
+  `0.0005`) the approve could land and the stake could not.
+* **a panic may lift the dollar ceiling by half — never the fraction.** `ALPHA_BOOST ×
+  confidence` applies to `MAX_TRADE_SIZE_USD` only: "a fifth of the wallet" is the answer
+  to *what is the worst one mistake can do*, and a measurement is not allowed to enlarge
+  the mistake it is measuring.
+
+### The seam this loop refuses to invent
+
+A DeFiLlama pool is not a vault: the feed publishes a project, a chain and a UUID, the book
+publishes a contract address, and no code here can prove one implements the other. So a
+signal is acted on only when the pool and a book entry share a name (normalised: letters
+and digits). A panic with nothing behind it in the book is a **signal**, not an action:
+
+```text
+   signal   aave-v3-usdc  [PANIC 0.42] — a measured dislocation, but no vault in the
+            operator's book implements this pool: nothing was sized and nothing was signed
+```
+
+That line is the honest answer on a first run, and on most runs. No amount is printed for
+it, because without a vault there is no token to stake: a dollar figure there would be a
+number about nothing.
+
+### Dry run is the default, and it is not a flag inside the venue
+
+`DRY_RUN` unset is a dry run; only `0/false/no/off` makes the loop sign, so a typo
+(`DRY_RUN=ture`) leaves it in the safe mode. In a dry run the branch returns **before**
+`execute_stake` is called at all — `test_a_dry_cycle_decides_and_signs_nothing` asserts on
+an empty venue ledger, not on a boolean, because a boolean inside a method is a promise and
+an empty ledger is a fact.
+
+### The state file, and why a corrupt one stops the loop
+
+Positions live in `TRADER_STATE` (`/data/trader_state.json` in the container) and are
+written after every cycle: address, amount, the verdict it was bought on, the confidence.
+It is what stops a restart from staking the same money twice — so a file that cannot be read
+is **not** treated as an empty portfolio. The process stops and names the file.
+`UNMEASURED` never closes a position (a feed that stopped publishing is not evidence against
+a record); `FORMULA`/`DISHONEST`/`THIN` do.
+
+Tests: `tests/test_trade_loop.py` — 35 of them, no network and no chain: the caps, the
+fail-closed refusals, the dry run's empty ledger, the exit path, the state file's refusal to
+lie, and the CLI's mode. The provider's new read has its own in
+`tests/test_physics_real_testnet.py` (six more: two decimals, a missing signer, a read that
+failed, a vault outside the book).
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear
@@ -621,13 +712,15 @@ python -m agent.main
 pytest
 ```
 
-692 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+733 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
 genome/sensorium/organism tests — on a box without them those tests say so by
 name, which is why the full run is a *workspace* command, not a pip-install one.
-Nothing on the deployment path needs any of the three.
+Nothing on the deployment path needs any of the three: the trading cycle's own 35
+(`tests/test_trade_loop.py`) and the provider's 68 run anywhere Python does.
+
 
 ## Production Readiness
 
@@ -831,39 +924,58 @@ job.
 ```bash
 cp .env.example .env && chmod 600 .env
 mkdir -p data && sudo chown 10001:10001 data   # see below: the image is not root
-docker compose up -d --build
-docker compose logs -f trainer
-docker compose run --rm coherence            # one-shot job, behind the `jobs` profile
-docker compose exec trainer pytest -q        # the suite, as far as it ships in the image
+docker compose up -d --build                   # `trader`, the trading cycle
+docker compose logs -f trader                  # the decisions, one cycle at a time
+docker compose run --rm coherence              # one-shot job, behind the `jobs` profile
+docker compose --profile training up -d trainer  # the training loop, when you want it
+docker compose exec trader pytest -q           # the suite, as far as it ships in the image
 ```
+
+Three services, one image, and the default one **hunts**: `trader` runs
+`python -m agent.trade.loop --loop --interval ${TRADE_INTERVAL:-300}` and, with
+`DRY_RUN=1` (the default, and what an unset variable means), it computes and logs every
+decision without signing anything. `trainer` is the self-training loop and now lives behind
+`--profile training`, so a box that trades does not also re-fit itself every hour unless
+someone asked; `coherence` is the same seam as a one-shot job.
 
 The `mkdir`/`chown` is not decoration: `data/` is gitignored and `.dockerignore`d,
 so on a fresh box compose creates it as `root:root` and the container — uid
 `10001`, on purpose — cannot write its state file. The symptom is a loop that
-dies with `PermissionError: [Errno 13] ... /data/digital_state.json` on the first
+dies with `PermissionError: [Errno 13] ... /data/trader_state.json` on the first
 cycle; the fix is the line above, once.
 
 The image is `python:3.12-slim` plus the package's extras, runs as uid `10001`,
 and holds **no key, no `.env` and no address** — both are `.dockerignore`d, so
-`docker build` cannot bake a secret into a layer. `trainer` is the long-running
-service (the self-training loop, one cycle an hour, `${TRAIN_INTERVAL}` to
-change it); `coherence` is the same seam as a one-shot job. One health check,
-and it is the honest one: the state file is written at the end of every cycle,
-so a file older than three hours means the loop is not working and compose
-restarts it.
+`docker build` cannot bake a secret into a layer. One health check, and it is the
+honest one: both loops write their state file at the end of every cycle, so a
+`/data/trader_state.json` (or `/data/digital_state.json`) older than ninety minutes
+means the loop is not working and compose restarts it.
 
 The `.env` from step 3 is the file compose reads: the same
-`TESTNET_PROFILE=arbitrum` and the same key, handed to the container's
-environment at start — never copied into the image, never a build argument.
+`TESTNET_PROFILE=arbitrum`, the same key, and the same `DRY_RUN`, handed to the
+container's environment at start — never copied into the image, never a build
+argument. **`DRY_RUN=1` until the logs have been read**: `docker compose logs -f
+trader` prints one block per cycle, and the block says which mode it was in.
+
 
 The image carries the suite and the `dev` extra so it can be *measured*, not
-because a deploy needs them: `pytest -q` in the container runs every test whose
-dependencies ship in this repository, and the ones that need a workspace sibling
-(the `entrain_infer` core, `axis_core`, the scikit-learn datasets) say so by
-name. The whole 692 run on a host that holds the workspace. What to check after
-the first build: the image runs as uid `10001`, writes `/data/digital_state.json`
-through the mounted volume when given `--once --offline`, and its health check
-answers 1 before that file exists and 0 after.
+because a deploy needs them. Measured on this repository's own build
+(`python:3.12-slim`, 589 MB, uid `10001`):
+
+* **built and run with no network**: one cycle with the node and the feed both
+  unreachable printed the two warnings (the book could not be read, the feed could
+  not be reached), exited `0`, and wrote `/data/trader_state.json` **and**
+  `/data/trader_cycle.json` — a container that dies when its inputs are missing is a
+  container that hides a failure behind a restart loop;
+* **the health check** answers `1` with no state file and `0` with a fresh one;
+* **`pytest -q` inside the image** collects 699 and passes 623. The 76 that do not run
+  there need `sklearn` (the `organism` extra) or a workspace sibling — the
+  `entrain_infer` core, `axis_core` — and they say so by name rather than passing
+  quietly. The trading path's own tests do run in the image:
+  `docker compose exec trader pytest -q tests/test_trade_loop.py
+  tests/test_physics_real_testnet.py` is green. All 733 pass on a host that holds the
+  workspace.
+
 
 ### Environment variables
 
@@ -886,6 +998,14 @@ error with a name, never a silent fallback.
 | `TESTNET_BLOCK_TIMEOUT` | seconds to await a block | `30` |
 | `TESTNET_ALLOW_MAINNET` | `1` to let a real-money chain through (with `allow_mainnet=True` in code) | unset → refused |
 | `TESTNET_ABI_FILE` | override the built-in vault ABI | built in |
+| `DRY_RUN` | `0/false/no/off` makes the trader sign; anything else (including unset, and a typo) computes and logs only | unset → **dry run** |
+| `MAX_TRADE_SIZE_USD` | the most one transaction may commit | `0` → no USD ceiling of its own |
+| `MAX_TRADE_FRACTION` | a share of the wallet, read from the chain on the same cycle | `0.20` |
+| `ETH_USD_PRICE` | how the native balance is valued; without it the fraction applies to the stable credits only | unset → ETH unpriced |
+| `GAS_RESERVE_ETH` | below this, a stake is refused instead of sent | `0.0005` |
+| `TRADE_INTERVAL` | seconds between trading cycles (compose) | `300` |
+| `TRADER_STATE` | where the trader remembers its positions | `data/trader_state.json` |
+| `TRADE_MARKET` | `real` (DeFiLlama), `synthetic` (drawn, no egress) or `off` | `real` |
 | `AXIS_AI_SIGNING_KEY` | `--sign` on `agent.signals` / `agent.physics` (base64 Ed25519 seed) | unset → `--sign` exits 2 |
 | `ENRG_CACHE_DIR` | where the market cache lives | `.cache` |
 

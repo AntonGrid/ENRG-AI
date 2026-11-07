@@ -30,6 +30,19 @@ is a declared blocklist, and connecting to one raises
 passes ``allow_mainnet=True``: two independent decisions, because the mistake this
 guards against is expensive and one keystroke away.
 
+One read the interface does not declare
+=======================================
+
+:meth:`RealTestnetProvider.balance` is the only method here that
+:class:`~agent.physics.interfaces.IWeb3Provider` does not ask for, and it is here for one
+caller: a trading loop that has to size a trade against a wallet it can see. It reads
+``eth_getBalance`` always and ``balanceOf`` of one vault's token when it is given a vault,
+and it answers a failed read with ``Balance(error=...)`` rather than an exception —
+because a loop's response to "the node will not say" is to trade nothing this cycle, and a
+caller that gets ``0.0`` instead cannot tell that apart from an empty wallet. Two decimals
+counts live in one place for the same reason: :data:`ETH_DECIMALS` is 18 and
+:data:`DEFAULT_DECIMALS` is 6, and confusing them is how a loop believes it is rich.
+
 Configuration, all of it from the environment
 =============================================
 
@@ -142,6 +155,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, and web3 is optional at run
     from web3 import Web3
 
 __all__ = [
+    "Balance",
     "DryRun",
     "ProtocolBook",
     "ProtocolEntry",
@@ -152,6 +166,7 @@ __all__ = [
     "TestnetUnavailable",
     "MAINNET_CHAIN_IDS",
     "CHAIN_PROFILES",
+    "ETH_DECIMALS",
     "YIELD_EVENT_SIGNATURE",
 ]
 
@@ -191,6 +206,11 @@ CHAIN_PROFILES: Dict[str, int] = {
 #: Credits per token unit when nobody says otherwise: a USDC-like token, because a
 #: credit is a cent-shaped thing and six decimals is what a test stablecoin has.
 DEFAULT_DECIMALS = 6
+
+#: Wei per ether. The native balance is read in wei and reported in ether, and the one
+#: thing a trading loop must never do is confuse the two: ``0.008`` read as wei is a
+#: wallet that looks empty, and ``8e15`` read as ether is a wallet that looks infinite.
+ETH_DECIMALS = 18
 
 #: Blocks scanned when a record is asked for. A chain cannot be asked for "the last N
 #: events" without an indexer, so the window is declared and printed rather than
@@ -537,6 +557,62 @@ class DryRun:
         verdict = "would pass" if self.ok else f"would fail: {self.revert}"
         gas = "unknown" if self.gas is None else str(int(self.gas))
         return f"dry run {self.action} {self.amount} -> {verdict} (gas {gas})"
+
+
+# ── what the wallet actually holds ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Balance:
+    """What an account holds, read off the chain — never assumed, never cached.
+
+    Two numbers, because on an L2 they are two different budgets: ``native`` is the gas
+    money, and ``token`` is the credit the vault pulls. A stake spends the second and
+    costs a little of the first, so a loop that only knows one of them is a loop that
+    either reverts or stalls.
+
+    ``error`` is the honest shape of a failed read: a node that will not answer produces
+    *no balance*, not a balance of zero, and a caller that cannot tell those apart sizes
+    a trade on a fact it does not have. Every caller here treats a non-empty ``error``
+    as a refusal to trade.
+    """
+
+    address: str = ""
+    native_eth: float = 0.0
+    native_units: int = 0
+    token: str = ""
+    token_balance: float = 0.0
+    token_units: int = 0
+    decimals: int = DEFAULT_DECIMALS
+    chain_id: int = 0
+    block: int = 0
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "address": self.address,
+            "native_eth": round(float(self.native_eth), 9),
+            "native_units": int(self.native_units),
+            "token": self.token,
+            "token_balance": round(float(self.token_balance), 6),
+            "token_units": int(self.token_units),
+            "decimals": int(self.decimals),
+            "chain_id": int(self.chain_id),
+            "block": int(self.block),
+            "error": self.error,
+        }
+
+    def __str__(self) -> str:
+        if self.error:
+            return f"balance of {self.address or 'the signer'}: unread — {self.error}"
+        line = f"{self.native_eth:.6f} ETH"
+        if self.token:
+            line += f" + {self.token_balance:.6f} of {self.token}"
+        return f"balance of {self.address or 'the signer'}: {line}"
 
 
 # ── the configuration, and where it is allowed to come from ──────────────────
@@ -1432,6 +1508,86 @@ class RealTestnetProvider(IWeb3Provider):
                 "reason": reason,
                 "step": int(self.step),
             }
+        )
+
+    # -- what the wallet holds ---------------------------------------------- #
+
+    def balance(
+        self,
+        protocol_address: Optional[str] = None,
+        *,
+        address: Optional[str] = None,
+    ) -> Balance:
+        """Read the signer's balance off the node — gas money, and one vault's credit.
+
+        Asked on every cycle rather than remembered, because the number a loop sizes a
+        trade against is the number the chain will check: a cached balance is a balance
+        that was true once, and ``MAX_TRADE_SIZE_USD`` against a stale wallet is how a
+        bot spends money it already spent.
+
+        Two reads, and the second one is optional:
+
+        * ``eth_getBalance`` — always, in wei, reported in ether (:data:`ETH_DECIMALS`);
+        * ``balanceOf`` — only when a ``protocol_address`` from the operator's book is
+          given, because the credit a stake moves is the token *that vault* pulls.
+
+        A failure is returned as ``Balance(error=...)`` rather than raised: the caller is
+        a loop, it has to keep cycling, and "I could not read the wallet" is a reason to
+        refuse a trade, not a reason to stop existing. A missing signer *is* raised
+        (``TestnetNotConfigured``), because there is no address to ask about at all.
+        """
+        owner = str(address).lower() if address else self._signer_address()
+        self._connect()
+        block = self._refresh_block()
+        base: Dict[str, Any] = {
+            "address": owner,
+            "chain_id": int(self._chain_id or 0),
+            "block": int(block),
+        }
+        try:
+            units = int(self._w3().eth.get_balance(self._checksum(owner)))
+        except Exception as exc:  # noqa: BLE001 - a read that failed is a fact
+            return Balance(
+                **base,
+                error=f"native balance: {_failure_kind(exc)} ({self._reason(exc)})",
+            )
+        native = units / (10 ** ETH_DECIMALS)
+        if not protocol_address:
+            return Balance(**base, native_eth=native, native_units=units)
+
+        key = str(protocol_address).lower()
+        entry = self.config.book.get(key)
+        if entry is None:
+            return Balance(
+                **base,
+                native_eth=native,
+                native_units=units,
+                error="the vault is not in the operator's address book",
+            )
+        decimals = int(entry.decimals)
+        try:
+            token = self._token_of(entry)
+            raw = int(
+                self._token_contract(token)
+                .functions.balanceOf(self._checksum(owner))
+                .call({"from": self._checksum(owner)})
+            )
+        except Exception as exc:  # noqa: BLE001 - the same rule as above
+            return Balance(
+                **base,
+                native_eth=native,
+                native_units=units,
+                decimals=decimals,
+                error=f"token balance: {_failure_kind(exc)} ({self._reason(exc)})",
+            )
+        return Balance(
+            **base,
+            native_eth=native,
+            native_units=units,
+            token=str(token),
+            token_units=raw,
+            token_balance=raw / (10 ** decimals),
+            decimals=decimals,
         )
 
     # -- capital in, capital out -------------------------------------------- #
