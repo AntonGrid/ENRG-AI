@@ -64,6 +64,11 @@ with a name, never a silent fallback.
                                never a permission — an L2 is still a mainnet here.
 ``TESTNET_PROTOCOLS_FILE``     path to the operator's address book (JSON).
 ``TESTNET_PROTOCOLS``          the same book inline, as JSON.
+``TESTNET_HISTORY``            where a record comes from: ``chain`` (the vault's own
+                               ``YieldDistributed`` logs — the default), ``feed`` (DeFiLlama's
+                               daily APY history for the entry's name or pinned ``pool``
+                               uuid, no node read), or ``auto`` (the log first, the feed when
+                               the log is silent).
 ``TESTNET_DECIMALS``           credits per unit (default ``6``, a USDC-like token).
 ``TESTNET_LOOKBACK``           blocks scanned for a record (default ``5000``).
 ``TESTNET_RECEIPT_TIMEOUT``    seconds to wait for a receipt (default ``120``).
@@ -91,6 +96,7 @@ that can widen its own permissions — so this one only reads it::
           "claim_apy": 0.05,         # what it says, as a fraction
           "decimals": 6,             # credits per token unit
           "token": "0x...",          # the ERC20 the vault pulls from
+          "pool": "",                # optional: the DeFiLlama pool uuid this vault is
           "note": "sepolia demo"
         }
       ]
@@ -99,6 +105,37 @@ that can widen its own permissions — so this one only reads it::
 An address not in this file is not published, is not on the whitelist and cannot be
 staked into: :meth:`RealTestnetProvider.execute_stake` answers ``False`` for it, which
 ``Portfolio`` turns into a refusal, which is exactly what a closed list is for.
+
+Reading a record: the vault's own logs, and — when it publishes none — the feed
+=================================================================================
+
+The record is what everything above measures, and there are exactly two places it can come
+from. ``chain`` (the default) reads ``YieldDistributed(uint256,uint256)`` logs of one address
+inside ``TESTNET_LOOKBACK`` blocks and decodes the second word of each log's data as a
+per-epoch rate scaled by ``1e18``: one static word, decoded by hand, so a record needs no ABI.
+
+That is the only honest source for a vault of this interface, and it is silent for almost
+every real address: Aave's ``aUSDC``, a Uniswap V3 pool, a Curve gauge all publish yield in
+their own events, and a book of them therefore prices nothing. ``TESTNET_HISTORY=feed`` is
+the second source, and it is the market's: DeFiLlama's daily APY history for the entry's
+**name** (or for the ``pool`` uuid the operator pinned), converted to per-step rates by the
+same ``(1+apy)^(1/365) − 1`` the funnel uses. ``TESTNET_HISTORY=auto`` reads the log first
+and asks the feed only when the log says nothing, so an address that publishes its own record
+is never replaced by a name match.
+
+Two facts about the fallback, both of them load-bearing:
+
+* **A feed-priced record is about a name, not about an address.**
+  :meth:`RealTestnetProvider.history_source` answers ``chain`` for a record read from the
+  address itself and the feed's label (``the feed aave-v3 USDC (Arbitrum) [d9fa8e]``)
+  otherwise, the protocol's note carries the same sentence, and the trading loop **signs only
+  into the first kind** — a vault whose own log it has not read is measured, refused, and
+  named, never funded.
+* **A node that will not answer is not the same silence as a vault that published nothing.**
+  ``auto`` falls back on an empty log, not on an outage: a dead node still surfaces as
+  :class:`TestnetUnavailable`, because "DeFiLlama can price this name" is not an answer to
+  "the chain you point at is unreachable". An operator who wants the feed regardless sets
+  ``TESTNET_HISTORY=feed`` and the node is not asked for a record at all.
 
 The chain's clock, and what a "step" means here
 ===============================================
@@ -157,8 +194,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, and web3 is optional at run
 __all__ = [
     "Balance",
     "DryRun",
+    "HISTORY_AUTO",
+    "HISTORY_CHAIN",
+    "HISTORY_FEED",
+    "HISTORY_SOURCES",
     "ProtocolBook",
     "ProtocolEntry",
+    "RECORD_FROM_CHAIN",
     "RealTestnetProvider",
     "TestnetConfig",
     "TestnetError",
@@ -185,6 +227,27 @@ ENV_BLOCK_TIMEOUT = "TESTNET_BLOCK_TIMEOUT"
 ENV_ALLOW_MAINNET = "TESTNET_ALLOW_MAINNET"
 ENV_ABI_FILE = "TESTNET_ABI_FILE"
 ENV_PROFILE = "TESTNET_PROFILE"
+ENV_HISTORY = "TESTNET_HISTORY"
+
+#: Where a record comes from, and the three answers this venue gives.
+#:
+#: ``chain`` is the vault's own ``YieldDistributed`` logs and nothing else — the default,
+#: because a record that *this address* published is the only one this file can read without
+#: borrowing somebody's word for it. ``feed`` prices an entry from DeFiLlama's daily APY
+#: history for its name and never touches the node to do it: the answer to a book of real
+#: dApp addresses (an aToken, a Uniswap pool) that emit our event never.
+#: ``auto`` reads the log first and asks the feed when the log says nothing — the address's
+#: own record always wins, and the feed is what keeps a silent vault from being unmeasurable.
+HISTORY_CHAIN = "chain"
+HISTORY_FEED = "feed"
+HISTORY_AUTO = "auto"
+HISTORY_SOURCES = (HISTORY_CHAIN, HISTORY_FEED, HISTORY_AUTO)
+DEFAULT_HISTORY = HISTORY_CHAIN
+
+#: What :meth:`RealTestnetProvider.history_source` calls a record read from the address
+#: itself. Every other value it can return names a foreign source, and a caller that signs
+#: capital may compare against this one string and nothing else.
+RECORD_FROM_CHAIN = HISTORY_CHAIN
 
 #: The chains this venue knows by name, and nothing else about them. A profile is a
 #: **spelling plus a chain id**: ``TESTNET_PROFILE=arbitrum`` lets the operator keep the
@@ -372,6 +435,11 @@ class ProtocolEntry:
     decimals: int = DEFAULT_DECIMALS
     token: str = ""
     note: str = ""
+    #: The DeFiLlama ``pool`` uuid this vault implements, when the operator knows it. It
+    #: removes the name match from the feed fallback entirely — the entry says which pool
+    #: prices it instead of hoping a label resolves — and it is optional because most
+    #: operators meet a pool through its label first.
+    pool: str = ""
 
     def __post_init__(self) -> None:
         if not _is_address(self.address):
@@ -392,10 +460,26 @@ class ProtocolEntry:
             )
         if not np.isfinite(float(self.claim_apy)):
             raise TestnetNotConfigured(f"{self.name}: the claim is not a number")
+        pool = str(self.pool or "").strip()
+        if len(pool) > 64 or any(character.isspace() for character in pool):
+            raise TestnetNotConfigured(f"{self.name}: {pool!r} is not a pool uuid")
         object.__setattr__(self, "address", str(self.address).lower())
         object.__setattr__(self, "token", str(self.token).lower())
         object.__setattr__(self, "claim_apy", float(self.claim_apy))
         object.__setattr__(self, "decimals", int(self.decimals))
+        object.__setattr__(self, "pool", pool)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "address": self.address,
+            "name": self.name,
+            "bucket": self.bucket,
+            "claim_apy": self.claim_apy,
+            "decimals": self.decimals,
+            "token": self.token,
+            "note": self.note,
+            "pool": self.pool,
+        }
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -720,6 +804,11 @@ class TestnetConfig:
     book: ProtocolBook = field(default_factory=ProtocolBook)
     decimals: int = DEFAULT_DECIMALS
     lookback: int = DEFAULT_LOOKBACK
+    #: ``TESTNET_HISTORY``: ``chain`` (the vault's own logs), ``feed`` (DeFiLlama's daily
+    #: APY history for the entry's name) or ``auto`` (log first, feed when the log is
+    #: silent). A *policy*, not a fallback: the venue is told which records it may publish,
+    #: because a record from the feed is a fact about a name and never about an address.
+    history: str = DEFAULT_HISTORY
     receipt_timeout: float = DEFAULT_RECEIPT_TIMEOUT
     block_timeout: float = DEFAULT_BLOCK_TIMEOUT
     allow_mainnet: bool = False
@@ -743,6 +832,17 @@ class TestnetConfig:
         object.__setattr__(
             self, "sources", {str(k): str(v) for k, v in dict(self.sources).items()}
         )
+
+        # Which records the venue may publish. A policy with three values and no fourth:
+        # a misspelt one is a named error rather than a silent "chain", because the
+        # operator asked a question about provenance and a typo must not answer it.
+        history = _clean(self.history).lower() or DEFAULT_HISTORY
+        if history not in HISTORY_SOURCES:
+            raise TestnetNotConfigured(
+                f"{ENV_HISTORY}={self.history!r} is not one of: "
+                + ", ".join(HISTORY_SOURCES)
+            )
+        object.__setattr__(self, "history", history)
 
         # The name that answered, so an error about a value from an alias sends the
         # operator to the variable they actually set.
@@ -859,6 +959,7 @@ class TestnetConfig:
             "lookback": _int_or(
                 source.get(ENV_LOOKBACK), DEFAULT_LOOKBACK, ENV_LOOKBACK
             ),
+            "history": _clean(source.get(ENV_HISTORY)) or DEFAULT_HISTORY,
             "receipt_timeout": _float_or(
                 source.get(ENV_RECEIPT_TIMEOUT),
                 DEFAULT_RECEIPT_TIMEOUT,
@@ -909,6 +1010,7 @@ class TestnetConfig:
             "sources": dict(self.sources),
             "decimals": int(self.decimals),
             "lookback": int(self.lookback),
+            "history": str(self.history),
             "protocols": len(self.book),
             "allow_mainnet": bool(self.allow_mainnet),
         }
@@ -961,6 +1063,7 @@ class RealTestnetProvider(IWeb3Provider):
         web3: Any = None,
         env: Optional[Mapping[str, str]] = None,
         allow_mainnet: bool = False,
+        feed: Any = None,
         **overrides: Any,
     ) -> None:
         """Build the venue; do not touch the network yet.
@@ -971,7 +1074,12 @@ class RealTestnetProvider(IWeb3Provider):
         happens on the first call that needs an answer.
 
         ``web3`` is a seam for tests (and for a node library other than web3.py): any
-        object with an ``eth`` attribute answering the calls in this file will do.
+        object with an ``eth`` attribute answering the calls in this file will do. ``feed``
+        is the same seam for the other wire: anything with
+        ``history(name, steps=None, uuid="")`` answering a
+        :class:`~agent.physics.defillama_adapter.FeedRecord`. Left out, it is built on first
+        use from :class:`~agent.physics.defillama_adapter.FeedHistory` — one catalogue per
+        process, because a catalogue is 1.4 MB.
         """
         if config is None:
             given: Dict[str, Any] = dict(overrides)
@@ -989,6 +1097,7 @@ class RealTestnetProvider(IWeb3Provider):
 
         self.config: TestnetConfig = config
         self._web3: Any = web3
+        self._feed: Any = feed
         self._signer: str = config.unlocked_account
         self._account: Any = None
         self._chain_id: Optional[int] = config.chain_id
@@ -998,6 +1107,11 @@ class RealTestnetProvider(IWeb3Provider):
         self._topic: Optional[str] = None
         self._claims: Dict[str, float] = {}
         self._tokens: Dict[str, str] = {}
+        # Where each address's last record came from: ``chain``, or the feed's label for the
+        # pool. Kept per address and never inferred later — a report that guessed would be a
+        # report that can say "the vault paid this" about a number the vault never saw.
+        self._history: Dict[str, str] = {}
+        self._records: Dict[str, Any] = {}
         self._whitelist: WhiteList = config.book.whitelist()
 
         # the ledger a report prints; every row is a thing that happened
@@ -1158,13 +1272,17 @@ class RealTestnetProvider(IWeb3Provider):
     # -- what is on offer --------------------------------------------------- #
 
     def get_protocol_list(self) -> List[Protocol]:
-        """Every book entry that has published something, and nothing else.
+        """Every book entry that has a record — its own, or one the feed vouches for.
 
-        A book entry with no ``YieldDistributed`` log is *not* published: it has said
-        nothing, so there is no record, and a protocol with no record cannot be one
-        (``Protocol`` refuses it, correctly). Filtering here rather than inventing a
-        placeholder keeps the absence of a measurement visible to the assessment, which
-        will call it ``UNMEASURED`` and refuse to size a position on it.
+        A book entry with no ``YieldDistributed`` log is still published when the operator
+        allowed the feed to speak for it (``TESTNET_HISTORY=auto`` or ``feed``): the record
+        is then the feed's sentence about the entry's **name**, and the protocol's note says
+        so. What this method never does is invent one — a ``Protocol`` refuses an empty
+        record (correctly), and a record nobody published is not a measurement.
+
+        The distinction travels with the object: :meth:`history_source` answers ``chain`` for
+        a record read from the address itself and the feed's label otherwise, and the trading
+        loop signs only into the first kind.
         """
         self._connect()
         self._refresh_block()
@@ -1182,12 +1300,39 @@ class RealTestnetProvider(IWeb3Provider):
                         returns=np.asarray(record, dtype=float),
                         address=entry.address,
                         alive=True,
-                        note=entry.note,
+                        note=self._note(entry),
                     )
                 )
             except PortfolioError as exc:  # a bad record is a protocol to skip
                 self.errors.append(f"{entry.name}: {exc}")
         return published
+
+    def history_source(self, address: str) -> str:
+        """Where this address's record came from, in a form a report can print.
+
+        ``chain`` when the address published its own ``YieldDistributed`` logs (that is
+        :data:`RECORD_FROM_CHAIN`); the feed's label — ``the feed aave-v3 USDC (Arbitrum)
+        [d9fa8e]`` — when the record is the feed's statement about the entry's *name*; and
+        ``""`` when there is no record at all, which is not a source but an absence.
+        """
+        return self._history.get(str(address).lower(), "")
+
+    def history_note(self, address: str) -> str:
+        """Why an entry has no record, in the feed's own words when the feed said so."""
+        record = self._records.get(str(address).lower())
+        return str(getattr(record, "reason", "") or "")
+
+    def _note(self, entry: ProtocolEntry) -> str:
+        """The book's note, plus the record's provenance when it is not the vault's own.
+
+        A feed-priced protocol is a real record about a *name*; a note that stayed silent
+        about it would let an operator believe the address had published it.
+        """
+        source = self._history.get(entry.address, "")
+        if not source or source == RECORD_FROM_CHAIN:
+            return entry.note
+        extra = f"record from {source}: this address published no log"
+        return f"{entry.note} · {extra}" if entry.note else extra
 
     def _yield_topic(self) -> str:
         """``keccak("YieldDistributed(uint256,uint256)")``, computed once."""
@@ -1203,18 +1348,44 @@ class RealTestnetProvider(IWeb3Provider):
     def fetch_protocol_history(
         self, address: str, steps: Optional[int] = None
     ) -> List[float]:
-        """The rates this address published, oldest first, decoded from its logs.
+        """The rates this entry is priced at, oldest first — its own logs, or the feed's.
 
-        Never raises on a venue problem: an address the book does not contain, a node
-        that will not answer and a log that will not decode all come back as "nothing
-        published" — which the assessment reads as a protocol to refuse. A
-        *configuration* error is different and does surface, because the difference
-        between "this venue said nothing" and "this venue points at a mainnet" must not
-        be flattened into an empty array.
+        Which of the two answers is the operator's policy (:data:`ENV_HISTORY`), and the
+        choice is recorded per address (see :meth:`history_source`) so no caller has to guess
+        afterwards:
+
+        ``chain``  the vault's own ``YieldDistributed`` logs, and nothing else (the default),
+                   because a record that *this address* published is the only one this file
+                   can read without borrowing somebody's word for it;
+        ``feed``   the feed's daily APY history for the entry's name or pinned pool — the
+                   node is not asked at all, which is how a book of real dApp addresses (an
+                   aToken, a Uniswap pool) becomes measurable;
+        ``auto``   the log first, the feed when the log is silent. The address's own record
+                   always wins: it is the only statement about *this* address.
+
+        Never raises on a venue problem: an address the book does not contain, a node that
+        will not answer and a log that will not decode all come back as "nothing published" —
+        which the assessment reads as a protocol to refuse. A *configuration* error is
+        different and does surface, because the difference between "this venue said nothing"
+        and "this venue points at a mainnet" must not be flattened into an empty array.
         """
         key = str(address).lower()
-        if not self.config.book.has(key):
+        entry = self.config.book.get(key)
+        if entry is None:
             return []
+        if str(self.config.history) == HISTORY_FEED:
+            return self._feed_record(entry, steps)
+        record = self._chain_record(key, steps)
+        if record or str(self.config.history) == HISTORY_CHAIN:
+            self._history[key] = RECORD_FROM_CHAIN if record else ""
+            return record
+        # ``auto``: the vault published nothing, so the feed is asked about its name. The
+        # silence is the *fallback's* reason to exist, not a fault — which is why the trade
+        # loop's warning about a quiet book names this switch instead of blaming the node.
+        return self._feed_record(entry, steps)
+
+    def _chain_record(self, key: str, steps: Optional[int] = None) -> List[float]:
+        """The rates the address itself published, decoded from its logs."""
         try:
             self._connect()
             height = self._refresh_block()
@@ -1236,6 +1407,57 @@ class RealTestnetProvider(IWeb3Provider):
         if steps is not None and int(steps) > 0:
             record = record[-int(steps) :]
         return record
+
+    def _feed_source(self) -> Any:
+        """The feed, built once and filtered to this venue's chain.
+
+        One instance per provider, because the object holds the scanner's cache: a cycle that
+        prices four book entries must read the catalogue once, not four times. The chain
+        filter is the feed's own spelling of the chain id (``Arbitrum``), and an id this file
+        does not know filters nothing — the record's label prints the chain either way.
+        """
+        if self._feed is None:
+            from agent.physics.defillama_adapter import FeedHistory, chain_name
+
+            self._feed = FeedHistory(
+                chain=chain_name(self._chain_id or self.config.chain_id or 0)
+            )
+        return self._feed
+
+    def _feed_record(
+        self, entry: ProtocolEntry, steps: Optional[int] = None
+    ) -> List[float]:
+        """The feed's daily history for this entry, as per-step rates.
+
+        Never raises: a feed that cannot be read is a record that is absent and a sentence in
+        :attr:`errors`, because a cycle that died whenever DeFiLlama had a bad morning would
+        be a loop that cannot report the book it *can* read. The pinned ``pool`` uuid wins
+        over the name match, and a uuid the feed cannot chart is not quietly replaced by a
+        name match — the operator stated which pool this vault is.
+        """
+        key = entry.address
+        try:
+            record = self._feed_source().history(
+                entry.name, steps=steps, uuid=entry.pool
+            )
+        except Exception as exc:  # noqa: BLE001 - one entry, one sentence, never a cycle
+            self.errors.append(
+                f"{entry.name}: the feed could not be read ({type(exc).__name__}: {exc})"
+            )
+            self._history[key] = ""
+            return []
+        self._records[key] = record
+        rates = record.rates().tolist() if record else []
+        if not rates:
+            self._history[key] = ""
+            reason = str(getattr(record, "reason", "") or "")
+            self.errors.append(
+                f"{entry.name}: no record from the feed"
+                + (f" — {reason}" if reason else "")
+            )
+            return []
+        self._history[key] = record.label
+        return rates
 
     def _decode(self, key: str, logs: Any) -> List[float]:
         """Turn ``YieldDistributed`` logs into per-epoch rates, in chain order.
@@ -1828,6 +2050,15 @@ class RealTestnetProvider(IWeb3Provider):
 
     # -- what it can say ----------------------------------------------------- #
 
+    def _record_labels(self) -> Dict[str, str]:
+        """``{entry name: where its last record came from}`` — the report's provenance table."""
+        labels: Dict[str, str] = {}
+        for entry in self.config.book:
+            source = self._history.get(entry.address, "")
+            if source:
+                labels[entry.name] = source
+        return labels
+
     def describe(self) -> Dict[str, Any]:
         """The venue as a report line: who, where, what clock, what happened.
 
@@ -1847,6 +2078,8 @@ class RealTestnetProvider(IWeb3Provider):
             "failures": len(self.failures),
             "dry_runs": len(self.dry_runs),
             "book": [entry.name for entry in self.config.book],
+            "history": str(self.config.history),
+            "records": self._record_labels(),
             "config": self.config.describe(),
             "errors": list(self.errors[-5:]),
         }

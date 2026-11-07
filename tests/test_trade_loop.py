@@ -763,9 +763,16 @@ def book_entry(address: str = VAULT, name: str = "Aave V3 USDC") -> Dict[str, An
     return {"address": address, "name": name, "bucket": "active", "decimals": 6}
 
 
-def with_book(venue: FakeVenue, book: Any, lookback: int = 5_000) -> FakeVenue:
+def with_book(
+    venue: FakeVenue,
+    book: Any,
+    lookback: int = 5_000,
+    history: str = "chain",
+) -> FakeVenue:
     """Give a stub the one attribute the diagnostics need: the book it was built from."""
-    venue.config = SimpleNamespace(book=book, lookback=lookback)  # type: ignore[attr-defined]
+    venue.config = SimpleNamespace(  # type: ignore[attr-defined]
+        book=book, lookback=lookback, history=history
+    )
     return venue
 
 
@@ -805,11 +812,17 @@ class BookVenue(FakeVenue):
 
     records: Dict[str, List[float]] = field(default_factory=dict)
     config: Any = None
+    #: Where each address's record came from, the way ``RealTestnetProvider`` answers it:
+    #: ``chain`` for the address's own log, the feed's label otherwise.
+    source: Dict[str, str] = field(default_factory=dict)
 
     def fetch_protocol_history(
         self, address: str, steps: Optional[int] = None
     ) -> List[float]:
         return list(self.records.get(str(address).lower(), ()))
+
+    def history_source(self, address: str) -> str:
+        return self.source.get(str(address).lower(), "")
 
 
 def test_the_book_report_says_which_entry_has_no_record():
@@ -869,3 +882,94 @@ def test_the_cli_reports_the_book_and_runs_no_cycle(monkeypatch, capsys):
     assert "book report" in printed
     assert "empty" in printed
     assert "cycle 1" not in printed   # no cycle was run, and no state file was written
+
+
+# ── a record the feed vouched for: measured, printed, never signed ──────────
+#
+# A book of real dApp addresses publishes no ``YieldDistributed``, so the venue may price an
+# entry from DeFiLlama's history of its *name* (``TESTNET_HISTORY=auto``). That makes the
+# book non-empty and the hunter's verdict real — and it is not evidence that the address
+# implements ``stake(uint256)``, which is the one thing a signature would need.
+
+FEED_LABEL = "the feed aave-v3 USDC (Arbitrum) [d9fa8e]"
+
+
+def test_a_feed_priced_vault_is_measured_and_not_staked():
+    """A PANIC on a name-matched pool is a verdict, and not permission to sign."""
+    venue = BookVenue(published=[vault()], source={VAULT: FEED_LABEL})
+    cycle = trader(venue, signal(), dry_run=False).run_once()
+
+    assert cycle.book[0]["source"] == FEED_LABEL
+    assert cycle.book[0]["implied_apy"] is not None     # it *is* priced
+    action = cycle.actions[0]
+    assert action.kind == "hold"
+    assert action.verdict == "PANIC"                     # the verdict is still printed
+    assert FEED_LABEL in action.reason
+    assert venue.stakes == []                            # and nothing was signed
+
+
+def test_a_record_read_from_the_address_itself_is_still_staked():
+    """The guard is narrow on purpose: the vault's own log is what a stake may be based on."""
+    venue = BookVenue(
+        published=[vault()], source={VAULT: L.RECORD_FROM_CHAIN}
+    )
+    cycle = trader(venue, signal(), dry_run=False).run_once()
+
+    assert cycle.actions[0].kind == "stake"
+    assert venue.stakes and venue.stakes[0][0] == VAULT
+
+
+def test_the_cycle_prints_where_a_record_came_from():
+    venue = BookVenue(published=[vault()], source={VAULT: FEED_LABEL})
+    text = trader(venue, signal()).run_once().summary_text()
+
+    assert "book  Aave V3 USDC" in text
+    assert FEED_LABEL in text
+    assert "signs only into a vault whose record it has read itself" in text
+
+
+def test_a_quiet_book_names_the_switch_that_would_price_it():
+    """"No log" is a diagnosis; the warning also says which variable changes it."""
+    venue = with_book(FakeVenue(published=[]), book_of(book_entry()), history="chain")
+    cycle = trader(venue).run_once()
+
+    assert any("TESTNET_HISTORY=auto" in warning for warning in cycle.warnings), (
+        cycle.warnings
+    )
+
+
+def test_a_feed_that_named_nothing_is_reported_as_such():
+    venue = with_book(FakeVenue(published=[]), book_of(book_entry()), history="auto")
+    cycle = trader(venue).run_once()
+
+    assert any(
+        "TESTNET_HISTORY=auto was asked and named none of these entries" in warning
+        for warning in cycle.warnings
+    ), cycle.warnings
+
+
+def test_the_book_report_shows_a_feed_record_and_says_it_is_not_stakable():
+    venue = BookVenue(
+        published=[], records={VAULT: [0.0001] * 60}, source={VAULT: FEED_LABEL}
+    )
+    with_book(venue, book_of(book_entry()), history="auto")
+    printed: List[str] = []
+
+    assert L._book_report(venue, None, printed.append) == 0
+
+    text = "\n".join(printed)
+    assert "TESTNET_HISTORY=auto" in text
+    assert f"60 record(s) · {FEED_LABEL}" in text
+    assert "not stakable" in text
+    assert "1 of 1 record(s) came from the feed" in text
+
+
+def test_the_book_report_points_at_the_switch_when_the_feed_was_not_asked():
+    venue = BookVenue(published=[], records={})
+    with_book(venue, book_of(book_entry()), history="chain")
+    printed: List[str] = []
+
+    assert L._book_report(venue, None, printed.append) == 4
+    text = "\n".join(printed)
+    assert "the feed was not asked" in text
+    assert "TESTNET_HISTORY=auto" in text

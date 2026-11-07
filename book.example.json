@@ -18,13 +18,25 @@
     "says it per entry, against the live chain and the live market, and exits 4 when",
     "nothing can be priced. Replace them with your own vault once it is deployed.",
     "",
-    "Keys the loader reads: address, name, bucket, claim_apy, decimals, token, note.",
+    "Each entry carries a 'pool' — the DeFiLlama uuid of the pool this address actually",
+    "implements, which is what lets TESTNET_HISTORY=auto (or =feed) price it from the",
+    "feed's own daily history instead of a name guess. Both uuids below were read out of",
+    "https://yields.llama.fi/pools and checked against the address: the Aave row's",
+    "underlyingTokens[0] is the USDC this aToken is a claim on, and the Uniswap row is the",
+    "0.05% WETH-USDC pool this address is (see poolMeta). With 'pool' pinned the entry",
+    "needs no name match at all; without it, 'name' has to be spelled like the pool.",
+    "",
+    "Keys the loader reads: address, name, bucket, claim_apy, decimals, token, note, pool.",
     "  address   0x + 40 hex — the vault. Checked, and lower-cased.",
-    "  name      MUST be spelled like the DeFiLlama pool the hunter measures, or the cycle",
-    "            answers 'the market has no pool named like this vault' and holds.",
+    "  name      the pool's own label: 'project symbol (chain)' exactly as DeFiLlama spells",
+    "            it. The cycle matches a verdict to a vault by this name (normalised: letters",
+    "            and digits), so 'USDC' does NOT match 'aave-v3 USDC (Arbitrum)'.",
     "  bucket    safe | active | experimental (agent.physics.portfolio.BUCKETS).",
     "  decimals  credits per token unit: 6 for USDC, 18 for an 18-decimal token.",
     "  token     the ERC20 the vault pulls on stake(); empty means the built-in default.",
+    "  pool      optional DeFiLlama pool uuid: pins which pool prices this entry, so the",
+    "            feed fallback matches a uuid instead of a label. Empty means 'match the",
+    "            name', which is a heuristic the operator declares by spelling it well.",
     "Keys starting with '_' are ignored by the loader and exist for the reader."
   ],
   "_template_for_your_vault": {
@@ -34,26 +46,29 @@
     "claim_apy": 0.045,
     "decimals": 6,
     "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "pool": "",
     "note": "the vault this loop is allowed to stake into, and nothing else"
   },
   "protocols": [
     {
       "address": "0x724dc807b04555b71ed48a6896b6F41593b8C637",
-      "name": "USDC",
+      "name": "aave-v3 USDC (Arbitrum)",
       "bucket": "active",
       "claim_apy": 0.045,
       "decimals": 6,
       "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-      "note": "Aave V3 Arbitrum aUSDC (aArbUSDCn) — a real address over real USDC, and not a vault of this interface"
+      "pool": "d9fa8e14-0447-4207-9ae8-7810199dfa1f",
+      "note": "Aave V3 Arbitrum aUSDC (aArbUSDCn) — a real address over real USDC, and not a vault of this interface; the pool uuid is DeFiLlama's aave-v3 USDC (Arbitrum)"
     },
     {
       "address": "0xC6962004f452bE9203591991D15f6b388e09E8D0",
-      "name": "USDC-WETH",
+      "name": "uniswap-v3 WETH-USDC (Arbitrum)",
       "bucket": "active",
       "claim_apy": 0.10,
       "decimals": 6,
       "token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-      "note": "Uniswap V3 USDC/WETH 0.05% pool on Arbitrum (read back from the factory's getPool) — also not a vault of this interface"
+      "pool": "a14bd201-764c-40a5-86b8-2928b2461232",
+      "note": "Uniswap V3 USDC/WETH 0.05% pool on Arbitrum (read back from the factory's getPool) — also not a vault of this interface; the pool uuid is DeFiLlama's uniswap-v3 WETH-USDC (Arbitrum, 0.05%)"
     }
   ]
 }

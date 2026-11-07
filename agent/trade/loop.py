@@ -8,7 +8,10 @@ in this order, each of which can stop the cycle:
    (``RealTestnetProvider.get_protocol_list``). This file never chooses an address: a
    venue with an empty book trades nothing, and says why in as many lines as it has
    entries — an empty book and a book of addresses that publish no ``YieldDistributed``
-   are different faults, and the message names the one that happened.
+   are different faults, and the message names the one that happened. A record can also be
+   the *feed's* (``TESTNET_HISTORY=auto``/``feed``), and then it is a fact about a name
+   rather than about the address: this loop prints it and holds, because a signature is
+   the one thing that needs the second kind.
 2. **What does the market say about it?** ``DiscoveryEngine`` reads DeFiLlama, the two
    gates screen it, and ``VolatilityHunter`` measures each approved pool — ``PANIC``,
    ``CALM``, ``THIN``, ``FORMULA``, ``DISHONEST``, ``UNMEASURED``. Those are the verdicts
@@ -60,7 +63,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from agent.physics.real_testnet_provider import YIELD_EVENT_SIGNATURE
+from agent.physics.real_testnet_provider import (
+    ENV_HISTORY,
+    RECORD_FROM_CHAIN,
+    YIELD_EVENT_SIGNATURE,
+)
 from agent.physics.volatility_hunter import PanicSignal
 from agent.trade.capital import Sizing, TradeSize, _flag, size_trade
 
@@ -300,7 +307,11 @@ class Cycle:
             for row in self.book:
                 apy = row.get("implied_apy")
                 shown = "unmeasured" if apy is None else f"{float(apy):+.2%} implied"
-                lines.append(f"   book  {row.get('name', '?'):<24} {shown}")
+                line = f"   book  {row.get('name', '?'):<24} {shown}"
+                source = str(row.get("source") or "")
+                if source and source != RECORD_FROM_CHAIN:
+                    line += f" · {source}"
+                lines.append(line)
         else:
             lines.append("   book  empty — no vault published a record, so nothing is priced")
         if self.market:
@@ -418,7 +429,7 @@ class Trader:
     # -- what it reads ------------------------------------------------------- #
 
     def _book(self, cycle: Cycle) -> List[Any]:
-        """The vaults that have published a record — the only things that can be priced."""
+        """The vaults that have a record — the only things that can be priced."""
         read = getattr(self.venue, "get_protocol_list", None)
         if read is None:  # pragma: no cover - every venue has it; a stub might not
             cycle.warnings.append("the venue answers no get_protocol_list: nothing to price")
@@ -439,16 +450,28 @@ class Trader:
                 points = int(len(record))
             except TypeError:  # a venue that publishes no record at all
                 points = 0
+            address = str(getattr(protocol, "address", ""))
             cycle.book.append(
                 {
                     "name": str(getattr(protocol, "name", "")),
-                    "address": str(getattr(protocol, "address", "")),
+                    "address": address,
                     "points": points,
                     "claim_apy": float(getattr(protocol, "claim_apy", 0.0) or 0.0),
                     "implied_apy": None if apy is None else round(float(apy), 6),
+                    "source": self._record_source(address),
                 }
             )
         return protocols
+
+    def _record_source(self, address: str) -> str:
+        """Where this address's record came from, as the venue says it — ``""`` if it can't.
+
+        ``chain`` is a record read from the address itself; anything else is somebody's
+        statement about a *name* (the feed's label), and the two are never the same thing.
+        A venue that does not answer the question yields ``""``, which is honest: this file
+        will not guess provenance, it will only refuse to sign without it.
+        """
+        return _source_of(self.venue, address)
 
     def _empty_book(self, cycle: Cycle) -> None:
         """Why nothing was priced: no entry at all, or entries that published nothing.
@@ -476,6 +499,21 @@ class Trader:
                 f"{getattr(entry, 'name', '?')} ({getattr(entry, 'address', '?')}): no "
                 f"{YIELD_EVENT_SIGNATURE} log in the last {lookback} blocks — an entry is "
                 "a vault of this interface, not a lending pool's share token"
+            )
+        # The line that turns a diagnosis into an instruction. A venue with a policy of
+        # `chain` has not asked the feed at all, and that is a decision the operator can
+        # reverse with one variable — so the warning says which variable.
+        policy = str(getattr(config, "history", "") or "")
+        if policy in {"", RECORD_FROM_CHAIN}:
+            cycle.warnings.append(
+                f"the feed was not asked: {ENV_HISTORY}=chain prices only a vault's "
+                f"own log — set {ENV_HISTORY}=auto to price these entries from "
+                "DeFiLlama's history of their names, or =feed to ask only the feed"
+            )
+        else:
+            cycle.warnings.append(
+                f"{ENV_HISTORY}={policy} was asked and named none of these entries "
+                "either: a name has to be spelled like the pool you mean (see --book-report)"
             )
 
     def _market(self, cycle: Cycle) -> Any:
@@ -569,6 +607,23 @@ class Trader:
                 verdict=verdict,
                 confidence=confidence,
                 reason=reason or "the hunter refused this pool",
+            )
+        # A record the feed vouched for is a fact about a *name*. The verdict on it is real
+        # and worth printing — and it is not evidence that this address implements
+        # `stake(uint256)`, which is the one thing a signature would need to be true.
+        source = self._record_source(address)
+        if source and source != RECORD_FROM_CHAIN:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                confidence=confidence,
+                reason=(
+                    f"priced from {source}, not from this address's own log: the verdict is "
+                    "about the pool's name, and this loop signs only into a vault whose "
+                    "record it has read itself"
+                ),
             )
         if held is not None:
             return Action(
@@ -863,10 +918,11 @@ def _book_report(
     book = getattr(config, "book", None)
     entries = list(book) if book is not None else []
     lookback = int(getattr(config, "lookback", 0) or 0)
+    policy = str(getattr(config, "history", "") or "(unset → chain)")
     chain = getattr(venue, "chain_id", 0) or "?"
     printer(
         f"book report — {len(entries)} entry/entries · lookback {lookback} blocks · "
-        f"chain {chain}"
+        f"chain {chain} · {ENV_HISTORY}={policy}"
     )
     if not entries:
         printer("  empty — no address is listed, so nothing can be priced or staked")
@@ -887,6 +943,7 @@ def _book_report(
             )
 
     published = 0
+    priced_from_feed = 0
     for entry in entries:
         name = str(getattr(entry, "name", ""))
         address = str(getattr(entry, "address", ""))
@@ -901,6 +958,9 @@ def _book_report(
             except Exception as exc:  # noqa: BLE001 - the line is the report
                 note = f"the record could not be read ({type(exc).__name__}: {exc})"
         published += 1 if records else 0
+        source = _source_of(venue, address)
+        foreign = bool(source) and source != RECORD_FROM_CHAIN
+        priced_from_feed += 1 if foreign else 0
         signal = index.get(_normalise(name))
         if market is None:
             verdict = "market off"
@@ -912,18 +972,64 @@ def _book_report(
         else:
             verdict = "no pool in the report is named like this vault"
         if records:
-            record = f"{records} record(s)"
+            where = f" · {source}" if source else ""
+            record = f"{records} record(s){where}"
         else:
-            record = "no record" + (f" — {note}" if note else "")
+            why = note or _note_of(venue, address)
+            record = "no record" + (f" — {why}" if why else "")
         printer(f"  {name:<24} {address}  {record}")
+        if foreign:
+            printer(
+                f"  {'':<24} not stakable as-is: the record above is the feed's about this "
+                "name, and this loop signs only into a vault whose own log it has read"
+            )
         printer(f"  {'':<24} market: {verdict}")
     if not published:
+        if policy in {"", "(unset → chain)", RECORD_FROM_CHAIN}:
+            printer(
+                f"  nothing to price: an entry has to emit {YIELD_EVENT_SIGNATURE} "
+                "(and a cycle has to see it inside the lookback window) before the hunter "
+                "can measure it"
+            )
+            printer(
+                f"  the feed was not asked — {ENV_HISTORY}=auto prices an entry from "
+                "DeFiLlama's daily history of its name when the vault itself published "
+                "nothing, and =feed asks only the feed"
+            )
+        else:
+            printer(
+                "  nothing to price: no entry has a record — the feed named no pool for "
+                "these names (or published no series for the pool they pin), and no vault "
+                f"emitted {YIELD_EVENT_SIGNATURE} inside the lookback window"
+            )
+    elif priced_from_feed:
         printer(
-            f"  nothing to price: an entry has to emit {YIELD_EVENT_SIGNATURE} "
-            "(and a cycle has to see it inside the lookback window) before the hunter "
-            "can measure it"
+            f"  {priced_from_feed} of {published} record(s) came from the feed, not from an "
+            "address's own log: measured, and deliberately not staked"
         )
     return 0 if published else 4
+
+
+def _source_of(venue: Any, address: str) -> str:
+    """Where the venue says this address's record came from, or ``""`` if it cannot say."""
+    read = getattr(venue, "history_source", None)
+    if read is None:
+        return ""
+    try:
+        return str(read(address) or "")
+    except Exception:  # noqa: BLE001 - a report line is not worth an exception
+        return ""
+
+
+def _note_of(venue: Any, address: str) -> str:
+    """The venue's own sentence about why an entry has no record."""
+    read = getattr(venue, "history_note", None)
+    if read is None:
+        return ""
+    try:
+        return str(read(address) or "")
+    except Exception:  # noqa: BLE001 - same rule as above
+        return ""
 
 
 def _venue_from_env() -> Any:

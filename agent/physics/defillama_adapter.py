@@ -70,6 +70,21 @@ adapter quietly shrinks the world and the funnel reports a smaller, cleaner mark
 flight at once) and, if the host keeps asking, that pool is skipped *by name* like any other
 unreadable one.
 
+A name is not an address, and the bridge has to say so
+=====================================================
+
+The funnel reads *pools*, and a pool is a uuid. A trading loop holds an *address book*, and
+an address is a vault. Between the two there is exactly one seam, and it is a **name**:
+:class:`FeedHistory` turns a book entry's name (``USDC``, ``Aave V3 USDC (Arbitrum)``) into
+the daily APY series of the pool that carries it, so a venue whose own
+``YieldDistributed`` logs are silent can still be measured against history the market
+actually published. The match is stated and counted, never assumed: four degrees of
+evidence (an exact symbol, the whole label, a symbol that carries the name, a name that
+carries the symbol), ties broken by depth, and a name nothing carries answers a record with
+no series *and* the reason. A uuid can be pinned by the operator instead, which removes the
+guesswork entirely — :class:`FeedRecord` then says which pool answered, so a report can print
+"priced from the feed" and never confuse it with "the vault paid it".
+
 Nothing here signs, stakes or withdraws: there is no key, no ABI and no transaction in this
 file, and :class:`DiscoveryEngine` deliberately has no method that could move a credit.
 """
@@ -115,8 +130,11 @@ __all__ = [
     "BACKOFF",
     "CACHE_DIR",
     "CACHE_TTL",
+    "CHAIN_NAMES",
     "CHART_URL",
     "DEFAULT_TIMEOUT",
+    "FeedHistory",
+    "FeedRecord",
     "MAX_MISSING_SHARE",
     "MIN_HISTORY",
     "MIN_TVL_USD",
@@ -130,6 +148,7 @@ __all__ = [
     "USER_AGENT",
     "VENUE_NAME",
     "WATCH_LIMIT",
+    "WHOLE_CATALOGUE",
     "WORKERS",
     "DefiLlamaError",
     "DefiLlamaMarket",
@@ -141,6 +160,7 @@ __all__ = [
     "PoolRow",
     "apy_to_rate",
     "bucket_for",
+    "chain_name",
     "clean_series",
     "entrain_windows",
     "main",
@@ -195,6 +215,27 @@ MAX_MISSING_SHARE = 0.25
 #: belongs to the *feed's* calendar, and an adapter that changed venues would have to say
 #: so rather than inherit a constant that happens to match.
 STEPS_PER_YEAR = 365
+
+#: The chain ids this file can spell the way the *feed* spells them, so that a venue which
+#: knows it is chain 42161 can ask for ``Arbitrum`` pools and nothing else. Four entries, not
+#: a registry: these are the chains the trading venue ships a profile for, and an id that is
+#: missing here is answered with ``""`` — "no filter" — rather than with a guess, because a
+#: wrong chain filter would price a vault against a pool on somebody else's network.
+CHAIN_NAMES: Dict[int, str] = {
+    1: "Ethereum",
+    137: "Polygon",
+    8453: "Base",
+    42161: "Arbitrum",
+    11155111: "Sepolia",
+}
+
+
+def chain_name(chain_id: Any) -> str:
+    """The feed's spelling of a chain id, or ``""`` when this file does not know it."""
+    try:
+        return CHAIN_NAMES.get(int(chain_id or 0), "")
+    except (TypeError, ValueError):
+        return ""
 
 #: The fewest points a pool must publish before it is worth a :class:`Protocol` at all:
 #: two, because a spread needs two numbers. The scanner has its own, higher floor
@@ -506,6 +547,144 @@ class PoolFrame:
             "uuid": self.uuid,
             "points": len(self),
             "missing": int(self.missing),
+        }
+
+
+# ── a name, priced from the feed ────────────────────────────────────────────
+
+
+def _words(value: object) -> str:
+    """A name as comparable words: lower case, letters and digits only.
+
+    The same normalisation the trading loop applies to a vault's name, repeated here on
+    purpose: this file has to answer "which pool is this name" on its own, and a resolver
+    that borrowed the loop's helper would not be importable by a notebook that has no loop.
+    """
+    return "".join(
+        character for character in str(value or "").lower() if character.isalnum()
+    )
+
+
+def _pieces(value: object) -> frozenset:
+    """A name as a set of words — ``USDC-WETH`` and ``WETH-USDC`` are the same pair.
+
+    The second normalisation, and it exists because the venue spells pairs in its own order:
+    ``symbol`` is what the project called it, and an operator writing ``USDC-WETH`` should not
+    have to know that the feed wrote ``WETH-USDC``. Tokens of one character are dropped —
+    they make every name match every other name.
+    """
+    text = str(value or "")
+    return frozenset(
+        token
+        for token in "".join(
+            character if character.isalnum() else " " for character in text.lower()
+        ).split()
+        if len(token) > 1
+    )
+
+
+def _rank(name: object, row: PoolRow) -> Optional[int]:
+    """How well a catalogue row carries a name; ``None`` when it does not carry it at all.
+
+    Five degrees of evidence, and the order is the whole rule — a lower number is a better
+    match:
+
+    ``0``  the symbol *is* the name (``USDC`` → the pool whose symbol is ``USDC``);
+    ``1``  the whole label is the name (``project symbol (chain)``, normalised) — the way a
+           careful operator spells an entry;
+    ``2``  the symbol is the same *set of words* (``USDC-WETH`` → ``WETH-USDC``: the same
+           pair, spelled the way the project spelled it);
+    ``3``  the symbol carries the name (``USDC`` → ``USDC-WETH``: a pair that holds it);
+    ``4``  the name carries the symbol (``Aave V3 USDC`` → ``USDC``: a vault named after its
+           token, which is how most real vaults are named).
+
+    Anything else is not a match, and is not turned into one: the caller reports the
+    absence, because a nearest-neighbour guess here is a measurement of a different pool
+    wearing this one's name.
+    """
+    wanted = _words(name)
+    symbol = _words(row.symbol)
+    if not wanted or not symbol:
+        return None
+    if symbol == wanted:
+        return 0
+    if _words(row.project) + symbol + _words(row.chain) == wanted:
+        return 1
+    words = _pieces(row.symbol)
+    if len(words) > 1 and words == _pieces(name):
+        return 2
+    if wanted in symbol:
+        return 3
+    if symbol in wanted or _words(row.project) + symbol == wanted:
+        return 4
+    return None
+
+
+@dataclass(frozen=True)
+class FeedRecord:
+    """A *name*, priced from the feed: the pool that answered, and the series it published.
+
+    Deliberately not a :class:`agent.physics.portfolio.Protocol`. A ``Protocol`` asserts that
+    an *address* published a record; here the address published nothing and the record is the
+    feed's statement about a **name**. Keeping the two apart is what lets a report say
+    "priced from the feed, not from this address's log" — and lets a loop refuse to sign into
+    a vault whose own record it has never read, while still measuring a real market.
+
+    ``matched`` counts the pools that carried the name as well as the one that won, because
+    "the only pool called this" and "the deepest of nine called this" are different amounts
+    of evidence and the report prints the difference. ``reason`` carries the feed's own
+    sentence when there is no series.
+    """
+
+    name: str
+    uuid: str = ""
+    pool: str = ""
+    symbol: str = ""
+    project: str = ""
+    chain: str = ""
+    apy: Tuple[float, ...] = ()
+    missing: int = 0
+    matched: int = 0
+    #: True when the operator's book named the uuid, so nothing was matched and nothing is
+    #: claimed about the pool's label: a report says so rather than looking it up.
+    pinned: bool = False
+    reason: str = ""
+
+    def __len__(self) -> int:
+        return len(self.apy)
+
+    def __bool__(self) -> bool:
+        """True when there is enough of a series to be a record at all."""
+        return len(self.apy) >= MIN_HISTORY
+
+    @property
+    def label(self) -> str:
+        """What a report prints as the provenance: the pool, the chain, enough uuid to find."""
+        if not self.uuid:
+            return "the feed (no pool matched)"
+        if self.pinned and not self.pool:
+            return f"the feed pool [{self.uuid[:8]}] (pinned by the book)"
+        who = f" {self.pool}" if self.pool else ""
+        base = f"the feed{who} [{self.uuid[:6]}]"
+        # How many pools carried the name is part of the answer: "the deepest of forty-one
+        # called USDC" and "the only pool called this" are different amounts of evidence.
+        return f"{base} (deepest of {self.matched})" if self.matched > 1 else base
+
+    def rates(self, steps_per_year: int = STEPS_PER_YEAR) -> np.ndarray:
+        """The APY series as per-step returns — the units the funnel's arithmetic is in."""
+        return to_returns(self.apy, int(steps_per_year))
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "uuid": self.uuid,
+            "pool": self.pool,
+            "chain": self.chain,
+            "points": len(self.apy),
+            "missing": int(self.missing),
+            "matched": int(self.matched),
+            "pinned": bool(self.pinned),
+            "reason": self.reason,
         }
 
 
@@ -915,6 +1094,150 @@ class DefiLlamaScanner:
             skipped=tuple(skipped),
             fetched_at=time.time(),
             warnings=tuple(self.warnings),
+        )
+
+
+#: How many catalogue rows a *name* is resolved against: all of them. The funnel's
+#: two hundred is a budget for reading **histories** (one request per pool); a lookup costs
+#: nothing per row, and truncating the catalogue to the two hundred deepest pools would make
+#: a $36 M Arbitrum pool unfindable because Ethereum holds the top two hundred. This is a
+#: number rather than ``len(rows)`` only because ``get_top_pools`` takes a bound.
+WHOLE_CATALOGUE = 1_000_000
+
+
+@dataclass
+class FeedHistory:
+    """A *name* → the pool it denotes, and that pool's published series.
+
+    The one seam between an address book and the feed. A venue that reads a chain knows the
+    address and the label; the feed knows the label and a uuid; this class answers the
+    question "what does this label earn" and says how it answered. Three rules, and each one
+    is a place an adapter could have invented a measurement:
+
+    **A match is evidence, not a similarity.** :func:`_rank` orders five kinds of evidence,
+    and only those five count — the last of them is the same *set* of words, which is how
+    ``USDC-WETH`` finds the pool the project spelled ``WETH-USDC``. Among equals the
+    *deepest* pool wins (``tvlUsd``), because a book entry that names a stablecoin means the
+    pool with an exit; ``matched`` reports how many tied, so a report can print "the deepest
+    of nine". A name nothing carries gets a :class:`FeedRecord` with no series and a
+    sentence — never the nearest pool.
+
+    **A chain is a filter, not a preference.** ``chain`` is spelled the way the feed spells
+    it (``Arbitrum``); when set, only pools on that chain are candidates, and a name that
+    exists only elsewhere is reported with the chains it *does* exist on. An empty ``chain``
+    filters nothing, which is the honest answer for a venue whose chain id this file does not
+    know.
+
+    **A short or gappy series is refused by the scanner, not padded here.** Every point comes
+    from ``/chart/{uuid}`` through :meth:`DefiLlamaScanner.fetch_pool_history`, so
+    :data:`MAX_MISSING_SHARE` and :data:`MIN_HISTORY` apply exactly as they do to the funnel,
+    and a pool the feed cannot chart is a record with a reason.
+    """
+
+    scanner: DefiLlamaScanner = field(default_factory=DefiLlamaScanner)
+    chain: str = ""
+    limit: int = WHOLE_CATALOGUE
+
+    # -- finding ------------------------------------------------------------ #
+
+    def candidates(
+        self, name: str, *, refresh: bool = False
+    ) -> Tuple[List[Tuple[int, PoolRow]], List[PoolRow]]:
+        """``(ranked, everything)`` — the candidates for a name and the whole catalogue.
+
+        The catalogue is read once and both lists come from it, so asking "did this name
+        exist on another chain" costs no second request (a warm cache answers it for free).
+        """
+        rows = list(self.scanner.get_top_pools(int(self.limit), refresh=refresh))
+        ranked: List[Tuple[int, PoolRow]] = []
+        if _words(name):
+            for row in rows:
+                rank = _rank(name, row)
+                if rank is not None:
+                    ranked.append((rank, row))
+        return ranked, rows
+
+    def find(
+        self, name: str, *, refresh: bool = False
+    ) -> Tuple[Optional[PoolRow], int]:
+        """The pool this name denotes, and how many pools tied for it on this chain."""
+        ranked, _ = self.candidates(name, refresh=refresh)
+        if self.chain:
+            ranked = [
+                (rank, row)
+                for rank, row in ranked
+                if _words(row.chain) == _words(self.chain)
+            ]
+        if not ranked:
+            return None, 0
+        best = min(rank for rank, _ in ranked)
+        tied = [(rank, row) for rank, row in ranked if rank == best]
+        # The deepest of the pools that carry the name: a book entry that names a token means
+        # the pool with an exit, and the tie count travels with the answer.
+        tied.sort(key=lambda item: -float(item[1].tvl_usd))
+        return tied[0][1], len(tied)
+
+    # -- pricing ------------------------------------------------------------ #
+
+    def history(
+        self,
+        name: str,
+        *,
+        steps: Optional[int] = None,
+        uuid: str = "",
+        refresh: bool = False,
+    ) -> FeedRecord:
+        """The series this name is priced at — or a record that says why there is none.
+
+        ``uuid`` pins the pool and removes the name match entirely: an operator who knows
+        which pool a vault implements should say so rather than hope that a label resolves.
+        A pinned uuid the feed cannot chart is *still* a record with no series and the feed's
+        own reason, never a fall-back to the name match — a fallback would mean the
+        operator's declaration had been quietly replaced by a similarity.
+        """
+        label = str(name or "")
+        pinned = str(uuid or "").strip()
+        row: Optional[PoolRow] = None
+        matched = 0
+        if not pinned:
+            row, matched = self.find(label, refresh=refresh)
+            pinned = str(row.uuid) if row is not None else ""
+        if not pinned:
+            return FeedRecord(
+                name=label, matched=int(matched), reason=self._miss(label, refresh=refresh)
+            )
+
+        before = len(self.scanner.warnings)
+        apy = self.scanner.fetch_pool_history(pinned, refresh=refresh)
+        said = self.scanner.warnings[before:]
+        if steps is not None and int(steps) > 0:
+            apy = tuple(apy[-int(steps) :])
+        return FeedRecord(
+            name=label,
+            uuid=pinned,
+            pinned=row is None,
+            pool=row.name if row is not None else "",
+            symbol=row.symbol if row is not None else "",
+            project=row.project if row is not None else "",
+            chain=row.chain if row is not None else "",
+            apy=tuple(apy),
+            matched=int(matched),
+            reason="" if apy else (said[-1] if said else "the feed published no history"),
+        )
+
+    def _miss(self, name: str, *, refresh: bool = False) -> str:
+        """Why a name has no pool: nothing carries it, or nothing carries it *here*."""
+        reason = "no pool in the catalogue carries this name"
+        if not self.chain:
+            return reason
+        ranked, _ = self.candidates(name, refresh=refresh)
+        elsewhere = [row for _, row in ranked if _words(row.chain) != _words(self.chain)]
+        if not elsewhere:
+            return reason
+        chains = sorted({row.chain for row in elsewhere})
+        return (
+            f"{len(elsewhere)} pool(s) carry this name and none of them is on "
+            f"{self.chain} ({', '.join(chains[:3])})"
         )
 
 

@@ -39,6 +39,7 @@ import pytest
 
 from agent.physics import portfolio as P
 from agent.physics import real_testnet_provider as T
+from agent.physics.defillama_adapter import apy_to_rate as feed_rate
 from agent.physics.interfaces import IWeb3Provider
 
 #: Aliased away from ``Test*`` so pytest does not try to collect them as test classes.
@@ -1397,3 +1398,225 @@ def test_a_token_read_that_fails_keeps_the_gas_number(provider, world):
     assert balance.native_eth == pytest.approx(0.008)
     assert balance.token_balance == 0.0
     assert "token balance" in balance.error
+
+
+# ── the second source of a record: the feed, and only when it is allowed ────
+#
+# A real market's addresses publish no ``YieldDistributed``: an aToken, a Uniswap pool and
+# a Curve gauge all report yield in their own events. The venue's answer is a *policy*
+# (``TESTNET_HISTORY``) with three settings, and what these tests pin down is that the
+# policy is obeyed exactly — the log wins in ``auto``, the node is not asked in ``feed``,
+# and a feed-priced record is never presented as the address's own.
+
+#: Sixty days at 0.02 % — a plausible daily APY series (about 7.5 % a year).
+FEED_APYS = [0.02] * 60
+
+
+class FakeFeed:
+    """A feed that answers from a dict and remembers exactly what it was asked.
+
+    The real collaborator is :class:`agent.physics.defillama_adapter.FeedHistory`; this
+    double keeps the same three-argument call and returns the same
+    ``FeedRecord``, so the provider's handling of a label, a series and a reason is the
+    code under test rather than the double's.
+    """
+
+    def __init__(
+        self,
+        apys: Optional[List[float]] = None,
+        *,
+        pool: str = "aave-v3 USDC (Arbitrum)",
+        uuid: str = "d9fa8e14-0447-4207-9ae8-7810199dfa1f",
+        reason: str = "",
+    ) -> None:
+        self.apys = list(FEED_APYS if apys is None else apys)
+        self.pool = pool
+        self.uuid = uuid
+        self.reason = reason
+        self.calls: List[Dict[str, Any]] = []
+
+    def history(
+        self, name: str, *, steps: Optional[int] = None, uuid: str = ""
+    ) -> Any:
+        from agent.physics.defillama_adapter import FeedRecord
+
+        self.calls.append({"name": str(name), "steps": steps, "uuid": str(uuid)})
+        apys = self.apys[-int(steps) :] if steps and int(steps) > 0 else self.apys
+        return FeedRecord(
+            name=str(name),
+            uuid=self.uuid if apys else "",
+            pool=self.pool if apys else "",
+            apy=tuple(apys),
+            reason="" if apys else (self.reason or "the feed published no history"),
+        )
+
+
+class DeadNode:
+    """A node that raises on every read: what ``TESTNET_HISTORY=feed`` must not need."""
+
+    class eth:  # noqa: N801 - a namespace, not a class anyone instantiates
+        @property
+        def block_number(self) -> int:
+            raise RuntimeError("the node is down")
+
+        @property
+        def chain_id(self) -> int:
+            raise RuntimeError("the node is down")
+
+
+def test_the_default_policy_is_the_vault_s_own_log(world):
+    """Nothing changes for a vault that publishes: the feed is not asked at all."""
+    feed = FakeFeed()
+    quiet = RealTestnetProvider(env=venue_env(), web3=FakeWeb3(world), feed=feed)
+
+    assert quiet.config.history == T.DEFAULT_HISTORY == T.HISTORY_CHAIN
+    assert quiet.fetch_protocol_history(VAULT) == pytest.approx([0.0004] * 8)
+    assert feed.calls == []
+    assert quiet.history_source(VAULT) == T.RECORD_FROM_CHAIN
+
+
+def test_auto_keeps_the_address_s_own_record_when_there_is_one(world):
+    """A native record is about *this* address; a name match is not. The log wins."""
+    feed = FakeFeed()
+    venue = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "auto"}), web3=FakeWeb3(world), feed=feed
+    )
+
+    assert venue.fetch_protocol_history(VAULT) == pytest.approx([0.0004] * 8)
+    assert feed.calls == []
+
+
+def test_feed_policy_does_not_need_a_node_at_all():
+    """The feed is the other wire: a dead RPC must not stop the record being read."""
+    feed = FakeFeed()
+    venue = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "feed"}), web3=DeadNode(), feed=feed
+    )
+
+    record = venue.fetch_protocol_history(VAULT)
+
+    assert len(record) == len(FEED_APYS)
+    assert venue.errors == []  # the node was not even asked
+    assert feed.calls
+
+
+def test_a_feed_priced_record_is_published_with_its_provenance(world):
+    """The protocol exists, is measured, and its note says who vouched for it."""
+    world.logs = []
+    feed = FakeFeed()
+    venue = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "auto"}), web3=FakeWeb3(world), feed=feed
+    )
+
+    published = venue.get_protocol_list()
+
+    assert len(published) == 1
+    protocol = published[0]
+    assert protocol.returns.size == len(FEED_APYS)
+    assert "a test vault" in protocol.note  # the operator's own note survives
+    assert "record from the feed aave-v3 USDC (Arbitrum)" in protocol.note
+    assert "this address published no log" in protocol.note
+    assert venue.describe()["records"]["VaultA"].startswith("the feed")
+    assert venue.describe()["history"] == "auto"
+
+
+def test_an_entry_can_pin_which_pool_prices_it(world):
+    """``pool`` in the book is the operator's declaration, and it reaches the feed."""
+    feed = FakeFeed()
+    entry = {**book_payload()["protocols"][0], "pool": "pinned-uuid"}
+    book = ProtocolBook.from_payload({"protocols": [entry]})
+    venue = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "feed"}),
+        web3=FakeWeb3(world),
+        book=book,
+        feed=feed,
+    )
+
+    venue.fetch_protocol_history(VAULT)
+
+    assert feed.calls[-1]["uuid"] == "pinned-uuid"
+    assert feed.calls[-1]["name"] == "VaultA"
+
+
+def test_a_pool_that_is_not_a_uuid_is_refused_by_name():
+    entry = {**book_payload()["protocols"][0], "pool": "two words"}
+    with pytest.raises(NetNotConfigured) as raised:
+        ProtocolBook.from_payload({"protocols": [entry]})
+    assert "not a pool uuid" in str(raised.value)
+
+
+def test_a_name_the_feed_does_not_know_is_no_record_and_a_reason(world):
+    """A feed with nothing to say is an absence with a sentence, not a zero."""
+    world.logs = []
+    feed = FakeFeed(apys=[], reason="no pool in the catalogue carries this name")
+    venue = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "auto"}), web3=FakeWeb3(world), feed=feed
+    )
+
+    assert venue.fetch_protocol_history(VAULT) == []
+    assert venue.get_protocol_list() == []
+    assert venue.history_source(VAULT) == ""
+    assert any(
+        "no record from the feed" in line and "catalogue" in line for line in venue.errors
+    )
+
+
+def test_a_feed_that_raises_is_a_sentence_and_not_a_cycle(world):
+    """A bad morning at DeFiLlama must not be able to kill a trading cycle."""
+
+    class Broken:
+        def history(self, name: str, **kwargs: Any) -> Any:
+            raise RuntimeError("the feed answered HTTP 503")
+
+    venue = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "feed"}), web3=FakeWeb3(world), feed=Broken()
+    )
+
+    assert venue.fetch_protocol_history(VAULT) == []
+    assert any("the feed could not be read" in line for line in venue.errors)
+
+
+def test_steps_takes_the_tail_of_the_feed_series(world):
+    world.logs = []
+    feed = FakeFeed()
+    venue = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "auto"}), web3=FakeWeb3(world), feed=feed
+    )
+
+    assert len(venue.fetch_protocol_history(VAULT, steps=5)) == 5
+    assert feed.calls[-1]["steps"] == 5
+
+
+def test_an_unknown_history_policy_is_a_named_error():
+    with pytest.raises(NetNotConfigured) as raised:
+        RealTestnetProvider(env=venue_env(**{T.ENV_HISTORY: "oracle"}))
+    message = str(raised.value)
+    assert T.ENV_HISTORY in message and "oracle" in message
+    for source in (T.HISTORY_CHAIN, T.HISTORY_FEED, T.HISTORY_AUTO):
+        assert source in message
+
+
+def test_the_policy_is_printed_by_the_venue(provider):
+    line = provider.describe()
+    assert line["history"] == T.DEFAULT_HISTORY
+    assert line["config"]["history"] == T.DEFAULT_HISTORY
+    assert T.ENV_HISTORY == "TESTNET_HISTORY"
+
+
+def test_auto_prices_a_silent_vault_from_the_feed(world):
+    """The whole point: no log, and the book still gets a record with real history."""
+    world.logs = []
+    feed = FakeFeed()
+    quiet = RealTestnetProvider(
+        env=venue_env(**{T.ENV_HISTORY: "auto"}), web3=FakeWeb3(world), feed=feed
+    )
+
+    record = quiet.fetch_protocol_history(VAULT)
+
+    assert len(record) == len(FEED_APYS)
+    # the APYs arrive as the per-step rates that compound back to them
+    assert record[0] == pytest.approx(feed_rate(0.02))
+    assert feed.calls == [{"name": "VaultA", "steps": None, "uuid": ""}]
+    assert quiet.history_source(VAULT).startswith("the feed aave-v3 USDC (Arbitrum)")
+    assert quiet.history_source(VAULT) != T.RECORD_FROM_CHAIN
+

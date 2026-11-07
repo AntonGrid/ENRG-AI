@@ -561,3 +561,126 @@ def test_the_report_is_json_able_and_adds_up(two_pools):
     assert body["approved"] + body["refused"] + body["unmeasured"] == body["watchlist"]
     assert body["market"] == body["watchlist"] + body["refused_by_scanner"]
     assert math.isclose(body["elapsed"], body["elapsed"])  # a number, not NaN
+
+
+# ── a name, priced from the feed: the seam between a book and a market ──────
+#
+# The venue holds an address and a label; the feed holds a label and a uuid. These tests
+# pin down the bridge — which pool a name denotes, what happens when two do, and what is
+# said when none does — because this is the one place where a careless adapter could hand
+# the funnel one pool's history under another pool's name.
+
+A_USDC = "aaaaaa01-0000-0000-0000-000000000000"
+ANOTHER_USDC = "bbbbbb02-0000-0000-0000-000000000000"
+ETH_USDC = "eeeeee03-0000-0000-0000-000000000000"
+WETH_USDC = "dddddd04-0000-0000-0000-000000000000"
+
+
+def row(project, symbol, chain, tvl, apy, pool):
+    """One ``/pools`` row, with only the fields the resolver reads."""
+    return {
+        "chain": chain,
+        "project": project,
+        "symbol": symbol,
+        "tvlUsd": float(tvl),
+        "apy": float(apy),
+        "pool": pool,
+    }
+
+
+def catalogue():
+    """Two pools called USDC on Arbitrum, a deeper one on Ethereum, and one pair."""
+    return {
+        "status": "success",
+        "data": [
+            row("aave-v3", "USDC", "Arbitrum", 5.0e8, 3.0, A_USDC),
+            row("compound-v3", "USDC", "Arbitrum", 1.0e7, 2.0, ANOTHER_USDC),
+            row("aave-v3", "USDC", "Ethereum", 9.0e8, 4.0, ETH_USDC),
+            row("uniswap-v3", "WETH-USDC", "Arbitrum", 3.0e7, 12.0, WETH_USDC),
+        ],
+    }
+
+
+def resolver(*, chain="Arbitrum", series=None, limit=200) -> A.FeedHistory:
+    """A resolver over a mocked wire; nothing here reaches the network."""
+    catalogue_ = catalogue()
+    charts = {A_USDC: noisy(3.0), WETH_USDC: noisy(12.0)} if series is None else series
+    scan = A.DefiLlamaScanner(
+        transport=wire(catalogue_, charts), use_cache=False, timeout=1.0
+    )
+    return A.FeedHistory(scanner=scan, chain=chain, limit=int(limit))
+
+
+def test_a_name_resolves_to_the_deepest_pool_that_carries_it():
+    """"USDC" is an exact symbol on three pools; the deepest one on *this* chain wins."""
+    pool, matched = resolver().find("USDC")
+
+    assert pool is not None
+    assert pool.uuid == A_USDC and pool.chain == "Arbitrum"
+    assert matched == 2  # two Arbitrum pools carry it; Ethereum's does not count
+
+
+def test_the_chain_filter_is_the_feed_s_spelling_of_a_chain_id():
+    assert A.chain_name(42161) == "Arbitrum"
+    assert A.chain_name(0) == "" and A.chain_name(None) == ""
+    assert A.chain_name(999_999) == ""  # unknown: no filter rather than a guess
+
+
+def test_a_pool_that_s_published_history_is_the_series_it_published():
+    record = resolver().history("USDC")
+
+    assert record
+    assert record.uuid == A_USDC and record.pool == "aave-v3 USDC (Arbitrum)"
+    assert len(record) == LONG
+    # the APYs are converted, not copied: the record compounds back to what was published
+    assert float(record.rates()[0]) == pytest.approx(A.apy_to_rate(record.apy[0]))
+
+
+def test_a_name_no_pool_carries_is_a_reason_and_not_a_neighbour():
+    record = resolver().history("NOPE")
+
+    assert not record and record.uuid == "" and record.apy == ()
+    assert "no pool in the catalogue carries this name" in record.reason
+    assert not record.as_dict()["points"]
+
+
+def test_a_pair_is_matched_whatever_order_it_is_spelled_in():
+    """The project writes ``WETH-USDC``; the operator wrote ``USDC-WETH``. Same pool."""
+    pool, matched = resolver().find("USDC-WETH")
+
+    assert pool is not None and pool.uuid == WETH_USDC
+    assert matched == 1
+    # and the same pool is not what a *single* token means: "USDC" stays the exact symbol
+    assert resolver().find("USDC")[0].uuid == A_USDC
+
+
+def test_a_name_that_exists_only_on_another_chain_says_where_it_lives():
+    record = resolver(chain="Polygon").history("USDC")
+
+    assert not record
+    assert "none of them is on Polygon" in record.reason
+    assert "Arbitrum" in record.reason  # the chains it *does* exist on are named
+
+
+def test_an_operator_can_pin_the_pool_and_the_name_is_not_consulted():
+    """The uuid in the book wins: no match, no guessing, no fall-back."""
+    record = resolver(series={WETH_USDC: noisy(12.0)}).history("USDC", uuid=WETH_USDC)
+
+    assert record.uuid == WETH_USDC
+    assert record.pool == ""  # nothing was looked up, so nothing is claimed
+    assert record.label == "the feed pool [dddddd04] (pinned by the book)"
+    assert record.pinned
+
+
+def test_a_pinned_pool_the_feed_cannot_chart_is_a_reason_not_a_name_match():
+    record = resolver().history("USDC", uuid=ETH_USDC)
+
+    assert not record and record.uuid == ETH_USDC
+    assert "no such pool" in record.reason or "HTTP 500" in record.reason
+
+
+def test_a_tail_of_the_published_series_can_be_asked_for():
+    record = resolver().history("USDC", steps=3)
+    assert len(record) == 3
+    assert record.apy == resolver().history("USDC").apy[-3:]
+
