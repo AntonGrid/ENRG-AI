@@ -104,6 +104,22 @@ class World:
         self.height = 100
         self.chain = SEPOLIA
         self.gas_price = 7
+        #: The block's ``baseFeePerGas``. ``None`` is a pre-1559 chain: the provider then
+        #: prices by ``gas_price``. A number is an EIP-1559 chain, which is the shape of
+        #: every chain this venue has actually signed on.
+        self.base_fee: Optional[int] = None
+        #: What ``eth_maxPriorityFeePerGas`` suggests; ``None`` means the call raises, which
+        #: is how an older node behaves and what the fallback-to-zero is for.
+        self.priority_fee: Optional[int] = 0
+        #: The base fee a *later* read sees — the drift between the estimate and the
+        #: sequencer's check, which is the whole reason a fee needs a buffer.
+        self.base_fee_rise_to: Optional[int] = None
+        #: How many times the base fee has been asked for, so ``base_fee_rise_to`` can
+        #: answer the first read with the old number and every later one with the new.
+        self.base_fee_reads = 0
+        #: A node that refuses the raw transaction (a fee below the base fee, a bad
+        #: signature, a paused sequencer) — raised by ``send_raw_transaction``.
+        self.send_error: Optional[Exception] = None
         self.nonce = 0
         self.gas = 51_000
         self.logs: List[Dict[str, Any]] = []
@@ -241,6 +257,20 @@ class FakeEth:
     def gas_price(self) -> int:
         return int(self._world.gas_price)
 
+    @property
+    def max_priority_fee(self) -> int:
+        if self._world.priority_fee is None:
+            raise AttributeError("eth_maxPriorityFeePerGas is not available")
+        return int(self._world.priority_fee)
+
+    def get_block(self, block: Any = "latest") -> Dict[str, Any]:
+        self._world.base_fee_reads += 1
+        if self._world.base_fee is None:
+            return {}
+        if self._world.base_fee_rise_to is not None and self._world.base_fee_reads > 1:
+            return {"number": self._world.height, "baseFeePerGas": self._world.base_fee_rise_to}
+        return {"number": self._world.height, "baseFeePerGas": int(self._world.base_fee)}
+
     def get_transaction_count(self, address: str, block: str = "latest") -> int:
         self._world.counts.append((str(address), block))
         return int(self._world.nonce)
@@ -259,6 +289,8 @@ class FakeEth:
         return FakeContract(self._world, address, abi)
 
     def send_raw_transaction(self, raw: Any) -> bytes:
+        if self._world.send_error is not None:
+            raise self._world.send_error
         self._world.sent.append(
             {"raw": raw, "to": self._world.built_to or VAULT}
         )
@@ -784,6 +816,102 @@ def test_an_amount_below_one_unit_is_an_error_not_a_rounding(provider, world):
     with pytest.raises(NetNotConfigured):
         provider.execute_stake(VAULT, 1e-9)
     assert world.sent == []
+
+
+# ── the fee is bid above the base fee, and a refusal says what was bid ──────
+#
+# The first real transaction this venue ever signed was an ``approve`` on Arbitrum One, and
+# the sequencer refused it: ``max fee per gas less than block base fee: maxFeePerGas:
+# 20016000 baseFee: 20046000``. Nothing was broken in the estimate — the base fee moved by
+# a tenth of a percent in the gap between the estimate and the check. A fee bid *at* the
+# node's number is a fee that can only be mined in the block it was read in, so the tests
+# below hold two things: the buffer exists, and a refusal quotes both sides of it.
+
+
+def test_a_base_fee_of_one_hundred_is_bid_at_a_hundred_and_twelve_at_least(provider, world):
+    """The number in the brief: base 100 in, and never less than 112 out."""
+    world.base_fee = 100
+    fee = provider._fee()
+    assert fee["maxFeePerGas"] >= 112
+    # web3's own recipe first — 2 * base_fee + tip, which already covers a block or two
+    # of drift — and the 12% on top of it
+    assert fee["maxFeePerGas"] == T._with_buffer(2 * 100)
+    assert fee["maxPriorityFeePerGas"] == 0
+    assert "gasPrice" not in fee  # one shape, never both
+
+
+def test_the_suggested_tip_is_carried_and_not_buffered(provider, world):
+    """A tip is the node's suggestion, not a ceiling: it is quoted, not multiplied."""
+    world.base_fee = 100
+    world.priority_fee = 5
+    fee = provider._fee()
+    assert fee["maxPriorityFeePerGas"] == 5
+    assert fee["maxFeePerGas"] == T._with_buffer(205)
+
+
+def test_a_node_that_suggests_no_tip_gets_zero_and_not_a_refusal(provider, world):
+    """``eth_maxPriorityFeePerGas`` is not on every node, and its absence is not an error."""
+    world.base_fee = 100
+    world.priority_fee = None
+    fee = provider._fee()
+    assert fee["maxPriorityFeePerGas"] == 0
+    assert fee["maxFeePerGas"] >= 112
+
+
+def test_a_chain_without_a_base_fee_is_still_priced_with_the_buffer(provider, world):
+    """Sepolia, Anvil, and anything pre-1559: one ``gasPrice``, buffered the same way."""
+    world.base_fee = None
+    world.gas_price = 1000
+    assert provider._fee() == {"gasPrice": 1120}
+    # and the buffer survives a small number, where int(7 * 1.12) would round it away
+    world.gas_price = 7
+    assert provider._fee() == {"gasPrice": 8}
+
+
+def test_the_transaction_is_signed_with_the_buffered_caps(provider, world):
+    """What actually reaches ``build_transaction`` — the approve that was refused."""
+    world.base_fee = 20_000_000
+    assert provider.execute_stake(VAULT, 10.0) is True
+    built = [tx for kind, _, _, tx in world.calls if kind == "build"]
+    approve, stake = built[0], built[1]
+    assert approve["maxFeePerGas"] == T._with_buffer(2 * 20_000_000)
+    assert approve["maxFeePerGas"] > 20_000_000  # strictly above the base fee it read
+    assert approve["maxPriorityFeePerGas"] == 0
+    assert "gasPrice" not in approve  # a type-2 transaction, not a legacy one
+    assert stake["maxFeePerGas"] == approve["maxFeePerGas"]
+
+
+def test_a_fee_refusal_quotes_what_was_bid_and_what_the_chain_asked(provider, world):
+    """Arbitrum's own sentence, at the numbers that were refused in the field."""
+    world.base_fee = 20_016_000
+    world.base_fee_rise_to = 20_046_000  # the drift that a buffer is for
+    world.send_error = ValueError(
+        "max fee per gas less than block base fee: "
+        "maxFeePerGas: 20016000 baseFee: 20046000"
+    )
+    with pytest.raises(P.StakeRefused) as raised:
+        provider.execute_stake(VAULT, 10.0)
+    text = str(raised.value)
+    assert "max fee per gas less than block base fee" in text  # the node's words, kept
+    assert "maxFeePerGas 44835840 wei (0.044835840 gwei)" in text  # what this file bid
+    assert "tip 0 wei (0.000000000 gwei)" in text
+    assert "the base fee reads 20046000 wei (0.020046000 gwei) after the refusal" in text
+    assert "to spare" in text  # 44.8 gwei bid against a 20.0 gwei base fee
+    assert provider.stakes == []
+    assert world.sent == []  # a refused transaction is not a sent one
+
+
+def test_a_refusal_says_how_short_the_bid_was_when_the_base_fee_ran_away(provider, world):
+    """On a chain where block space spikes, the sentence must say *how far* short."""
+    world.base_fee = 100
+    world.base_fee_rise_to = 10_000
+    world.send_error = ValueError("max fee per gas less than block base fee")
+    with pytest.raises(P.StakeRefused) as raised:
+        provider.execute_stake(VAULT, 10.0)
+    text = str(raised.value)
+    assert f"maxFeePerGas {T._with_buffer(200)} wei" in text
+    assert "the base fee reads 10000 wei (0.000010000 gwei)" in text
+    assert "9776 wei (0.000009776 gwei) short" in text
 
 
 # ── the failures a real venue produces ──────────────────────────────────────

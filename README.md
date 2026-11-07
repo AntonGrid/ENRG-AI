@@ -385,7 +385,12 @@ Three properties are the reason the file is longer than the two lines it replace
   `StakeRefused`, never a position;
 * **`dry_run()` signs nothing** — `eth_call` says whether the call would revert,
   `estimate_gas` says what it would cost, and neither creates a hash. A mainnet chain id is
-  refused unless `TESTNET_ALLOW_MAINNET=1` *and* `allow_mainnet=True`: two keys, one lock.
+  refused unless `TESTNET_ALLOW_MAINNET=1` *and* `allow_mainnet=True`: two keys, one lock;
+* **a fee is bid above the base fee** — `maxFeePerGas` is `2 × base_fee + tip` and then +12%
+  (`FEE_BUFFER_PERCENT`), with a legacy `gasPrice` buffered the same way on a chain that has
+  no base fee, because a cap signed *at* the node's number is refused the moment a block
+  ticks it up. The first real `approve` on Arbitrum failed exactly that way; a refusal now
+  quotes what was bid, what the chain asks after it, and the difference.
 
 Tests: `tests/test_physics_real_testnet.py` — a recording `web3` double for the
 translation and the failures (no network, no key), and, when `anvil` and `forge` are on
@@ -928,6 +933,48 @@ landed; a refused send is quoted instead of claimed.
 of the asset, so interest earned above it stays in the position as aToken dust until the
 operator takes it out.
 
+#### The fee is bid above the base fee, because the base fee moves
+
+The first real transaction this venue ever signed — the `approve` before that dollar of
+supply — was refused by Arbitrum One:
+
+```text
+approve 0xaf88… (1.0 credits) failed: the venue refused (max fee per gas less than block
+base fee: maxFeePerGas: 20016000 baseFee: 20046000)
+```
+
+Nothing was estimated wrongly. The fee was signed *at* `eth_gasPrice` and the base fee rose
+by 3 000 wei — a tenth of a percent — before the sequencer checked the signature. A cap at
+exactly the current base fee can only be mined in the block it was read in, which on an L2
+is a coin flip. So the venue now prices a transaction the way web3.py documents it and then
+adds a margin:
+
+* **a chain with a base fee** signs a type-2 transaction: `maxPriorityFeePerGas` is the
+  node's own `eth_maxPriorityFeePerGas` (0 on Arbitrum, and a tip is not a ceiling, so it
+  is never multiplied), and `maxFeePerGas` is `2 × base_fee + tip`, then **+12%**
+  (`FEE_BUFFER_PERCENT = 112` in `agent/physics/real_testnet_provider.py`). Two blocks of
+  drift are already inside the `2 ×`, and the 12% covers the gap after the estimate;
+* **a chain without one** (Sepolia, Anvil, anything pre-1559) still signs one legacy
+  `gasPrice`, buffered the same way;
+* **integer arithmetic** — `(x × 112 + 99) // 100` — so the margin cannot be rounded away
+  at small numbers: `int(7 × 1.12)` is 7, which is no margin at all.
+
+A refusal still quotes the node's words, and now also both sides of the bid, with the base
+fee re-read *after* the failure so the gap is a number rather than a guess:
+
+```text
+approve 0xaf88… (1.0 credits) failed: the venue refused (max fee per gas less than block
+base fee: …) [the fee this file bid: maxFeePerGas 44835840 wei (0.044835840 gwei); tip 0
+wei (0.000000000 gwei); the base fee reads 20046000 wei (0.020046000 gwei) after the
+refusal; 24789840 wei (0.024789840 gwei) to spare]
+```
+
+That last clause is the one that answers the question an operator actually has: was the
+*bid* short, or is something else wrong? `short` means the buffer is too small for this
+chain (raise `FEE_BUFFER_PERCENT`); `to spare` means the cap was never the problem.
+`scripts/first_breath.py` prices its one transfer by the same imported rule rather than a
+second copy of it — two copies of a safety margin is one copy too many.
+
 ### Dry run is the default, and it is not a flag inside the venue
 
 `DRY_RUN` unset is a dry run; only `0/false/no/off` makes the loop sign, so a typo
@@ -1006,7 +1053,7 @@ python -m agent.main
 pytest
 ```
 
-839 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+846 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
@@ -1052,7 +1099,7 @@ size of the thing: nothing here needs a cluster, a broker or a database.
   (`ARBITRUM_RPC_URL`, `ARBITRUM_PRIVATE_KEY`, `ARBITRUM_CHAIN_ID`) answer for the
   canonical ones. A profile is a spelling, not a permission — 42161, 137 and 8453
   are in the mainnet lock, so an L2 still needs both yeses to sign.
-* **A suite that runs like a deployment.** 839 tests, no network, no key, no
+* **A suite that runs like a deployment.** 846 tests, no network, no key, no
   chain; a live chain is an extra (`pip install 'enrg-ai[testnet]'`) and the
   Anvil tests skip by name when foundry is absent.
 
@@ -1269,7 +1316,7 @@ because a deploy needs them. Measured on this repository's own build
   `entrain_infer` core, `axis_core` — and they say so by name rather than passing
   quietly. The trading path's own tests do run in the image:
   `docker compose exec trader pytest -q tests/test_trade_loop.py
-  tests/test_physics_real_testnet.py tests/test_physics_aave_v3.py` is green. All 839
+  tests/test_physics_real_testnet.py tests/test_physics_aave_v3.py` is green. All 846
   pass on a host that holds the workspace.
 
 

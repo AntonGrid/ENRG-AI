@@ -297,6 +297,19 @@ DEFAULT_BLOCK_TIMEOUT = 30.0
 #: Seconds between two looks at the chain's height.
 BLOCK_POLL = 0.25
 
+#: The margin over the node's own number, in **percent**, for the fee a transaction is
+#: signed with. A fee is not a fact and an estimate is not a guarantee: on Arbitrum the
+#: base fee can move between the moment this file asks the node and the moment the
+#: sequencer checks the signature, and the first real ``approve`` was refused by 3 000 wei
+#: for exactly that reason (``max fee per gas less than block base fee: maxFeePerGas:
+#: 20016000 baseFee: 20046000`` — a tenth of a percent, and enough). So the bid is above
+#: what the node says rather than at it, and 112 is a deliberate, boring number: 12% of
+#: an L2 fee is a few thousandths of a cent, and a ceiling nobody hits is not a ceiling.
+#: Integer arithmetic (:func:`_with_buffer`) so the margin can never be halved by a float
+#: rounding at small numbers — at 7 wei a naive ``int(x * 1.12)`` keeps the 7 and the
+#: buffer disappears.
+FEE_BUFFER_PERCENT = 112
+
 #: Chains where the thing being staked is money. Connecting to one is refused unless the
 #: operator opts in **twice** (an environment variable and an argument), because this
 #: file exists to prove a seam, not to trade.
@@ -838,6 +851,29 @@ def _float_or(value: object, default: float, name: str) -> float:
         return float(text)
     except ValueError as exc:
         raise TestnetNotConfigured(f"{name}={text!r} is not a number") from exc
+
+
+def _with_buffer(wei: object) -> int:
+    """``wei`` raised by :data:`FEE_BUFFER_PERCENT`, rounded **up** and never down.
+
+    Integer arithmetic, because the point of a buffer is that it survives: ``int(7 * 1.12)``
+    is 7, and a fee that is bid at exactly what the node said is the fee that gets refused
+    when the base fee ticks up by one wei.
+    """
+    value = max(0, int(wei))
+    return (value * FEE_BUFFER_PERCENT + 99) // 100
+
+
+def _gwei(wei: object) -> str:
+    """Wei as a human reads it, and as the node spells it: ``20046000 (0.020046 gwei)``.
+
+    Both, always: the node's refusal quotes wei, an operator thinks in gwei, and a report
+    that printed one of the two would leave the other to mental arithmetic at the worst
+    possible moment.
+    """
+    value = max(0, int(wei))
+    whole, fraction = divmod(value, 10 ** 9)
+    return f"{value} wei ({whole}.{fraction:09d} gwei)"
 
 
 _DOTENV_READ = False
@@ -1842,13 +1878,102 @@ class RealTestnetProvider(IWeb3Provider):
         self._nonce = nonce + 1
         return nonce
 
-    def _fee(self) -> Dict[str, int]:
-        """A legacy gas price: accepted by Sepolia, Anvil, and every testnet alive."""
+    def _base_fee(self) -> Optional[int]:
+        """The block's base fee per gas, or ``None`` on a chain that has none.
+
+        ``None`` is not an error: a pre-1559 chain (and a test double) simply prices by
+        ``eth_gasPrice``, which is what this file did before it had a buffer.
+        """
         try:
-            return {"gasPrice": int(self._w3().eth.gas_price)}
+            block = self._w3().eth.get_block("latest")
+        except Exception as exc:  # noqa: BLE001 - a node that will not answer
+            self.errors.append(f"base_fee: {type(exc).__name__}: {exc}")
+            return None
+        base = getattr(block, "get", None)
+        value = base("baseFeePerGas") if callable(base) else getattr(
+            block, "baseFeePerGas", None
+        )
+        try:
+            return int(value) if value else None
+        except (TypeError, ValueError):
+            return None
+
+    def _priority_fee(self) -> int:
+        """The tip the node suggests, and **zero** when it suggests nothing.
+
+        Arbitrum answers ``eth_maxPriorityFeePerGas`` with 0 and expects a type-2
+        transaction that says so; a node too old for the call gets the same zero rather
+        than a refusal, because a missing suggestion is not a missing permission.
+        """
+        try:
+            return max(0, int(self._w3().eth.max_priority_fee))
+        except Exception as exc:  # noqa: BLE001 - an old node, or an Anvil
+            self.errors.append(f"priority_fee: {type(exc).__name__}: {exc}")
+            return 0
+
+    def _fee(self) -> Dict[str, int]:
+        """What this transaction is willing to pay per gas — bid *above* the node's number.
+
+        Two shapes, because there are two kinds of chain and the difference is not a
+        preference:
+
+        * **a base fee** (EIP-1559) ⇒ ``maxFeePerGas`` and ``maxPriorityFeePerGas``, the
+          caps a sequencer checks the signature against. The ceiling follows web3's own
+          recipe — ``2 * base_fee + tip``, so a block or two of drift is already inside it —
+          and then :data:`FEE_BUFFER_PERCENT` on top. This is the case the first real
+          ``approve`` fell into: it was priced at ``eth_gasPrice``, the base fee rose by
+          3 000 wei in the gap, and Arbitrum answered ``max fee per gas less than block
+          base fee``. A cap at exactly the current base fee is a transaction that can only
+          be mined in the block it was estimated in;
+        * **no base fee** ⇒ one legacy ``gasPrice``, buffered the same way. Sepolia, Anvil
+          and every pre-1559 chain take it, and the buffer costs nothing there.
+
+        The tip is never buffered: it is the node's own suggestion and a tip is not a
+        ceiling. If neither read succeeds the mapping is empty and ``build_transaction``
+        fills in the client's defaults — the same behaviour this file had before.
+        """
+        base = self._base_fee()
+        if base:
+            tip = self._priority_fee()
+            return {
+                "maxPriorityFeePerGas": tip,
+                "maxFeePerGas": _with_buffer(2 * base + tip),
+            }
+        try:
+            return {"gasPrice": _with_buffer(self._w3().eth.gas_price)}
         except Exception as exc:  # pragma: no cover - a node without eth_gasPrice
             self.errors.append(f"gas_price: {type(exc).__name__}: {exc}")
             return {}
+
+    def _fee_note(self, fee: Mapping[str, int]) -> str:
+        """What was bid, and what the chain asks **now** — for a refusal to quote.
+
+        The two numbers a fee refusal is made of, plus the third that explains it: the base
+        fee re-read after the failure, and by how much it was missed. Without that third
+        number an operator sees a decimal they cannot place; with it, the sentence says
+        whether the buffer was too small or the wallet bid something else entirely.
+        """
+        if not fee:
+            return ""
+        parts: List[str] = []
+        if "maxFeePerGas" in fee:
+            parts.append(f"maxFeePerGas {_gwei(fee['maxFeePerGas'])}")
+            parts.append(f"tip {_gwei(fee.get('maxPriorityFeePerGas', 0))}")
+            bid = int(fee["maxFeePerGas"])
+        elif "gasPrice" in fee:
+            parts.append(f"gasPrice {_gwei(fee['gasPrice'])}")
+            bid = int(fee["gasPrice"])
+        else:  # pragma: no cover - neither shape is a shape this file builds
+            return ""
+        now = self._base_fee()
+        if now:
+            parts.append(f"the base fee reads {_gwei(now)} after the refusal")
+            parts.append(
+                f"{_gwei(now - bid)} short"
+                if now > bid
+                else f"{_gwei(bid - now)} to spare"
+            )
+        return f" [the fee this file bid: {'; '.join(parts)}]"
 
     def _dispatch(self, tx: Dict[str, Any]) -> Any:
         """Hand one transaction to the node — signed here, or signed by the node.
@@ -1907,18 +2032,24 @@ class RealTestnetProvider(IWeb3Provider):
         chain reported — ``gas_used`` and ``effective_gas_price`` — because those are what
         :meth:`agent.physics.transaction_cost_analyzer.TransactionCostAnalyzer.from_receipt`
         prices the next trade with: a limit is an intention, and a receipt is a receipt.
+
+        The fee is bid by :meth:`_fee`, above what the node just said, and the bid travels
+        with a refusal: a message that quotes the node's own numbers and *not* ours leaves
+        an operator guessing whether the cap or the chain was wrong.
         """
         self._connect()
         sender = self._checksum(self._signer_address())
+        fee: Dict[str, int] = {}
         try:
             gas = int(function.estimate_gas({"from": sender}))
+            fee = self._fee()
             tx = function.build_transaction(
                 {
                     "from": sender,
                     "nonce": self._next_nonce(),
                     "chainId": int(self._chain_id or 0),
                     "gas": gas,
-                    **self._fee(),
+                    **fee,
                 }
             )
             digest = self._dispatch(tx)
@@ -1933,7 +2064,7 @@ class RealTestnetProvider(IWeb3Provider):
             self._nonce = None
             raise StakeRefused(
                 f"{action} {address} ({float(amount)!r} credits) failed: "
-                f"{_failure_kind(exc)} ({self._reason(exc)})"
+                f"{_failure_kind(exc)} ({self._reason(exc)}){self._fee_note(fee)}"
             ) from exc
         record = {
             "action": action,

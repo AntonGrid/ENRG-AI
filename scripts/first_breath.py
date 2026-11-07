@@ -159,6 +159,7 @@ def _breath(args: argparse.Namespace, voice: Voice) -> int:
         MAINNET_CHAIN_IDS,
         TestnetConfig,
         TestnetNotConfigured,
+        _with_buffer,
     )
 
     try:
@@ -272,13 +273,18 @@ def _breath(args: argparse.Namespace, voice: Voice) -> int:
 
     # 4. the transaction, and the signature that never leaves this process
     voice.step(4, "preparing the transfer and signing it locally")
+    # The price is the venue's own rule, imported rather than copied: ``eth_gasPrice`` plus
+    # its margin. A transfer signed exactly at the node's number is refused the moment the
+    # base fee ticks up — which is precisely how the first real ``approve`` on Arbitrum One
+    # died, 3 000 wei short.
+    offered = _with_buffer(gas_price)
     tx: dict = {
         "from": sender,
         "to": recipient,
         "value": value,
         "nonce": nonce,
         "chainId": chain_id,
-        "gasPrice": gas_price,
+        "gasPrice": offered,
     }
     try:
         tx["gas"] = int(
@@ -302,7 +308,11 @@ def _breath(args: argparse.Namespace, voice: Voice) -> int:
         digest = signed.hash.hex()
 
     voice.row("transfer", f"{_ether(value)} ETH -> {recipient}")
-    voice.row("gas", f"{tx['gas']} @ {Decimal(gas_price) / Decimal(10**9):.3f} gwei, nonce {nonce}")
+    voice.row(
+        "gas",
+        f"{tx['gas']} @ {Decimal(offered) / Decimal(10**9):.3f} gwei "
+        f"(the node said {Decimal(gas_price) / Decimal(10**9):.3f}), nonce {nonce}",
+    )
 
     # 5. one send, one receipt, no retry
     if args.dry_run:
