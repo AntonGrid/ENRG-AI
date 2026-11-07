@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+from agent.physics import aave_v3
 from agent.physics import portfolio as P
 from agent.physics import real_testnet_provider as T
 from agent.physics.defillama_adapter import apy_to_rate as feed_rate
@@ -155,6 +157,61 @@ class World:
         return [str(tx["to"]) for tx in self.sent]
 
 
+def checksummed(address: str) -> str:
+    """EIP-55's *shape* without its hash — the rule a fake node has to enforce.
+
+    The real rule upper-cases a hex letter when a nibble of ``keccak256(lower-case hex)``
+    says so. This suite has no keccak (web3 is an optional dependency and CI does not
+    install it), so the digest is ``sha3_256`` instead. Everything a test needs still
+    holds: the answer is deterministic, idempotent, and a letter-bearing address comes
+    back *not* equal to the string it was handed — which is what makes a skipped
+    conversion visible. Digits have no case, so ``0x1111…`` survives unchanged, exactly
+    as under the real rule; that is why every address-shaped constant in this file that
+    is not a real Aave address still reads the same after being converted.
+    """
+    text = str(address).strip()
+    if len(text) != 42 or not text.lower().startswith("0x"):
+        return text
+    body = text.lower()[2:]
+    digest = hashlib.sha3_256(body.encode()).hexdigest()
+    return "0x" + "".join(
+        character.upper() if int(digest[index], 16) > 7 else character
+        for index, character in enumerate(body)
+    )
+
+
+def accept(address: Any) -> None:
+    """Refuse an address argument the way web3's encoder does — quoted, not paraphrased.
+
+    ``web3/_utils/validation.py`` raises on exactly two things: an all-lower-case address
+    ("…only accepts checksum addresses…") and a mixed-case one whose checksum does not
+    match ("Address has an invalid EIP-55 checksum"). Reproducing the refusal here is the
+    point of the double: a call that forgot to convert fails in a test instead of on a
+    chain, after an approval has been paid for.
+    """
+    if not isinstance(address, str) or len(address) != 42:
+        return
+    if not address.startswith("0x"):
+        return
+    if any(character not in "0123456789abcdefABCDEF" for character in address[2:]):
+        return
+    if address == checksummed(address):
+        return
+    if address == address.lower():
+        raise ValueError(
+            "web3.py only accepts checksum addresses. The software that gave you this "
+            "non-checksum address should be considered unsafe, please file it as a bug "
+            "on their platform. Try using an ENS name instead. Or, if you must accept "
+            "lower safety, use Web3.to_checksum_address(lower_case_address).",
+            address,
+        )
+    raise ValueError(
+        "Address has an invalid EIP-55 checksum. After looking up the address from the "
+        "original source, try again.",
+        address,
+    )
+
+
 class FakeCall:
     """One contract function call: ``stake(units)``, and what would happen to it."""
 
@@ -198,7 +255,12 @@ class FakeCall:
 
 
 class FakeFunctions:
-    """``contract.functions``: any attribute is a function of that name."""
+    """``contract.functions``: any attribute is a function of that name.
+
+    The arguments are vetted before the call exists, at the same moment web3 encodes —
+    which is the moment the real ``supply`` was refused, and the reason this double can
+    promise anything at all about the case of an address.
+    """
 
     def __init__(self, world: World, address: str = "") -> None:
         self._world = world
@@ -206,6 +268,8 @@ class FakeFunctions:
 
     def __getattr__(self, name: str) -> Any:
         def factory(*args: Any) -> FakeCall:
+            for argument in args:
+                accept(argument)
             return FakeCall(self._world, self._address, name, args)
 
         return factory
@@ -215,6 +279,7 @@ class FakeContract:
     """A contract handle: an address and a namespace of functions."""
 
     def __init__(self, world: World, address: str, abi: Any) -> None:
+        accept(address)  # the *target* is encoded too, and refused the same way
         self.address = address
         self.abi = abi
         self.functions = FakeFunctions(world, address)
@@ -319,7 +384,7 @@ class FakeWeb3:
         self.eth = FakeEth(world)
 
     def to_checksum_address(self, address: str) -> str:
-        return str(address)
+        return checksummed(address)
 
     def keccak(self, text: str = "", hexstr: str = "") -> bytes:
         return b"\x99" * 32
@@ -1821,8 +1886,6 @@ def aave_venue(aave_world: World) -> RealTestnetProvider:
     )
 
 
-
-
 def test_an_aave_entry_has_to_name_the_asset_it_supplies():
     """``supply`` takes the asset as its first argument; guessing one supplies the wrong coin."""
     with pytest.raises(NetNotConfigured) as raised:
@@ -1914,12 +1977,12 @@ def test_a_declaration_that_contradicts_the_pool_is_refused(aave_world):
     assert aave_world.names("build") == [] and venue.approvals == []
 
 
-
 def test_an_aave_supply_approves_the_pool_and_calls_supply(aave_venue, aave_world):
     assert aave_venue.execute_stake(AAVE_POOL, 1.0) is True
 
-    pool = AAVE_POOL.lower()
-    usdc = AAVE_USDC.lower()
+    # every address that reaches the encoder is the checksummed form of the book's spelling
+    pool = checksummed(AAVE_POOL)
+    usdc = checksummed(AAVE_USDC)
     # the spender is the pool, because the pool is what pulls the asset
     assert ("call", "allowance", (SIGNER, pool), {"from": SIGNER}) in aave_world.calls
     assert aave_world.names("build") == ["approve", "supply"]
@@ -1974,10 +2037,106 @@ def test_an_aave_withdraw_returns_the_asset_to_the_signer(aave_venue, aave_world
 
     assert aave_world.names("build") == ["withdraw"]
     withdraw = [call for call in aave_world.calls if call[0] == "build"][0]
-    assert withdraw[2] == (AAVE_USDC.lower(), 2_500_000, SIGNER)
-    assert aave_world.sent_to() == [AAVE_POOL.lower()]
+    assert withdraw[2] == (checksummed(AAVE_USDC), 2_500_000, SIGNER)
+    assert aave_world.sent_to() == [checksummed(AAVE_POOL)]
     assert aave_venue.withdrawals[0]["action"] == "withdraw"
     assert aave_venue.approvals == []  # nothing to approve on the way out
+
+
+def test_a_book_that_spells_its_addresses_in_lower_case_still_signs(world):
+    """The book and ``.env`` are written by hand, and web3 refuses the hand's spelling.
+
+    ``0xaf88d065…`` is a perfectly correct address and an unacceptable thing to hand a
+    contract encoder, which accepts only the checksummed form — exactly how the first real
+    ``supply`` was refused *after* its ``approve`` had already been paid for. So a book
+    written in lower case is now an address the venue converts, not one it signs.
+    """
+    world.chain = ARBITRUM
+    venue = RealTestnetProvider(
+        env=aave_env(
+            **{
+                "TESTNET_PROTOCOLS": json.dumps(
+                    aave_entry(address=AAVE_POOL.lower(), token=AAVE_USDC.lower())
+                )
+            }
+        ),
+        web3=FakeWeb3(world),
+        allow_mainnet=True,
+    )
+
+    assert venue.execute_stake(AAVE_POOL.lower(), 1.0) is True
+
+    supply = [call for call in world.calls if call[:2] == ("build", "supply")][0]
+    asset, amount, on_behalf_of, referral = supply[2]
+    assert amount == 1_000_000 and referral == 0
+    assert asset == checksummed(AAVE_USDC) and asset != AAVE_USDC.lower()
+    assert on_behalf_of == checksummed(SIGNER)
+    assert venue.stakes[0]["status"] == 1 and venue.refusals == []
+
+
+def test_the_double_refuses_a_lower_case_argument_the_way_web3_did(aave_world):
+    """The bug, reproduced on purpose: the two sentences the real encoder sent back."""
+    node = FakeWeb3(aave_world)
+    pool = node.eth.contract(address=checksummed(AAVE_POOL), abi=[])
+
+    with pytest.raises(ValueError) as raised:
+        pool.functions.supply(AAVE_USDC.lower(), 1_000_000, SIGNER, 0)
+    assert "only accepts checksum addresses" in str(raised.value)
+    assert AAVE_USDC.lower() in str(raised.value)
+
+    with pytest.raises(ValueError) as raised:
+        pool.functions.approve("0x" + AAVE_USDC[2:].upper(), 1_000_000)
+    assert "invalid EIP-55 checksum" in str(raised.value)
+
+
+def test_the_real_web3_encodes_what_the_venue_hands_it():
+    """The encoder that refused the first real ``supply``, asked the same question twice.
+
+    The double's checksum is a stand-in *shape* — no keccak in a suite that must run
+    without web3 — so the one test that can prove the shape is the real thing is this one.
+    It skips where ``web3`` is absent (CI) rather than pretend; where it is installed, a
+    lower-case address is refused with the sentence we were sent and the converted one
+    encodes to Aave's own selector.
+    """
+    web3 = pytest.importorskip("web3")
+    node = web3.Web3()
+    venue = RealTestnetProvider(env=aave_env(), web3=node, allow_mainnet=True)
+    pool = node.eth.contract(
+        address=venue._checksum(AAVE_POOL.lower()), abi=aave_v3.pool_abi()
+    )
+    owner = venue._checksum(SIGNER.lower())
+
+    with pytest.raises(Exception) as raised:
+        pool.encode_abi("supply", args=[AAVE_USDC.lower(), 1_000_000, owner, 0])
+    assert "only accepts checksum addresses" in str(raised.value)
+
+    asset = venue._checksum(AAVE_USDC.lower())
+    assert asset == AAVE_USDC  # the real EIP-55 of the real asset, not a re-spelling
+    encoded = pool.encode_abi("supply", args=[asset, 1_000_000, owner, 0])
+    assert encoded.startswith("0x617ba037")  # supply(address,uint256,address,uint16)
+
+
+def test_no_address_crosses_the_encoder_unchecksummed(aave_venue, aave_world):
+    """The whole conversation at once, read for the one thing the chain charged for.
+
+    Every address-shaped string in every call, estimate and build — the arguments and not
+    only the targets — has to be the checksummed form, or the encoder would have refused
+    the call on a chain that had already been charged for the approval before it.
+    """
+    aave_venue.execute_stake(AAVE_POOL, 1.0)
+    aave_venue.withdraw(AAVE_POOL, 0.5)
+    read = aave_venue.balance(AAVE_POOL)
+    assert read.ok and aave_venue.refusals == []
+
+    seen = {
+        argument
+        for _action, _name, args, _tx in aave_world.calls
+        for argument in args
+        if isinstance(argument, str) and len(argument) == 42
+    }
+    assert {checksummed(AAVE_POOL), checksummed(AAVE_USDC)} <= seen
+    assert all(each == checksummed(each) for each in seen)
+    assert AAVE_POOL.lower() not in seen and AAVE_USDC.lower() not in seen
 
 
 def test_the_balance_reports_the_a_token_position(aave_venue, aave_world):
@@ -2005,6 +2164,10 @@ def test_a_dry_run_of_a_supply_simulates_the_pool(aave_venue, aave_world):
 
     assert run.ok and run.units == 1_000_000 and run.sender == SIGNER
     assert aave_world.names("call") == ["supply"]
+    # the simulation encodes the same arguments the signature would: a dry run that could
+    # not be signed is a green light pointing at a wall
+    simulated = [call for call in aave_world.calls if call[:2] == ("call", "supply")][0]
+    assert simulated[2] == (checksummed(AAVE_USDC), 1_000_000, SIGNER, 0)
     assert "stake" not in aave_world.names("estimate_gas")
     assert aave_world.sent == []  # a simulation signs nothing
 

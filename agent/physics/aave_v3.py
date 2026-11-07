@@ -245,7 +245,16 @@ def pool_abi() -> List[Dict[str, Any]]:
 def supply_args(
     deployment: AaveDeployment, units: int, on_behalf_of: str
 ) -> Tuple[str, int, str, int]:
-    """``supply(asset, amount, onBehalfOf, referralCode)`` — the position is the signer's."""
+    """``supply(asset, amount, onBehalfOf, referralCode)`` — the position is the signer's.
+
+    ``asset`` comes back in the table's lower-case form, and that is deliberate: an
+    address's case is a typo check (EIP-55), not data, so it is not this file's to invent.
+    The venue applies the checksummed form at the boundary, where web3's encoder demands
+    it — see ``RealTestnetProvider._pool_call`` — because a table that carried mixed case
+    would be a second spelling of the same address, and the first place two spellings of
+    one address disagreed is the first place a supply was refused after its approval had
+    already been paid for.
+    """
     amount = int(units)
     if amount <= 0:
         raise ValueError(
@@ -262,7 +271,12 @@ def supply_args(
 def withdraw_args(
     deployment: AaveDeployment, units: int, recipient: str
 ) -> Tuple[str, int, str]:
-    """``withdraw(asset, amount, to)`` — and ``to`` is the signer, never a third party."""
+    """``withdraw(asset, amount, to)`` — and ``to`` is the signer, never a third party.
+
+    Both addresses here are the venue's to spell: the asset as the table keeps it, the
+    recipient as the signer's key produced it, and ``_pool_call`` hands the encoder the
+    checksummed form of both.
+    """
     amount = int(units)
     if amount <= 0:
         raise ValueError(

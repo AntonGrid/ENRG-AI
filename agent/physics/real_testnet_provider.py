@@ -2339,12 +2339,11 @@ class RealTestnetProvider(IWeb3Provider):
         """
         deployment = self._deployment(entry)
         owner = self._signer_address()
-        pool = self._contract(deployment.pool, aave_v3.pool_abi()).functions
         if action == "stake":
             self._ensure_allowance(entry, units)
             self.stakes.append(
                 self._send(
-                    pool.supply(*aave_v3.supply_args(deployment, units, owner)),
+                    self._pool_call(deployment, "stake", units, owner),
                     action="supply",
                     address=entry.address,
                     amount=value,
@@ -2354,7 +2353,7 @@ class RealTestnetProvider(IWeb3Provider):
         else:
             self.withdrawals.append(
                 self._send(
-                    pool.withdraw(*aave_v3.withdraw_args(deployment, units, owner)),
+                    self._pool_call(deployment, "withdraw", units, owner),
                     action="withdraw",
                     address=entry.address,
                     amount=value,
@@ -2362,6 +2361,37 @@ class RealTestnetProvider(IWeb3Provider):
                 )
             )
         return True
+
+    def _pool_call(
+        self, deployment: aave_v3.AaveDeployment, kind: str, units: int, owner: str
+    ) -> Any:
+        """``supply(...)`` or ``withdraw(...)`` on Aave's Pool, every address checksummed.
+
+        An address's case is a typo check (EIP-55), not data — the deployment table stores
+        its own in lower case so that a pool's identity cannot depend on how a file spelled
+        it, and the signer is kept as this file's key produced it. web3 wants the opposite
+        *at the boundary*: its encoder refuses any address **argument** that is not the
+        checksummed form, and it refuses it loudly and late.
+
+        That is how the first real ``supply`` died while the ``approve`` before it passed,
+        and the difference is the whole lesson: a *target* goes through :meth:`_contract`,
+        which checksums it; an *argument* went through nothing at all. ``0xaf88d065…`` is
+        a perfectly correct address and an unacceptable thing to encode.
+
+        So the case is applied here, at the one place that hands Aave an argument, and the
+        dry run builds its call here too — a simulation that could not be signed would be a
+        green light pointing at a wall.
+        """
+        pool = self._contract(deployment.pool, aave_v3.pool_abi()).functions
+        if kind == "stake":
+            asset, amount, on_behalf_of, referral = aave_v3.supply_args(
+                deployment, units, owner
+            )
+            return pool.supply(
+                self._checksum(asset), amount, self._checksum(on_behalf_of), referral
+            )
+        asset, amount, recipient = aave_v3.withdraw_args(deployment, units, owner)
+        return pool.withdraw(self._checksum(asset), amount, self._checksum(recipient))
 
     def _ensure_allowance(self, entry: ProtocolEntry, units: int) -> None:
         """Let the venue pull ``units`` — once, and only if it cannot already.
@@ -2536,11 +2566,8 @@ class RealTestnetProvider(IWeb3Provider):
         if str(entry.kind) == AAVE_KIND:
             deployment = self._deployment(entry)
             owner = self._sender_or_zero()
-            pool = self._contract(deployment.pool, aave_v3.pool_abi()).functions
-            if kind == "stake":
-                return pool.supply(*aave_v3.supply_args(deployment, units, owner))
-            if kind == "withdraw":
-                return pool.withdraw(*aave_v3.withdraw_args(deployment, units, owner))
+            if kind in {"stake", "withdraw"}:
+                return self._pool_call(deployment, kind, units, owner)
             raise TestnetNotConfigured(
                 f"{entry.name}: an Aave position has no evidence call — there is no "
                 "submitValidationProof on a Pool, and inventing one would be a dry run of "

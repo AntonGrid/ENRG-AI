@@ -871,6 +871,18 @@ to a different place, and it has to be a place that **refuses**:
   its own beneficiary and `referralCode = 0` (this loop is nobody's affiliate), and
   `withdraw(asset, amount, to)` paying the signer. An `approve` to the Pool comes first,
   and is awaited like any other transaction;
+* **the case of an address is applied at the boundary, never stored.** EIP-55 is a typo
+  check, not data, so the table keeps its addresses in one form, the book may spell them in
+  another, and the signer arrives as the key produced it. web3's encoder accepts only the
+  checksummed form and says so *late* — which is how the first real `supply` was refused
+  one block after its `approve` had been paid for: `0xaf88d065e77c8c…` is a perfectly
+  correct address and an uncodable argument. Every string a Pool call receives — the
+  asset, the beneficiary, the recipient, and the Pool itself — goes through
+  `Web3.to_checksum_address` in `_pool_call`, the one place that hands Aave an argument;
+  the dry run builds its call there too, because a simulation that could not be signed is
+  a green light pointing at a wall. `tests/test_physics_real_testnet.py` makes its web3
+  double refuse a lower-case address with the sentence the real encoder sent, so a
+  forgotten conversion fails in a test instead of on a chain;
 * the **position is read off the aToken**, not remembered: `balance()` reports
   `position_token` / `position_balance`, which is the supplied amount plus every interest
   payment since — so a lost state file, a second operator, or a withdrawal made by hand
@@ -1053,14 +1065,16 @@ python -m agent.main
 pytest
 ```
 
-846 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+850 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
 genome/sensorium/organism tests — on a box without them those tests say so by
 name, which is why the full run is a *workspace* command, not a pip-install one.
-Nothing on the deployment path needs any of the three: the trading cycle's own 35
-(`tests/test_trade_loop.py`) and the provider's 68 run anywhere Python does.
+Nothing on the deployment path needs any of the three: the trading cycle's own 85
+(`tests/test_trade_loop.py`) and the provider's 109 run anywhere Python does — one of
+those asks for foundry and one for `web3`, and each skips itself by name rather than
+passing quietly.
 
 
 ## Production Readiness
@@ -1099,7 +1113,7 @@ size of the thing: nothing here needs a cluster, a broker or a database.
   (`ARBITRUM_RPC_URL`, `ARBITRUM_PRIVATE_KEY`, `ARBITRUM_CHAIN_ID`) answer for the
   canonical ones. A profile is a spelling, not a permission — 42161, 137 and 8453
   are in the mainnet lock, so an L2 still needs both yeses to sign.
-* **A suite that runs like a deployment.** 846 tests, no network, no key, no
+* **A suite that runs like a deployment.** 850 tests, no network, no key, no
   chain; a live chain is an extra (`pip install 'enrg-ai[testnet]'`) and the
   Anvil tests skip by name when foundry is absent.
 
@@ -1316,7 +1330,7 @@ because a deploy needs them. Measured on this repository's own build
   `entrain_infer` core, `axis_core` — and they say so by name rather than passing
   quietly. The trading path's own tests do run in the image:
   `docker compose exec trader pytest -q tests/test_trade_loop.py
-  tests/test_physics_real_testnet.py tests/test_physics_aave_v3.py` is green. All 846
+  tests/test_physics_real_testnet.py tests/test_physics_aave_v3.py` is green. All 850
   pass on a host that holds the workspace.
 
 
