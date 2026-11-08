@@ -1001,14 +1001,57 @@ Positions live in `TRADER_STATE` (`/data/trader_state.json` in the container) an
 written after every cycle: address, amount, the verdict it was bought on, the confidence.
 It is what stops a restart from staking the same money twice — so a file that cannot be read
 is **not** treated as an empty portfolio. The process stops and names the file.
-`UNMEASURED` never closes a position (a feed that stopped publishing is not evidence against
-a record); `FORMULA`/`DISHONEST`/`THIN` do.
 
-Tests: `tests/test_trade_loop.py` — 57 of them, no network and no chain: the caps, the
-fail-closed refusals, the dry run's empty ledger, the exit path, the state file's refusal to
-lie, the widths of the hunt (`SCAN_LIMIT`/`MEASURE_LIMIT`, and the flag that beats them), the
-address book's two kinds of empty, the feed-priced hold (a record the feed vouched for is
-measured, printed and never signed), the book report, and the CLI's mode. The wire behind it
+Three details make the file trustworthy enough to hold the only memory a loop has:
+
+* **the write is atomic** — a temporary neighbour, an `fsync`, an `os.replace`, and a
+  directory sync. A power cut leaves either the old document or the new one, never half of
+  either; a truncated file would be read as a stopped agent on the next boot.
+* **the position is written *before* it is signed** (a write-ahead). A kill between the
+  signature and the save was the one window in which a restart would stake the same dollars a
+  second time — so the position goes to disk first, and it is taken back out (`_unremember`,
+  with the file rewritten immediately) if the venue refuses or the send raises. A kill
+  *during* the send keeps it: the loop cannot know whether that signature moved money, and
+  "unknown" costs one cycle of "already at the ceiling", while guessing "nothing happened"
+  costs the same dollars twice.
+* **a live loop that cannot write it stops** (`TradeError`) instead of trading blind. A dry
+  run, where nothing is at risk, downgrades the same failure to a warning.
+
+### Leaving a position: a conviction lost, or a panic that passed
+
+A position is closed for exactly two reasons, and both are spelled out in
+`agent/trade/loop.py` as constants rather than as conditions inside a method:
+
+| verdicts | what happened | what the loop does |
+| --- | --- | --- |
+| `THIN`, `FORMULA`, `DISHONEST` (`EXIT_VERDICTS`) | the pool is no longer what it was bought as | withdraw |
+| `CALM`, `GROWTH` (`TAKE_PROFIT_VERDICTS`) **on a position opened on `PANIC`** | the dislocation *was* the thesis, and it has closed | withdraw (take-profit) |
+| `CALM`, `GROWTH` on a position opened on `CALM` | nothing: it was bought for carry | hold |
+| `UNMEASURED` | the feed stopped publishing, which is not evidence against the pool | hold |
+| the vault published no record this cycle | "no answer today" is not a sale | hold, and say so in a warning |
+
+The take-profit is the difference between a loop that can only leave a pool when something
+goes *wrong* with it and one that also banks a trade when something goes *right*: without it
+every winner stayed open until its verdict turned, which means the only exits were bad ones.
+
+Two further rules are what make the exit an exit rather than a gesture:
+
+* **the amount is what the venue says, not what the file remembers.** An Aave position is an
+  aToken balance — principal plus interest — and withdrawing the recorded principal would
+  leave the profit in the pool. A zero from a chain that answered is a *fact*: the stale
+  entry is dropped and nothing is signed, because a withdrawal of nothing is a revert and a
+  fee.
+* **a position that is leaving is not topped up on the way out.** The closing set is computed
+  before the entries are considered, so a `CALM` cycle cannot supply a dollar to an
+  `aave-v3` entry and withdraw it in the same block — two fees to stand still.
+
+Tests: `tests/test_trade_loop.py` — 94 of them, no network and no chain: the caps, the
+fail-closed refusals, the dry run's empty ledger, the exit path (a conviction, a take-profit,
+the whole aToken balance, a position the chain says is gone), the write-ahead and the refusal
+that takes it back, the state file's refusal to lie, the widths of the hunt
+(`SCAN_LIMIT`/`MEASURE_LIMIT`, and the flag that beats them), the address book's two kinds of
+empty, the feed-priced hold (a record the feed vouched for is measured, printed and never
+signed), the book report, and the CLI's mode. The wire behind it
 has its own: `tests/test_physics_real_testnet.py` (eighty, twelve of them about
 `TESTNET_HISTORY` — the default is the vault's own log, `auto` prices a silent vault from the
 feed and keeps the log when there is one, `feed` never touches the node, `steps` takes a
@@ -1261,7 +1304,61 @@ sudo systemctl daemon-reload && sudo systemctl enable --now enrg-ai-trainer
 journalctl -u enrg-ai-trainer -f
 ```
 
-#### 5. The fast way: tmux (a look, not a deployment)
+#### 5. The trader's own unit (24/7, no Docker)
+
+The same shape, pointed at the cycle that moves money. One cycle every five minutes,
+positions remembered in `/var/lib/enrg-ai/trader_state.json`:
+
+```ini
+[Unit]
+Description=ENRG-AI trading cycle
+After=network-online.target
+Wants=network-online.target
+# A state file that cannot be read stops the loop *on purpose*, so a restart storm would only
+# bury the message it stopped to print. Five failed starts in five minutes and systemd leaves
+# the unit `failed` with the reason in the journal — visible, and not a loop that trades while
+# nobody is watching.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+User=enrg
+WorkingDirectory=/opt/ENRG-AI
+EnvironmentFile=/opt/ENRG-AI/.env
+ExecStart=/opt/ENRG-AI/.venv/bin/python -m agent.trade.loop \
+          --loop --interval 300 \
+          --state /var/lib/enrg-ai/trader_state.json \
+          --json /var/lib/enrg-ai/trader_cycle.json
+Restart=always
+RestartSec=15
+# A stop is SIGTERM, and the loop's own `--interval` sleep is what it interrupts:
+# a position is never mid-write, because the write is atomic.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/enrg-ai
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo install -d -o enrg -g enrg /var/lib/enrg-ai
+sudo systemctl daemon-reload && sudo systemctl enable --now enrg-ai-trader
+journalctl -u enrg-ai-trader -f          # one block per cycle
+```
+
+`Restart=always` is the whole auto-restart story, and it is safe to lean on **because a
+corrupt state file stops the loop by name** (see above): a restart after a failure either
+finds a whole file and continues, or refuses to trade and says which file to look at. A loop
+that retried from an empty portfolio on every crash would stake the same money again every
+`RestartSec`. `StartLimitBurst` is the other half — a failure that repeats is a *report*, not
+a rhythm, so after five identical starts systemd stops trying and the unit stays `failed`
+until someone reads `journalctl -u enrg-ai-trader`.
+
+#### 6. The fast way: tmux (a look, not a deployment)
 
 ```bash
 tmux new -s enrg
@@ -1307,6 +1404,35 @@ and holds **no key, no `.env` and no address** — both are `.dockerignore`d, so
 honest one: both loops write their state file at the end of every cycle, so a
 `/data/trader_state.json` (or `/data/digital_state.json`) older than ninety minutes
 means the loop is not working and compose restarts it.
+
+#### And it comes back after a reboot
+
+`restart: unless-stopped` is the container's half of "runs forever"; the other half is
+Docker's own service, which not every distribution enables at boot:
+
+```bash
+sudo systemctl enable --now docker                        # the daemon returns after a reboot
+docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' \
+     "$(docker compose ps -q trader)"                     # must say: unless-stopped
+docker compose ps                                         # one `trader`, `Up`
+```
+
+Positions survive all of it because they live on the `./data` volume
+(`/data/trader_state.json`), which compose re-attaches on every recreate — and because the
+file is written atomically *before* a stake is signed (see "The state file" above), a
+`reboot` in the middle of a send is the one case that errs toward "hold", never toward a
+second stake.
+
+One variable decides whether a deployment is a hunt or a rehearsal, and its absence is the
+rehearsal: `DRY_RUN` (`1`/unset signs nothing, `0` signs). Check the other one before leaving
+the box unattended — `FORCE_TRADE` must be **empty**. It is a test tool that lets an
+`aave-v3` entry be supplied with no verdict behind it, and a 24/7 loop that leaves it on is a
+loop buying on nothing:
+
+```bash
+grep -E '^(DRY_RUN|FORCE_TRADE)=' .env    # → DRY_RUN=0 and no FORCE_TRADE line
+docker compose logs --tail 40 trader      # the last cycles say which mode they were in
+```
 
 The `.env` from step 3 is the file compose reads: the same
 `TESTNET_PROFILE=arbitrum`, the same key, and the same `DRY_RUN`, handed to the

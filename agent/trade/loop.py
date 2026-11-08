@@ -62,6 +62,28 @@ lets an ``aave-v3`` entry be supplied while the market has *no* verdict for it a
 a test tool that says out loud ``Force trade: I would supply $1.00 USDC to Aave.``, and
 one that lifts no ceiling, outranks no conviction and signs nothing in a dry run.
 
+When it leaves, and why a panic that has passed is a sale
+=========================================================
+
+A position that can only be *entered* is a trap, so every cycle also asks the held
+positions what the market says about them now, and two kinds of answer close one:
+
+* **a conviction** — ``THIN``, ``FORMULA`` or ``DISHONEST`` (:data:`EXIT_VERDICTS`):
+  the pool stopped being what it was bought as. There is no argument about this one;
+* **a panic that has passed** — the entry was opened on ``PANIC`` and the hunter now
+  measures ``CALM`` or ``GROWTH`` (:data:`TAKE_PROFIT_VERDICTS`). This is the
+  take-profit: the dislocation that made the pool cheap is the thing that was bought,
+  and when ordinary pricing returns there is nothing left to hold for. A position
+  opened on ``CALM`` (carry, not alpha) is *not* closed by a ``CALM`` verdict — it was
+  never bought on a dislocation, so there is none to have passed.
+
+``UNMEASURED`` closes nothing: a feed that stopped publishing is not evidence against a
+record, and a loop that liquidates on its own blindness sells at the bottom of an outage.
+A withdrawal carries the **whole** position as the venue reads it (the aToken balance,
+which is principal *plus* every interest payment since) rather than the number the state
+file remembers — the interest *is* the profit being taken, and leaving it behind would
+mean a withdrawal that does not withdraw.
+
 The state file, and why a corrupt one stops the loop
 ====================================================
 
@@ -69,6 +91,13 @@ Positions are written to ``TRADER_STATE`` (``/data/trader_state.json`` in the co
 after every cycle. A file that cannot be read is **not** treated as an empty book: an
 empty book means "no position, so the stake is new", which is how a loop stakes the same
 money twice. A corrupt state file stops the process, and the message says which file.
+
+Two details make that guarantee survive a machine that loses power rather than a process
+that exits politely. The file is replaced through a temporary neighbour and :func:`os.replace`
+— a rename is atomic, so a crash leaves either the old file or the new one and never half
+of either. And in live mode the position is written **before** the transaction is signed
+(a write-ahead), then removed again if the venue refuses: the window in which a killed
+process could forget a stake it had already sent is one a restart can no longer walk into.
 """
 from __future__ import annotations
 
@@ -80,7 +109,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from agent.physics.real_testnet_provider import (
     AAVE_KIND,
@@ -105,6 +134,7 @@ __all__ = [
     "ENV_STATE",
     "EXIT_VERDICTS",
     "ENTRY_VERDICTS",
+    "TAKE_PROFIT_VERDICTS",
     "Position",
     "TradeError",
     "Trader",
@@ -149,6 +179,17 @@ ENTRY_VERDICTS = frozenset({"PANIC", "CALM", "GROWTH"})
 #: "get out", and a feed outage must not be able to liquidate a good position.
 EXIT_VERDICTS = frozenset({"FORMULA", "DISHONEST", "THIN"})
 
+#: Verdicts that close a ``PANIC`` position because the dislocation it was bought on has
+#: closed: the pool is *measured* — the hunter looked again and answered — and ordinary
+#: pricing is back. This is the take-profit, and it is the whole of it: the alpha here is
+#: the dislocation, not a forecast of one, so there is nothing left to hold for once the
+#: pool is calm again. Two things it is not: a verdict on ``CALM`` would also close a
+#: position *opened* on ``CALM`` (carry, bought without a dislocation, so it has none to
+#: have passed — see :meth:`Trader._closing`), and it never includes ``UNMEASURED``,
+#: because a feed that stopped publishing is not a recovered pool.
+TAKE_PROFIT_VERDICTS = frozenset({"CALM", "GROWTH"})
+
+
 #: The loop's own verdict for an entry the market report never named, and the only one of
 #: its kind. It is not a hunter verdict — the hunter speaks only about pools it measured —
 #: and it is reachable only through :func:`_match_key` for an ``aave-v3`` entry, whose
@@ -192,6 +233,43 @@ def _limit(name: str, default: int, env: Optional[Mapping[str, str]] = None) -> 
     source: Mapping[str, str] = os.environ if env is None else env
     raw = str(source.get(name, "")).strip()
     return int(default) if not raw else _count(raw, name)
+
+
+def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
+    """Write ``payload`` to ``path`` so that a crash leaves one whole file, never half.
+
+    Three steps and each one earns its line: the document goes to a neighbour named after
+    the target (so a reader never opens a file that is being written), the bytes are
+    ``fsync``-ed before the rename (so the rename cannot publish an empty file after a
+    power cut), and :func:`os.replace` swaps the names in one atomic step. The directory is
+    synced too, because that is what makes the *rename* survive a cut — and a refused
+    directory sync is not an error, since a filesystem that will not answer is still a
+    filesystem that has the file.
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    neighbour = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(neighbour, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(neighbour, path)
+    except OSError:
+        try:  # a half-written neighbour is litter, not state
+            neighbour.unlink()
+        except OSError:  # pragma: no cover - nothing left to clean up
+            pass
+        raise
+    try:
+        directory = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:  # pragma: no cover - a platform that will not open a directory
+        return
+    try:
+        os.fsync(directory)
+    except OSError:  # pragma: no cover - a filesystem that will not sync a directory
+        pass
+    finally:
+        os.close(directory)
 
 
 def _signal_index(report: Any) -> Dict[str, PanicSignal]:
@@ -484,7 +562,15 @@ class Trader:
             ) from exc
 
     def _save(self, cycle: Cycle) -> None:
-        """Write the positions and the last cycle. The file is the loop's heartbeat."""
+        """Write the positions and the last cycle. The file is the loop's heartbeat.
+
+        The write is atomic — a temporary neighbour, an ``fsync`` and a rename — because
+        the reader of this file is the *next* process. A machine that loses power halfway
+        through a plain ``write_text`` leaves a truncated document, and this loop's own
+        rule (see :data:`TradeError`) turns a truncated document into a stopped agent; the
+        rename makes the only two outcomes "the old file" and "the new file", which is the
+        kind of choice that needs no repair at three in the morning.
+        """
         path = self.state_path
         if path is None:
             return
@@ -501,9 +587,7 @@ class Trader:
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
+            _atomic_write(path, payload)
         except OSError as exc:
             # A live loop that cannot write its positions would stake the same money
             # again on the next cycle, so this is fatal in live mode and a warning in a
@@ -685,7 +769,11 @@ class Trader:
     # -- what it decides ----------------------------------------------------- #
 
     def _consider(
-        self, protocol: Any, index: Dict[str, PanicSignal], cycle: Cycle
+        self,
+        protocol: Any,
+        index: Dict[str, PanicSignal],
+        cycle: Cycle,
+        closing: Mapping[str, Tuple[str, str]],
     ) -> Action:
         """One vault: does the market say buy it, and can the wallet afford a fifth?
 
@@ -696,10 +784,29 @@ class Trader:
         than by a label), the hunter's verdict was not an entry verdict, and the record came
         from the feed while the address is a vault. :data:`ENV_FORCE` lifts the second one
         for an ``aave-v3`` entry and nothing else — see :meth:`_forced`.
+
+        ``closing`` is the fourth, and it is the first thing asked: a position this cycle is
+        about to withdraw is not topped up first (:meth:`_closing`). A ``CALM`` verdict on a
+        panic-opened pool is an *exit* here, and an ``aave-v3`` entry on ``CALM`` is
+        otherwise an entry — so a cycle that did not ask would supply a dollar and withdraw
+        it in the same breath, paying two fees to stand still.
         """
         name = str(getattr(protocol, "name", ""))
         address = str(getattr(protocol, "address", "")).lower()
         kind = _kind_of(self.venue, address)
+        leaving = closing.get(address)
+        if leaving is not None:
+            verdict, why = leaving
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                reason=(
+                    f"this position is leaving on this cycle ({why}): nothing is added to "
+                    "it, because a top-up now would be withdrawn in the same breath"
+                ),
+            )
         identity = _identity_of(self.venue, address)
         key = _match_key(index, name, identity, kind)
         signal = index.get(key) if key else None
@@ -842,6 +949,7 @@ class Trader:
             size,
             verdict,
             confidence,
+            cycle=cycle,
             held=at_venue,
             kind=kind,
             identity=identity,
@@ -896,6 +1004,7 @@ class Trader:
         verdict: str,
         confidence: float,
         *,
+        cycle: Cycle,
         held: float = 0.0,
         kind: str = "",
         identity: Any = None,
@@ -911,6 +1020,13 @@ class Trader:
         ``held`` is what the entry already holds, and the position this cycle records is the
         sum: an Aave supply *grows* a position, so storing only the delta would make the loop
         forget the rest of its own money and size the next cycle as if it had none.
+
+        ``cycle`` is here for the **write-ahead**: before a live send the position is written
+        to the state file, and it is taken back out again if the venue refuses, the call
+        raises, or the state file turns out to be unwritable (in which case the cycle stops
+        before signing rather than spending money it could not remember). The order is what
+        matters — a kill between the signature and the save used to be the one window in
+        which a restart would stake the same dollars again.
 
         ``forced`` is ``FORCE_TRADE`` at work, and it prints one sentence before anything is
         priced into a transaction — ``Force trade: I would supply $1.00 USDC to Aave.`` in a
@@ -948,25 +1064,28 @@ class Trader:
             if forced:
                 self.printer(self._force_line(identity, size, sent=None))
             return action
+        previous = self.positions.get(address)
+        self.positions[address] = Position(
+            address=address,
+            name=name,
+            amount=total,
+            at=float(self.now()),
+            verdict=verdict,
+            confidence=confidence,
+        )
+        self._save(cycle)  # the write-ahead: remembered before it is signed
         try:
             ok = bool(self.venue.execute_stake(address, size.amount))
         except Exception as exc:  # noqa: BLE001 - a failed send is a row, not a crash
+            self._unremember(address, previous, cycle)
             action.kind = "error"
             action.reason = f"the stake raised {type(exc).__name__}: {exc}"
             if forced:
                 self.printer(self._force_line(identity, size, sent=False, error=action.reason))
             return action
         action.sent = ok
-        if ok:
-            self.positions[address] = Position(
-                address=address,
-                name=name,
-                amount=total,
-                at=float(self.now()),
-                verdict=verdict,
-                confidence=confidence,
-            )
-        else:
+        if not ok:
+            self._unremember(address, previous, cycle)
             action.reason = self._refusal_line() or "the venue refused the stake"
         if forced:
             self.printer(
@@ -975,6 +1094,23 @@ class Trader:
                 )
             )
         return action
+
+    def _unremember(
+        self, address: str, previous: Optional[Position], cycle: Cycle
+    ) -> None:
+        """Take a write-ahead back: the stake did not happen, so the file must not say it did.
+
+        ``previous`` is the position this address held *before* the attempt (``None`` when
+        the entry was new), and restoring it rather than deleting the key is what keeps a
+        refused top-up from erasing a real position. The file is rewritten here rather than
+        at the end of the cycle, because a process killed in between would restart holding a
+        position it never bought — the exact mistake the write-ahead exists to prevent.
+        """
+        if previous is None:
+            self.positions.pop(address, None)
+        else:
+            self.positions[address] = previous
+        self._save(cycle)
 
     @staticmethod
     def _force_line(
@@ -1010,23 +1146,32 @@ class Trader:
             return str(last.get("reason", "") or "")
         return str(last)
 
-    def _revisit(
-        self, protocols: List[Any], index: Dict[str, PanicSignal], cycle: Cycle
-    ) -> None:
-        """Positions the market has since disowned: leave, with the verdict as the reason.
+    def _closing(self, index: Mapping[str, PanicSignal]) -> Dict[str, Tuple[str, str]]:
+        """The positions this cycle's verdicts close, per address, with the sentence why.
 
-        Only the verdicts that *convict* a pool close a position. ``UNMEASURED`` does not:
-        a feed that stopped publishing is not evidence against a record, and a loop that
-        liquidates on its own blindness is a loop that sells at the bottom of an outage.
+        Two verdicts close a position and they are different arguments, so both are spelled
+        out here rather than in a condition a reader has to reconstruct:
+
+        * :data:`EXIT_VERDICTS` — the pool stopped being what it was bought as
+          (``THIN``/``FORMULA``/``DISHONEST``). The hunter has evidence against it.
+        * :data:`TAKE_PROFIT_VERDICTS` — the entry was opened on ``PANIC`` and the hunter now
+          measures ordinary pricing (``CALM``/``GROWTH``). The dislocation *was* the thesis
+          and it has closed, which is a sale, not a hold.
+
+        The position's own ``verdict`` is what makes the second one a take-profit instead of
+        a churn: an entry opened on ``CALM`` was bought for carry, has no dislocation to have
+        passed, and stays. ``UNMEASURED`` closes nothing at all — a feed that stopped
+        publishing is not evidence about the pool, and a loop that liquidates on its own
+        blindness sells at the bottom of an outage.
+
+        The answer is computed *before* the entries are considered (see :meth:`_consider`),
+        because a position that is leaving this cycle must not be topped up on the way out.
         """
-        published = {
-            str(getattr(protocol, "address", "")).lower(): protocol for protocol in protocols
-        }
-        for address, position in list(self.positions.items()):
+        closing: Dict[str, Tuple[str, str]] = {}
+        for address, position in self.positions.items():
             # The same key the entry was *opened* on: a pool recognised by its declaration
             # rather than by its label would otherwise be impossible to leave on the verdict
             # that recognised it, and a position that can only be entered is a trap.
-            held_protocol = published.get(address)
             key = _match_key(
                 index,
                 position.name,
@@ -1034,27 +1179,102 @@ class Trader:
                 _kind_of(self.venue, address),
             ) or _normalise(position.name)
             signal = index.get(key)
-            if signal is not None:
-                verdict = str(getattr(signal, "verdict", ""))
-                if verdict in EXIT_VERDICTS:
-                    cycle.actions.append(
-                        self._exit(position, verdict, str(getattr(signal, "reason", "")))
-                    )
-                    continue
-            if held_protocol is None:
+            if signal is None:
+                continue
+            verdict = str(getattr(signal, "verdict", ""))
+            reason = str(getattr(signal, "reason", ""))
+            if verdict in EXIT_VERDICTS:
+                closing[address] = (
+                    verdict,
+                    reason or "the pool is no longer what it was bought as",
+                )
+                continue
+            if verdict in TAKE_PROFIT_VERDICTS and str(position.verdict).upper() == "PANIC":
+                closing[address] = (
+                    verdict,
+                    f"the panic this position was opened on has closed — the hunter measures"
+                    f" {verdict} now" + (f" ({reason})" if reason else "") + ", so the "
+                    "dislocation is taken rather than waited out",
+                )
+        return closing
+
+    def _revisit(
+        self,
+        protocols: List[Any],
+        index: Dict[str, PanicSignal],
+        cycle: Cycle,
+        closing: Mapping[str, Tuple[str, str]],
+    ) -> None:
+        """Turn the closing verdicts into transactions, and keep everything else.
+
+        Only the verdicts :meth:`_closing` names close a position: a conviction, or a panic
+        that has passed. A position whose pool was not published this cycle is *kept* and
+        flagged, because "the vault said nothing today" is not a reason to sell.
+        """
+        published = {
+            str(getattr(protocol, "address", "")).lower(): protocol for protocol in protocols
+        }
+        for address, position in list(self.positions.items()):
+            verdict, reason = closing.get(address, ("", ""))
+            if verdict:
+                cycle.actions.append(self._exit(position, verdict, reason, cycle=cycle))
+                continue
+            if address not in published:
                 cycle.warnings.append(
                     f"{position.name}: still holding {position.amount:.6f}, but the vault "
                     "published no record this cycle — the position is kept, not guessed at"
                 )
 
-    def _exit(self, position: Position, verdict: str, reason: str) -> Action:
+    def _whole_position(self, position: Position, cycle: Cycle) -> Optional[float]:
+        """What the venue would give back — ``None`` when the chain says there is nothing.
+
+        A vault has no receipt to ask, so the number the state file remembers is the only
+        answer there is. An Aave position is the opposite: the aToken balance *is* the
+        position — supplied principal plus every interest payment since — and it is what a
+        take-profit exists for. Withdrawing the remembered amount would leave the profit in
+        the pool and call the result an exit.
+
+        A zero from a chain that answered is a fact, not a missing value (the same rule
+        :meth:`_at_venue` keeps): it means the money is not there, and a withdrawal of it
+        would be a revert and a fee for nothing.
+        """
+        recorded = float(getattr(position, "amount", 0.0) or 0.0)
+        if _kind_of(self.venue, position.address) != AAVE_KIND:
+            return recorded
+        balance = self._balance(position.address, cycle)
+        if balance is None or not getattr(balance, "ok", False):
+            return recorded
+        if not str(getattr(balance, "position_token", "") or ""):
+            return recorded
+        return float(getattr(balance, "position_balance", 0.0) or 0.0)
+
+    def _exit(
+        self, position: Position, verdict: str, reason: str, *, cycle: Cycle
+    ) -> Action:
         """Close a position — the same dry-run rule as a stake, in the other direction."""
+        amount = self._whole_position(position, cycle)
+        if amount is None or float(amount) <= 0.0:
+            # The receipt says the position is empty: a withdrawal made by hand, or one this
+            # loop already signed on a cycle whose state file was lost. The file is what is
+            # wrong, so it is corrected here instead of paying a fee to withdraw nothing.
+            self.positions.pop(position.address, None)
+            return Action(
+                kind="hold",
+                venue=position.name,
+                address=position.address,
+                verdict=verdict,
+                confidence=float(position.confidence),
+                reason=(
+                    f"{reason} — but the venue reports an empty position, so there is "
+                    "nothing to withdraw: the stale entry was dropped instead of signed"
+                ),
+            )
         action = Action(
             kind="withdraw",
             venue=position.name,
             address=position.address,
-            amount=float(position.amount),
-            usd=float(position.amount),
+            amount=float(amount),
+            usd=float(amount),
             verdict=verdict,
             confidence=float(position.confidence),
             reason=reason or "the pool is no longer what it was bought as",
@@ -1063,7 +1283,7 @@ class Trader:
         if self.sizing.dry_run:
             return action
         try:
-            ok = bool(self.venue.withdraw(position.address, position.amount))
+            ok = bool(self.venue.withdraw(position.address, float(amount)))
         except Exception as exc:  # noqa: BLE001 - same rule as the stake
             action.kind = "error"
             action.reason = f"the withdrawal raised {type(exc).__name__}: {exc}"
@@ -1136,10 +1356,13 @@ class Trader:
                 "no vault in the operator's book has published a record: there is nothing "
                 "to price and nothing to stake"
             )
+        # Decided before anything is bought: a position that leaves this cycle must not be
+        # topped up on the same pass (see :meth:`_consider`).
+        closing = self._closing(index)
         for protocol in protocols:
-            cycle.actions.append(self._consider(protocol, index, cycle))
+            cycle.actions.append(self._consider(protocol, index, cycle, closing))
         self._unclaimed(protocols, index, cycle)
-        self._revisit(protocols, index, cycle)
+        self._revisit(protocols, index, cycle, closing)
         self.cycles = cycle.number
         self._save(cycle)
         return cycle

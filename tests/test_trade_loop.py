@@ -464,20 +464,32 @@ def test_an_empty_book_says_so_in_one_line():
 # ── the memory: positions, exits, and a file that must not lie ──────────────
 
 
-def seed(path: Path, amount: float = 13.6, name: str = "Aave V3 USDC") -> Path:
-    """A state file that says this loop already holds one position."""
+def seed(
+    path: Path,
+    amount: float = 13.6,
+    name: str = "Aave V3 USDC",
+    *,
+    address: str = VAULT,
+    verdict: str = "PANIC",
+) -> Path:
+    """A state file that says this loop already holds one position.
+
+    ``verdict`` is the verdict the position was *opened* on, and it is what makes a
+    ``CALM`` cycle a take-profit for one position and a hold for another: a position bought
+    into a panic has a dislocation to have passed, and a position bought for carry does not.
+    """
     path.write_text(
         json.dumps(
             {
                 "version": 1,
                 "cycles": 3,
                 "positions": {
-                    VAULT: {
-                        "address": VAULT,
+                    address: {
+                        "address": address,
                         "name": name,
                         "amount": amount,
                         "at": 1_699_000_000.0,
-                        "verdict": "PANIC",
+                        "verdict": verdict,
                         "confidence": 1.0,
                     }
                 },
@@ -532,6 +544,153 @@ def test_a_position_whose_vault_stopped_publishing_is_kept_and_flagged(tmp_path)
 
     assert any("published no record" in warning for warning in cycle.warnings)
     assert list(made.positions) == [VAULT]
+
+
+# ── the take-profit: a panic that has passed is a sale, not a hold ───────────
+#
+# Without this the loop could only ever leave a pool because the market *convicted* it — so
+# every good trade stayed open until something went wrong with it. The dislocation a PANIC
+# entry is bought into is the whole thesis, and ``CALM``/``GROWTH`` is that thesis closing.
+
+
+@pytest.mark.parametrize("verdict", sorted(L.TAKE_PROFIT_VERDICTS))
+def test_a_panic_that_has_passed_is_taken(tmp_path, verdict):
+    """Opened on a panic, measured calm: the position leaves with its profit, once."""
+    state = seed(tmp_path / "state.json", verdict="PANIC")
+    venue = FakeVenue()
+    made = trader(venue, signal(verdict=verdict), dry_run=False, state=state)
+    cycle = made.run_once()
+
+    assert [action.kind for action in cycle.actions] == ["hold", "withdraw"]
+    exit_row = cycle.actions[-1]
+    assert exit_row.verdict == verdict
+    assert "the panic this position was opened on has closed" in exit_row.reason
+    assert venue.withdrawals == [(VAULT, pytest.approx(13.6))]
+    assert made.positions == {}
+    assert json.loads(state.read_text())["positions"] == {}
+
+
+def test_a_calm_position_is_not_sold_by_a_calm_verdict(tmp_path):
+    """Bought for carry on CALM: there was no dislocation, so there is none to have passed."""
+    state = seed(tmp_path / "state.json", verdict="CALM")
+    venue = FakeVenue()
+    made = trader(venue, signal(verdict="CALM"), dry_run=False, state=state)
+    cycle = made.run_once()
+
+    assert [action.kind for action in cycle.actions] == ["hold"]
+    assert venue.withdrawals == []
+    assert list(made.positions) == [VAULT]
+
+
+def test_the_take_profit_withdraws_the_whole_atoken_balance(tmp_path):
+    """The file remembers $1.00 supplied; the chain says $1.35, and that is the exit.
+
+    Withdrawing the remembered number would leave the interest — the thing a take-profit
+    exists to collect — sitting in the pool, and would call it a closed position.
+    """
+    state = seed(tmp_path / "state.json", amount=1.0, name=AAVE_NAME, address=AAVE)
+    venue = pool_venue(position=1.35)
+    cycle = trader(
+        venue, signal(verdict="CALM", name=AAVE_NAME), dry_run=False, state=state
+    ).run_once()
+
+    assert [action.kind for action in cycle.actions] == ["hold", "withdraw"]
+    assert cycle.actions[-1].amount == pytest.approx(1.35)
+    assert venue.withdrawals == [(AAVE, pytest.approx(1.35))]
+
+
+def test_a_position_the_chain_says_is_gone_is_dropped_instead_of_signed(tmp_path):
+    """A zero from a chain that answered is a fact: nothing to withdraw, and no fee for it."""
+    state = seed(tmp_path / "state.json", amount=1.0, name=AAVE_NAME, address=AAVE)
+    venue = pool_venue(position=0.0)
+    made = trader(
+        venue, signal(verdict="CALM", name=AAVE_NAME), dry_run=False, state=state
+    )
+    cycle = made.run_once()
+
+    assert [action.kind for action in cycle.actions] == ["hold", "hold"]
+    assert "reports an empty position" in cycle.actions[-1].reason
+    assert venue.withdrawals == []
+    assert made.positions == {}
+    assert json.loads(state.read_text())["positions"] == {}
+
+
+# ── the write-ahead: remembered before it is signed, struck out when refused ─
+
+
+@dataclass
+class WatchfulVenue(FakeVenue):
+    """A venue that opens the state file at the moment it is asked to sign."""
+
+    state: Optional[Path] = None
+    seen: List[Dict[str, Any]] = field(default_factory=list)
+
+    def execute_stake(self, address: str, amount: float) -> bool:
+        if self.state is not None:
+            self.seen.append(json.loads(self.state.read_text(encoding="utf-8")))
+        return super().execute_stake(address, amount)
+
+
+@dataclass
+class KilledVenue(FakeVenue):
+    """A process that dies between the save and the answer: the worst case, in one line."""
+
+    def execute_stake(self, address: str, amount: float) -> bool:
+        raise KeyboardInterrupt("the operator stopped the agent mid-send")
+
+
+def test_the_position_is_written_to_the_file_before_it_is_signed(tmp_path):
+    state = tmp_path / "state.json"
+    venue = WatchfulVenue(state=state)
+    trader(venue, signal(), dry_run=False, state=state).run_once()
+
+    assert venue.seen, "the venue was never asked to sign"
+    assert venue.seen[0]["positions"][VAULT]["amount"] == pytest.approx(13.6)
+
+
+def test_a_kill_between_the_save_and_the_send_leaves_the_position_remembered(tmp_path):
+    """Unknown is not zero: a killed send keeps the position, because a second stake costs.
+
+    The loop cannot tell whether a signature that never returned moved the money, so it
+    restarts holding the position. The cost of that choice is a cycle of "already at the
+    ceiling" on a stake that did not land; the cost of the other is the same dollars twice.
+    """
+    state = tmp_path / "state.json"
+    with pytest.raises(KeyboardInterrupt):
+        trader(KilledVenue(), signal(), dry_run=False, state=state).run_once()
+
+    stored = json.loads(state.read_text())["positions"]
+    assert stored[VAULT]["amount"] == pytest.approx(13.6)
+
+    again = trader(FakeVenue(), signal(), dry_run=False, state=state).run_once()
+    assert again.actions[0].kind == "hold"          # nothing is staked a second time
+
+
+def test_a_refused_stake_is_struck_out_of_the_file(tmp_path):
+    state = tmp_path / "state.json"
+    made = trader(FakeVenue(refuse=True), signal(), dry_run=False, state=state)
+    cycle = made.run_once()
+
+    assert cycle.actions[0].sent is False
+    assert made.positions == {}
+    assert json.loads(state.read_text())["positions"] == {}
+
+
+def test_a_refused_top_up_keeps_the_position_it_would_have_grown(tmp_path):
+    """The write-ahead is taken back, not the position: a refusal is not a withdrawal."""
+    state = seed(tmp_path / "state.json", amount=1.0, name=AAVE_NAME, address=AAVE)
+    made = trader(
+        pool_venue(position=1.4, refuse=True),
+        signal(name=AAVE_NAME),
+        dry_run=False,
+        state=state,
+    )
+    cycle = made.run_once()
+
+    assert cycle.actions[0].kind == "stake"
+    assert cycle.actions[0].sent is False
+    assert made.positions[AAVE].amount == pytest.approx(1.0)
+    assert json.loads(state.read_text())["positions"][AAVE]["amount"] == pytest.approx(1.0)
 
 
 def test_a_second_cycle_does_not_buy_the_same_vault_twice():
