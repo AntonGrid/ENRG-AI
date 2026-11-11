@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -156,13 +157,23 @@ class Criteria:
         return hashlib.sha256(self.canonical().encode("utf-8")).hexdigest()
 
     def document(self, run: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-        """A report header: the criteria, their hash, and whatever the run measured."""
+        """A report header: the criteria, their hash, and whatever the run measured.
+
+        The measured half is passed through :func:`_jsonable`, because JSON has no infinity
+        and two of the numbers this package measures are legitimately infinite: a profit
+        factor with no losing trade, and a resolution for a row with too few trades to have
+        one. Writing them as the strings ``"inf"``/``"nan"`` keeps the distinction a reader
+        needs — "no losing trade" is not ``1.0`` and "no resolution" is not ``0`` — and keeps
+        the file writable. The declared half is *not* passed through it: a criterion that is
+        infinite is a bug in the declaration, and it must fail loudly rather than be spelled
+        around.
+        """
         payload: Dict[str, Any] = {
             "criteria_sha256": self.fingerprint(),
             "criteria": self.as_dict(),
         }
         if run is not None:
-            payload["run"] = dict(run)
+            payload["run"] = _jsonable(dict(run))
         return payload
 
     def write(self, path: Any, run: Optional[Mapping[str, Any]] = None) -> Path:
@@ -180,6 +191,29 @@ class Criteria:
             f"Criteria(alpha={self.alpha}, power={self.power}, gate={self.gate}, "
             f"seed={self.seed})"
         )
+
+
+def _jsonable(value: Any) -> Any:
+    """The value as JSON will accept it: non-finite floats become their own spelling.
+
+    ``json.dumps(..., allow_nan=False)`` refuses ``inf``, and this package produces it on
+    purpose. A pooled row whose trades all won has ``profit_factor = inf``; a row with fewer
+    than two trades has ``min_edge_bps = inf``, which is the honest reading of "this book
+    cannot name an edge yet". Dropping the number, clamping it, or letting the writer raise
+    would each turn a measurement into a missing field — the one thing a pre-registration
+    exists to prevent.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def verify(document: Mapping[str, Any]) -> str:

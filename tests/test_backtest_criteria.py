@@ -84,6 +84,38 @@ def test_the_document_is_json_without_infinities():
     assert json.loads(written)["criteria_sha256"] == declared().fingerprint()
 
 
+def test_an_infinite_measurement_is_written_not_dropped(tmp_path):
+    """``inf`` is a real measurement here, and the file must survive having measured it.
+
+    This is the shape the grid actually produced, from ``--symbols btcusdt --splits 1``: a
+    ``policy+atr`` row with two trades that both won has ``profit_factor = inf``, and a row
+    with no trades has ``min_edge_bps = inf``. An earlier writer refused both — the run
+    computed its table, wrote its CSV, and then died on its own report, which is the worst
+    possible order for the two to part company.
+    """
+    path = declared().write(
+        tmp_path / "criteria.json",
+        {
+            "trades": 2,
+            "summaries": [
+                {"ablation": "policy+atr", "trades": 2, "profit_factor": float("inf")},
+                {"ablation": "baseline", "trades": 1, "min_edge_bps": float("inf")},
+                {"ablation": "policy+atr+regime", "trades": 0, "min_edge_bps": float("nan")},
+                {"ablation": "policy", "trades": 40, "min_edge_bps": -12.5},
+            ],
+        },
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert verify(payload) == ""
+    rows = payload["run"]["summaries"]
+    assert rows[0]["profit_factor"] == "inf"
+    assert rows[1]["min_edge_bps"] == "inf"
+    assert rows[2]["min_edge_bps"] == "nan"
+    assert rows[3]["min_edge_bps"] == pytest.approx(-12.5)
+    # The declared half stays strictly numeric, so a reader can compare it as numbers.
+    assert all(isinstance(value, (int, float)) for value in payload["criteria"]["gate"].values())
+
+
 def test_write_round_trips_through_disk(tmp_path):
     path = declared().write(tmp_path / "nested" / "criteria.json", {"pairs": ["btcusdt"]})
     payload = json.loads(path.read_text(encoding="utf-8"))
