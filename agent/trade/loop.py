@@ -523,6 +523,16 @@ class Trader:
     #: and :meth:`_forced` is the whole of its remit: three conditions, no ceiling lifted,
     #: no conviction outranked, nothing signed in a dry run.
     force: bool = False
+    #: The learned veto, and the *only* thing it may do here: refuse an entry the hunter
+    #: allowed. ``policy`` is a fitted :class:`agent.backtest.policy.LogisticPolicy` (anything
+    #: with ``score`` and ``threshold`` will do) and ``case`` turns ``(address, signal)`` into
+    #: the feature row it was fitted on. Both default to ``None``, and with either missing this
+    #: loop behaves exactly as it did before the fields existed — which is the property that
+    #: makes the organ removable. The policy can never promote a refused entry and never sizes
+    #: one: the detector still decides what is interesting, the model decides whether it is
+    #: worth the fee.
+    policy: Any = None
+    case: Optional[Callable[[str, Any], Optional[Mapping[str, float]]]] = None
     cycles: int = 0
     positions: Dict[str, Position] = field(default_factory=dict)
 
@@ -606,6 +616,7 @@ class Trader:
             "sizing": self.sizing.describe(),
             "state": None if self.state_path is None else str(self.state_path),
             "force": bool(self.force),
+            "policy": bool(self.policy is not None and self.case is not None),
             "cycles": int(self.cycles),
             "positions": [position.as_dict() for position in self.positions.values()],
         }
@@ -905,7 +916,23 @@ class Trader:
                 ),
             )
 
+        # The learned veto, after the hunter has spoken and before a single RPC is spent on
+        # sizing: a bar the model will not buy is not worth a balance read. It sits *below*
+        # the verdict and the record checks on purpose — it may only subtract from what they
+        # allowed, never add to it.
+        veto = self._vetoed(address, signal, verdict)
+        if veto:
+            return Action(
+                kind="hold",
+                venue=name,
+                address=address,
+                verdict=verdict,
+                confidence=confidence,
+                reason=veto,
+            )
+
         balance = self._balance(address, cycle)
+
         if balance is None:
             return Action(
                 kind="hold",
@@ -955,6 +982,43 @@ class Trader:
             identity=identity,
             forced=forced,
             note=note,
+        )
+
+    def _vetoed(self, address: str, signal: Any, verdict: str) -> str:
+        """The policy's refusal, in a sentence — ``""`` when it has nothing to say.
+
+        Four ways to say nothing, and every one of them is deliberate:
+
+        * no policy attached, or no way to describe the bar — the organ is not installed;
+        * the feature builder returns nothing for this address — the loop is a *pool* reader
+          and a candle series is not always in hand, and a policy asked about a bar it cannot
+          see must abstain rather than guess;
+        * the builder throws — an unreadable bar is not an allowed one, so it is vetoed with
+          the exception's name in the sentence rather than swallowed;
+        * the score is at or above the threshold — the model agrees with the hunter.
+
+        It is a veto and only a veto: there is no branch here that returns "buy".
+        """
+        policy = self.policy
+        if policy is None or self.case is None:
+            return ""
+        try:
+            features = self.case(address, signal)
+        except Exception as exc:  # a feature builder must not be able to stop a cycle
+            return (
+                f"the policy could not describe this bar ({type(exc).__name__}: {exc}) — "
+                "vetoed, because a bar nobody could read is not a bar that was approved"
+            )
+        if not features:
+            return ""
+        score = float(policy.score(features))
+        threshold = float(getattr(policy, "threshold", 0.5))
+        if score >= threshold:
+            return ""
+        return (
+            f"the policy vetoed a {verdict or 'measured'} entry: p={score:.3f} below "
+            f"{threshold:.2f} — the hunter found a dislocation, this bar did not look like "
+            "one that pays the fee"
         )
 
     def _forced(self, kind: str, verdict: str) -> bool:
