@@ -1255,21 +1255,86 @@ the next experiment is a shorter bar (4hour, 333 days) or a cooldown, not a long
 
 
 
-Tests: `tests/test_backtest_data.py`, `tests/test_backtest_provider.py`,
-`tests/test_backtest_engine.py` and `tests/test_backtest_sweep.py` — 103 of them, and **not one
-opens a socket**: the transport is a parameter, the venue is a list of hand-written bars, the
-chart is a CSV in `tmp_path`, and the sweep's universe is a dictionary. What they pin: the
-newest-first answer reversed once, quote-versus-base volume, every failure as a sentence, the
-decline mapping (a bar that rose pays 0, a warm-up bar pays `nan`), the settlement lag, the
-slippage and the fee on both sides, the stop inside a bar and through a gap, one position at a
-time, the refusal with its reason, the exit table against the live loop's constants, **the
-prefix every verdict was measured on** (the detector is wrapped and every prefix length
-recorded, so a lookahead is a failing test and not a suspicion), the metrics read from a
-hand-built curve, the three files, the CLI's four exit codes, the universe's ranking and its
-tie-break, a failed pair kept in the table as a row, the sweep's totals, and the wall itself: no
-module in `agent/backtest/` imports `web3`, `agent.trade`, `real_testnet_provider` or
-`subprocess`, and the only `urllib` import in the package is *inside* the default transport,
-where `--csv` and `fetch=` never reach it.
+### The exit grid: ten books, one question, and no verdict
+
+`walkforward.py` is the backtest that refuses to answer. It fits the policy on the past, sells
+into the future a fold at a time, pools every fold and pair into one reading per ablation, and
+then asks the question the sweep cannot: *could this many trades have seen the gate at all?*
+The arithmetic is `agent/backtest/power.py` — a gate of 30 bps read at α 0.05 with power 0.9
+needs a spread and a count, and a book with too little of either prints **unmeasured**, not
+**fail**, because a sample that cannot see an edge has not disproved one.
+
+Ten books, one command (`bash scripts/exit_grid.sh`, about 25 minutes on 16 cores):
+
+```
+book                       period   folds  trades  bps/trade       t   σ bps  ± bps  needed
+base (fixed 2 % stop)      4hour        5       8       +2.7   +0.04     174    233     356
+base (ATR-2 stop)          4hour        5       8      +57.7   +1.43     114    153     155
+ATR-2                      4hour        5       8      +57.7   +1.43     114    153     155
+ATR-2 · risk 2 %           4hour        5       8      +57.7   +1.43     114    153     155
+ATR-2 · take-profit 2R     4hour        5       8      +57.7   +1.43     114    153     155
+ATR-2 · 2R + 1R trail      4hour        5       8      +57.7   +1.43     114    153     155
+ATR-2 · time stop 48 bars  4hour        5       8      +57.7   +1.43     114    153     155
+base                      1day        14      31      +76.6   +1.00     428    257    2140
+base (ATR-2 stop)         1day        14      15      +22.7   +0.12     748    674    6533
+ATR-2 · take-profit 2R     1day        14      15      +22.7   +0.12     748    674    6533
+```
+
+Read the middle column first: eight trades on the four-hour book and thirty-one on the daily
+one, against 155 and 2140 needed. **Not one row resolves the gate**, and the honest verdict on
+all ten is `unmeasured` — the gate is not cleared and not refused.
+
+What the grid did establish is which knob moves the number that *could* be resolved later. The
+stop is the only one that did anything: a fixed 2 % stop leaves +2.7 bps a trade against a 174
+bps spread, while an ATR-2 stop leaves +57.7 against 114 — the money a trade earns rises
+twenty-onefold and the spread falls by a third. Take-profit, trailing and the time stop moved
+nothing, and the reason is a property of the bars rather than a wiring bug. A direct probe of
+the same exits on one pair (btcusdt, daily, 2000 bars) shows the shape: nine trades, mean hold
+**2.7 bars**, and the exits read `take-profit 7, stop 2` — the signal closes seven of nine
+before a 2R target, a 1R trail or a clock can fire. Asking the clock for five bars moves
+exactly one trade and takes the profit factor from 0.89 to 0.88; the knobs work, there is
+nothing for them to grab.
+
+The daily book is *worse*, which is the opposite of what "more history" suggests: fourteen
+folds and half as many trades per fold, with a spread of 428–748 bps because every trade is a
+week-long swing. Resolution is bought with **count**, and the count is bought with breadth —
+`4hour` is capped at 2000 bars by the venue, so a longer window is not on offer; ~1.6 trades
+per pair per year means the 155 trades this gate needs are about a hundred pairs, not five
+years.
+
+Every row above is checkable afterwards, which the grid also had to fix. Each run writes
+`criteria.json` beside its table: the gate, its sha256 from `criteria.py`, the exits it ran
+with, and the sha256 of the bars it read — so a table and the criteria it was judged against
+cannot drift apart without the hash saying so. A live run is deterministic only *given* its
+candles, and the venue's candles move (one new bar closes and every fold boundary shifts), so
+the same command an hour later is a different experiment. `--save-candles` freezes what a run
+read and `--candles` replays it:
+
+```
+python -m agent.backtest.walkforward --symbols btcusdt --period 4hour --days 340 \
+    --save-candles data/frozen/4hour --out data/grid/verify-4hour
+bash scripts/exit_grid.sh --replay data/frozen/4hour 4hour
+```
+
+`data/frozen/` holds those bars (one pair, two periods, ~280 kB), and replaying them on another
+machine must print the same 64-character hash for `walkforward.csv`. On this machine it does,
+byte for byte: `b3156728c363fa4f50ef00910b0436c23c2c358c95387a5d7a4250ca08e54076`.
+
+
+Tests: `tests/test_backtest_*.py` — 249 of them, and **not one opens a socket**: the transport
+is a parameter, the venue is a list of hand-written bars, the chart is a CSV in `tmp_path`, and
+the sweep's universe is a dictionary. What they pin: the newest-first answer reversed once,
+quote-versus-base volume, every failure as a sentence, the decline mapping (a bar that rose
+pays 0, a warm-up bar pays `nan`), the settlement lag, the slippage and the fee on both sides,
+the stop inside a bar and through a gap, one position at a time, the refusal with its reason,
+the exit table against the live loop's constants, **the prefix every verdict was measured on**
+(the detector is wrapped and every prefix length recorded, so a lookahead is a failing test and
+not a suspicion), the metrics read from a hand-built curve, the three files, the CLI's four exit
+codes, the universe's ranking and its tie-break, a failed pair kept in the table as a row, the
+sweep's totals, the criteria file that survives an infinite measurement, the freeze that reads
+back as the same floats, and the wall itself: no module in `agent/backtest/` imports `web3`,
+`agent.trade`, `real_testnet_provider` or `subprocess`, and the only `urllib` import in the
+package is *inside* the default transport, where `--csv` and `fetch=` never reach it.
 
 ## Energy generation forecasting
 

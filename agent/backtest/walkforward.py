@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import csv
+import hashlib
 import math
 import statistics
 import sys
@@ -80,7 +81,9 @@ from agent.backtest.data import (
     HtxError,
     declines,
     fetch_klines,
+    load_csv,
     universe,
+    write_csv,
 )
 from agent.backtest.engine import BacktestResult, Backtester, Settings, Trade
 from agent.backtest.exits import (
@@ -985,6 +988,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-train", type=int, default=MIN_RECORD + 1, help="bars a training block must hold")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per request")
     parser.add_argument("--out", default=DEFAULT_OUT, help="where the table is written")
+    parser.add_argument(
+        "--candles",
+        default="",
+        help=(
+            "read <pair>.csv from this directory instead of the venue, so a run can be "
+            "reproduced bar for bar; the file is the window, so --days does not apply, and "
+            "the directory's hash is written beside the table"
+        ),
+    )
+    parser.add_argument(
+        "--save-candles",
+        default="",
+        help="write the bars this run read into this directory, for --candles to replay",
+    )
     parser.add_argument("--delimiter", default=",", help="the CSV separator")
     parser.add_argument("--quiet", action="store_true", help="write the files, print nothing")
     add_admission_arguments(parser)
@@ -999,8 +1016,17 @@ def _series(
     days: float,
     timeout: float,
     endpoint: str,
+    candles: Optional[Path] = None,
 ) -> CandleSeries:
-    """One pair's candles, through the same transport the sweep and the runner use."""
+    """One pair's candles: from a frozen file when one is named, from the venue otherwise.
+
+    ``candles`` is what makes a run reproducible. The venue serves a moving window — one new
+    bar closes and every fold boundary shifts — so two runs of the same command are only the
+    same experiment if both read the same bars. Naming a directory freezes that choice, and
+    the directory's hash travels with the table (:func:`_candles_fingerprint`).
+    """
+    if candles is not None:
+        return load_csv(Path(candles) / f"{symbol}.csv", symbol=symbol, period=str(period))
     return fetch_klines(
         symbol,
         period=str(period),
@@ -1008,6 +1034,29 @@ def _series(
         timeout=float(timeout),
         endpoint=endpoint,
     )
+
+
+def _freeze(series: CandleSeries, directory: Path) -> Path:
+    """Write one series where ``--candles`` will look for it, and say where that was."""
+    return write_csv(series, Path(directory) / f"{series.symbol}.csv")
+
+
+def _candles_fingerprint(paths: Sequence[Path]) -> str:
+    """A short hash of the frozen files, so two machines can prove they read the same bars.
+
+    The names go into the hash with the bytes: two directories that hold the same candles
+    under different names are not the same input, because the pair list is part of the run.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(Path(path).resolve() for path in paths):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"absent")
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _write_csv(path: Path, readings: Sequence[Reading], summaries: Sequence[Summary]) -> Path:
@@ -1101,6 +1150,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     symbols: List[str] = []
     if str(args.symbols).strip():
         symbols = [name.strip().lower() for name in str(args.symbols).split(",") if name.strip()]
+    elif str(args.candles).strip():
+        # A frozen directory *is* a universe: the pairs in it are the pairs that were read,
+        # and asking the venue for a ranking would make the run depend on today's turnover.
+        symbols = sorted(path.stem.lower() for path in Path(args.candles).glob("*.csv"))
+        if not symbols:
+            print(
+                f"walkforward: {args.candles} holds no <pair>.csv; pass --symbols or --save-candles",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
     else:
         try:
             listed = universe(
@@ -1130,6 +1189,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"── walkforward · {len(symbols)} pairs · {args.period} · {describe_exits(exits)}"
         )
     endpoint = HTX_ENDPOINTS[1 if str(args.exchange) == "huobi" else 0]
+    frozen = Path(args.candles) if str(args.candles).strip() else None
+    saving = Path(args.save_candles) if str(args.save_candles).strip() else None
+    frozen_paths: List[Path] = []
     benchmark: Optional[CandleSeries] = None
     if str(args.benchmark).strip():
         try:
@@ -1139,11 +1201,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 days=float(args.days),
                 timeout=float(args.timeout),
                 endpoint=endpoint,
+                candles=frozen,
             )
         except HtxError as exc:
             # The regime filter is an ablation, not the thesis: a dead benchmark narrows the
             # table by one row and must not stop the other three from being measured.
             print(f"walkforward: no benchmark ({exc}); the regime row will be noted", file=sys.stderr)
+        else:
+            if saving is not None:
+                _freeze(benchmark, saving)
+            if frozen is not None and (frozen / f"{benchmark.symbol}.csv") not in frozen_paths:
+                frozen_paths.append(frozen / f"{benchmark.symbol}.csv")
 
     if not args.quiet:
         print(
@@ -1162,10 +1230,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 days=float(args.days),
                 timeout=float(args.timeout),
                 endpoint=endpoint,
+                candles=frozen,
             )
         except HtxError as exc:
             print(f"   ! {symbol:<12} {exc}", file=sys.stderr)
             continue
+        if saving is not None:
+            _freeze(series, saving)
+        if frozen is not None and (frozen / f"{series.symbol}.csv") not in frozen_paths:
+            frozen_paths.append(frozen / f"{series.symbol}.csv")
         try:
             folds = expanding_folds(
                 series.rows,
@@ -1218,6 +1291,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "period": str(args.period),
             "days": float(args.days),
             "exits": dict(exits),
+            "candles": (
+                {
+                    "dir": str(frozen),
+                    "sha256": _candles_fingerprint(frozen_paths),
+                    "files": sorted(path.name for path in frozen_paths),
+                }
+                if frozen is not None
+                else {"dir": "", "sha256": "", "files": []}
+            ),
             "summaries": [row.as_dict() for row in summaries],
         },
     )

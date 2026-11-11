@@ -377,3 +377,75 @@ def test_a_run_writes_the_criteria_it_read_the_table_against(monkeypatch, tmp_pa
     # The exits a table was produced with travel with it, or two tables are indistinguishable.
     assert document["run"]["exits"] == {"stop_mode": "atr", "take_profit_r": 1.5}
     assert {row["verdict"] for row in document["run"]["summaries"]} == {"unmeasured"}
+
+
+def test_a_frozen_directory_reproduces_the_table_bar_for_bar(monkeypatch, tmp_path):
+    """The point of ``--candles``: the same bars give the same table, on any machine.
+
+    The venue serves a moving window, so two runs of the same command an hour apart are two
+    experiments — one new bar closes and every fold boundary shifts. Freezing the bars first
+    is what makes "the VPS reproduced it" a checkable sentence rather than a hopeful one, so
+    the test asserts bytes, not agreement about conclusions.
+    """
+    import json
+
+    from agent.backtest import walkforward
+    from agent.backtest.data import write_csv
+
+    series = market()
+    frozen = tmp_path / "frozen"
+    write_csv(series, frozen / "btcusdt.csv")
+
+    live_out = tmp_path / "live"
+    monkeypatch.setattr(walkforward, "_series", lambda *args, **kwargs: market())
+    assert walkforward.main(
+        ["--symbols", "btcusdt", "--folds", "2021", "--min-train", "60",
+         "--out", str(live_out), "--quiet"]
+    ) == 0
+    monkeypatch.undo()
+
+    replay_out = tmp_path / "replay"
+    # No monkeypatch: this reads the file, and would reach for the venue if it did not.
+    assert walkforward.main(
+        ["--candles", str(frozen), "--folds", "2021", "--min-train", "60",
+         "--out", str(replay_out), "--quiet"]
+    ) == 0
+
+    assert (replay_out / "walkforward.csv").read_bytes() == (
+        live_out / "walkforward.csv"
+    ).read_bytes()
+
+    document = json.loads((replay_out / "criteria.json").read_text())
+    candles = document["run"]["candles"]
+    assert candles["files"] == ["btcusdt.csv"]
+    assert len(candles["sha256"]) == 64
+
+    # A different freeze is a different input, and the hash has to say so — otherwise it is
+    # decoration that would agree with any comparison made in its name.
+    write_csv(market(), frozen / "ethusdt.csv")
+    assert walkforward.main(
+        ["--candles", str(frozen), "--folds", "2021", "--min-train", "60",
+         "--out", str(tmp_path / "two"), "--quiet"]
+    ) == 0
+    second = json.loads((tmp_path / "two" / "criteria.json").read_text())
+    assert second["run"]["candles"]["sha256"] != candles["sha256"]
+
+
+def test_saving_candles_writes_what_the_run_read(monkeypatch, tmp_path):
+    """``--save-candles`` is how a table gets a receipt: the bars it was computed from."""
+    import json
+
+    from agent.backtest import walkforward
+
+    monkeypatch.setattr(walkforward, "_series", lambda *args, **kwargs: market())
+    folder = tmp_path / "saved"
+    assert walkforward.main(
+        ["--symbols", "btcusdt", "--folds", "2021", "--min-train", "60",
+         "--out", str(tmp_path / "wf"), "--save-candles", str(folder), "--quiet"]
+    ) == 0
+
+    written = folder / "btcusdt.csv"
+    assert written.is_file()
+    document = json.loads((tmp_path / "wf" / "criteria.json").read_text())
+    # Nothing was read from a frozen directory, so the run is not claimed to be replayable.
+    assert document["run"]["candles"]["dir"] == ""

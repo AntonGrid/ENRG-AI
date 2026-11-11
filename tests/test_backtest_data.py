@@ -320,6 +320,33 @@ def test_csv_that_does_not_exist_is_a_sentence(tmp_path):
         D.load_csv(tmp_path / "absent.csv")
 
 
+def test_a_written_series_reads_back_as_the_same_floats(tmp_path):
+    """A freeze that loses the last digit is a different experiment wearing the same name.
+
+    ``--save-candles`` exists so a second machine can read the same bars, and the only thing
+    that makes it worth doing is exactness: the floats must come back bit for bit, or the
+    reproduction test is testing the writer's rounding.
+    """
+    rows = [
+        D.Candle(at=1735689600.0, open=1e-05, high=0.000123456789, low=1.5e-08,
+                 close=67651.23456789012, volume=12345.678901234567),
+        D.Candle(at=1735704000.0, open=3.0, high=3.0, low=3.0, close=3.0, volume=0.0),
+    ]
+    series = D.CandleSeries(symbol="btcusdt", period="4hour", rows=rows)
+
+    path = D.write_csv(series, tmp_path / "frozen" / "btcusdt.csv")
+    back = D.load_csv(path, symbol="btcusdt", period="4hour")
+
+    assert back.rows == rows
+    assert back.period == "4hour"
+    assert back.warnings == []
+    # Epoch seconds with a header, so the file is also readable by anything else, and the
+    # trade count travels with it because it is part of the bar the venue published.
+    assert path.read_text(encoding="utf-8").splitlines()[0] == (
+        "timestamp,open,high,low,close,volume,trades"
+    )
+
+
 def test_an_empty_file_is_refused_rather_than_measured(tmp_path):
     path = tmp_path / "chart.csv"
     path.write_text("\n\n", encoding="utf-8")

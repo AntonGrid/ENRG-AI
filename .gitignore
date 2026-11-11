@@ -13,10 +13,12 @@ __pycache__/
 # Logs
 *.log
 
-# Runtime data
-knowledge.db
-memory/
-data/
+# Runtime data: a run's output and the venue's history are not the repository's source.
+data/*
+# ...except the frozen bars the reproducibility check replays. They are what makes "the other
+# machine got the same table" checkable after the venue's window has moved on, and they are
+# about 280 kB for one pair, which is cheaper than a claim nobody can test.
+!data/frozen/
 
 # Deploy files: the operator's `.env` is private, the example is not
 !.env.example

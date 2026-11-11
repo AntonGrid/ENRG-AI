@@ -98,6 +98,7 @@ __all__ = [
     "interval_of",
     "load_csv",
     "parse_klines",
+    "write_csv",
     "period_name",
     "universe",
 ]
@@ -586,6 +587,7 @@ CSV_ALIASES: Dict[str, Tuple[str, ...]] = {
     "low": ("low", "l"),
     "close": ("close", "c", "price"),
     "volume": ("volume", "vol", "quote_volume", "quotevolume", "amount"),
+    "trades": ("trades", "count", "trade_count", "tradecount"),
 }
 
 
@@ -665,6 +667,7 @@ def load_csv(
     high_col = _column_of(header, "high")
     low_col = _column_of(header, "low")
     volume_col = _column_of(header, "volume")
+    trades_col = _column_of(header, "trades")
     rows: List[Candle] = []
     for number, record in enumerate(reader, start=2):
         if len(record) <= max(at_col, close_col):
@@ -684,6 +687,13 @@ def load_csv(
                 low=_number(record[low_col], default=close) if low_col is not None else close,
                 close=float(close),
                 volume=_number(record[volume_col]) if volume_col is not None else 0.0,
+                # The trade count is not read by the engine, but it is part of the record:
+                # a freeze that drops it is not the same bars, and a replay is not a replay.
+                trades=(
+                    int(_number(record[trades_col], default=0.0))
+                    if trades_col is not None
+                    else 0
+                ),
             )
         )
     if not rows:
@@ -705,6 +715,41 @@ def load_csv(
         source=f"csv {file}",
         warnings=warnings,
     )
+
+
+def write_csv(series: CandleSeries, path: Any, *, delimiter: str = ",") -> Path:
+    """The inverse of :func:`load_csv`, exact enough to be a reproduction and not a sketch.
+
+    Why this exists: a backtest that reads the venue is deterministic *given its candles*, and
+    the venue's candles move. Two runs of the same command an hour apart are two different
+    experiments, because a new bar closes and every fold boundary shifts by one. Freezing the
+    bars first turns "the numbers agreed" into a claim a second machine can check, so this
+    writer's only real requirement is that it round-trips: :func:`load_csv` must read back the
+    same floats, not nearly the same ones.
+
+    ``repr`` is what makes that true — it is the shortest text that parses back to the same
+    double — so the file is also readable, which a hex dump would not be.
+    """
+    file = Path(path)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with file.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n", delimiter=delimiter)
+        writer.writerow(["timestamp", "open", "high", "low", "close", "volume", "trades"])
+        for candle in series.rows:
+            writer.writerow(
+                [
+                    # Epoch seconds, the shape :func:`_timestamp` prefers, and an integer
+                    # whenever it is one, because 1735689600 reads better than 1735689600.0.
+                    int(candle.at) if float(candle.at).is_integer() else repr(float(candle.at)),
+                    repr(float(candle.open)),
+                    repr(float(candle.high)),
+                    repr(float(candle.low)),
+                    repr(float(candle.close)),
+                    repr(float(candle.volume)),
+                    int(candle.trades),
+                ]
+            )
+    return file
 
 
 # ── the only socket in the package ─────────────────────────────────────────
