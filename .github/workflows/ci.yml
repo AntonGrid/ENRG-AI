@@ -22,5 +22,5 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run tests
-        # The full agent suite (fed/HFL/ERS/signals/market/trade/…) — 850 tests.
+        # The full agent suite (fed/HFL/ERS/signals/market/trade/backtest/…) — 930 tests.
         run: pytest -q

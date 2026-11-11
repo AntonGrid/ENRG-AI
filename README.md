@@ -50,6 +50,7 @@ agent/
 ├── evolution/         # DAO-driven self-evolution (propose→vote→A/B→canonicalize)
 ├── physics/           # coherence, curiosity, the economic agent, the DeFiLlama venue
 ├── trade/             # the trading cycle: book → market → hunter → size → a stake
+├── backtest/          # the same hunt on history: candles → verdicts → a report
 └── llm.py             # Ollama client (qwen2.5-coder:7b)
 tests/                 # pytest suite
 ```
@@ -1062,6 +1063,123 @@ nine of them about the name→pool bridge: the deepest of several, the chain fil
 name lives instead, the same pair spelled either way, a pinned uuid that is never re-matched
 by name, a dead chart as a reason, the tail).
 
+## Backtesting: the same hunt, on history, in an hour (Phase 9)
+
+The live cycle answers one question per cycle, with money. `agent/backtest/` asks the same
+question of a price history, in isolation, and answers with a report instead of a signature:
+it walks a public candle feed bar by bar through the *same* `PanicDetector` and
+`risk_assessment` the loop uses, and buys and sells on the *same* verdict table.
+
+```bash
+# 180 days of 4-hour BTC/USDT from HTX's public kline endpoint, a $1000 book
+python -m agent.backtest.run --exchange htx --symbol btcusdt --days 180 --capital 1000
+
+# the same, offline, from a chart an operator can edit in a spreadsheet
+python -m agent.backtest.run --exchange csv --csv chart.csv --capital 1000
+```
+
+Nothing in `agent/physics/` changed for this: the hunter is read, never bent. There is no
+RPC, no key, no signature and no transaction anywhere in the package, and it never touches
+`data/trader_state.json` — the live loop's memory is not a backtest's business.
+
+### The one invented quantity: what a candle pays a buyer
+
+The hunter's two inputs are a pool's **APY** (per cent a year) and its **depth** (dollars of
+TVL). A candle feed publishes neither, so the package states the bridge once, in
+`agent/backtest/data.py`, and prints it in every report:
+
+| the hunter wants | a candle gives | the reasoning |
+| --- | --- | --- |
+| `apy` — the rate a holder earns | the bar's **decline**, in per cent (`max(0, -return)`) | a pool pays in APY; a chart pays in a lower price. A bar that fell 2.5 % paid a buyer 2.5; a bar that rose paid nothing |
+| `tvl` — the depth | **quote turnover** (`vol` on HTX; `amount × close` when a feed publishes only base volume) | depth is what leaves when people run; turnover is the same measurement for an instrument |
+
+Annualising a bar (`(1+r)^365-1`) was rejected because it produces thousands of per cent, and
+`risk_assessment` would convict *every* record of promising more than `PLAUSIBLE_APY` allows —
+a backtest refused by its own claim ceiling measures nothing. A signed return was rejected
+because a pool's APY cannot be negative and `to_returns` maps every non-positive growth to
+`-1.0`: half a chart of down bars would arrive as a record of total losses and every honest
+instrument would be convicted as a ghost.
+
+So `PANIC` on a chart reads exactly as it does on a pool: *the instrument is suddenly paying
+far more than its own rest while participation drained* — a capitulation on drying volume.
+`GROWTH` reads as *the rate rose and the depth rose with it*, which on a chart is the same
+fall on rising volume.
+
+### The four files, and what each one owns
+
+| file | what it is |
+| --- | --- |
+| `data.py` | candles from HTX (`/market/history/kline`, 2000 bars a page — the venue ignores `from`/`to`, so there is no pagination to get wrong) or from a CSV (`timestamp,open,high,low,close,volume`); the decline/turnover conversion; one sentence per failure |
+| `simulated_provider.py` | a venue that answers the `IWeb3Provider` operations from the candles: `execute_stake`, `withdraw`, `balance`, `advance` (the clock is a *bar*), plus an empty whitelist and a proof channel that always refuses |
+| `engine.py` | the decisions: one verdict per bar on the prefix that ends there, the entry table, the exit table, the stop, and the equity row per bar |
+| `reporter.py` | the readings: ROI, max drawdown, win rate, trades, mean hold, exposure, fees — and **buy & hold**, the benchmark that keeps an honest backtest honest |
+
+### The fills are assumptions, and each one is a field
+
+* **slippage 0.1 %** against the trader on every fill, both ways;
+* **fee 0.1 %** per side, printed in total so a strategy that only works before costs is
+  visible instead of impressive;
+* **latency one bar**, so an order is filled at the *next* bar's open — the close a decision
+  was made on has already happened by the time it could arrive. `--latency-bars 0` is the
+  optimistic case a reader should compare against;
+* **the stop fills inside the bar that crosses it** (at the stop price), and **at the open
+  when the bar gapped below it** — a backtest that filled a gap at the stop would invent the
+  difference on every crash.
+
+### The exit table is the live loop's table
+
+| verdict | on a position opened on `PANIC` | on a position opened on `CALM`/`GROWTH` |
+| --- | --- | --- |
+| `CALM`, `GROWTH` (`TAKE_PROFIT_VERDICTS`) | sell — the dislocation has closed | hold: it was bought for carry and has no dislocation to have passed |
+| `THIN`, `FORMULA`, `DISHONEST` (`EXIT_VERDICTS`) | sell — the record stopped being what it was bought as | sell |
+| `UNMEASURED` | hold — blindness is not a verdict | hold |
+| the stop (`--stop 0.02`) | sell, by the venue's own order, with no verdict attached | sell |
+
+A test compares the two packages' constants (`test_the_verdict_sets_are_the_live_loops_sets`)
+rather than restating them, because a backtest of a different table would be a backtest of a
+different strategy.
+
+### The report: three files, and the number that shames a strategy
+
+`--out data/backtest` (the default) receives `backtest_report.json` (settings, the window, the
+venue's assumptions, every trade, the whole equity curve, the verdict histogram, the warnings),
+`backtest_trades.csv` (one row per round trip, ISO timestamps, the delimiter Excel expects) and
+`backtest_equity.csv` (the book bar by bar — the curve the drawdown is measured on).
+`--delimiter ';'` writes the locale that wants one.
+
+```
+── backtest · btcusdt 4hour · 2000 bars · 2025-12-13 → 2026-11-11
+   capital $1,000.00 → $994.47 · ROI -0.55% · buy & hold -17.64%
+   max drawdown 2.52% · win rate 50.0% (1/2) · profit factor 0.76
+   trades 2 closed + 0 open · mean hold 0.5 bars (0.1 d) · fees $4.03 · exposure 0%
+   exits take-profit 1, stop 1
+   verdicts UNMEASURED 64 · CALM 1933 · PANIC 3 · judged 1936 bars
+   warn  2400 bars of 4hour were asked for and the venue serves at most 2000 in one
+         answer, so the window is 2000 bars (333.3 days) instead of 400
+```
+
+Exit codes mean what they mean everywhere else in this layer: `0` answered (whatever it
+earned), `2` a configuration that cannot mean anything, `3` a feed that did not answer, `4` a
+window the detector cannot speak on (fewer bars than `--min-points`). A window the venue
+cannot serve, and a strategy that never got a decision to make, are printed as warnings —
+never swallowed. A stop followed by a re-entry on the next bar is the strategy as written;
+`--cooldown-bars 30` (the hunter's own `PANIC_COOLDOWN`) makes one episode one bet instead of
+one bet per bar, and the report tells you which it was.
+
+Tests: `tests/test_backtest_data.py`, `tests/test_backtest_provider.py` and
+`tests/test_backtest_engine.py` — 71 of them, and **not one opens a socket**: the transport is
+a parameter, the venue is a list of hand-written bars, and the chart is a CSV in `tmp_path`.
+What they pin: the newest-first answer reversed once, quote-versus-base volume, every failure
+as a sentence, the decline mapping (a bar that rose pays 0, a warm-up bar pays `nan`), the
+settlement lag, the slippage and the fee on both sides, the stop inside a bar and through a
+gap, one position at a time, the refusal with its reason, the exit table against the live
+loop's constants, **the prefix every verdict was measured on** (the detector is wrapped and
+every prefix length recorded, so a lookahead is a failing test and not a suspicion), the
+metrics read from a hand-built curve, the three files, the CLI's four exit codes, and the wall
+itself: no module in `agent/backtest/` imports `web3`, `agent.trade`, `real_testnet_provider`
+or `subprocess`, and the only `urllib` import in the package is *inside* the default
+transport, where `--csv` and `fetch=` never reach it.
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear
@@ -1108,7 +1226,7 @@ python -m agent.main
 pytest
 ```
 
-850 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+930 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
@@ -1117,7 +1235,9 @@ name, which is why the full run is a *workspace* command, not a pip-install one.
 Nothing on the deployment path needs any of the three: the trading cycle's own 85
 (`tests/test_trade_loop.py`) and the provider's 109 run anywhere Python does — one of
 those asks for foundry and one for `web3`, and each skips itself by name rather than
-passing quietly.
+passing quietly. The backtest's 71 (`tests/test_backtest_*.py`) are in the same
+category and even further from a network: the transport is a parameter, so a test hands
+the loader a dictionary and a run hands it a CSV.
 
 
 ## Production Readiness
