@@ -1321,6 +1321,24 @@ bash scripts/exit_grid.sh --replay data/frozen/4hour 4hour
 machine must print the same 64-character hash for `walkforward.csv`. On this machine it does,
 byte for byte: `b3156728c363fa4f50ef00910b0436c23c2c358c95387a5d7a4250ca08e54076`.
 
+Getting that check to run inside the deployment image found a real packaging bug: `power.py`
+imports `scipy` to read the gate's power from a noncentral t distribution, and `scipy` was
+declared only in the `organism` extra — so a base install, including the image's own extras,
+could not import `agent.backtest.walkforward` at all. The gate's arithmetic is part of the
+verdict, so `scipy` is now a base dependency. With that fixed, an image built from this commit
+reproduces the hash in the container (Python 3.12.16, site-packages) exactly as the host does
+(Python 3.12.3, source tree):
+
+```
+docker compose build trader
+mkdir -p /tmp/enrg-replay
+docker compose run --rm -v "$PWD/data/frozen:/frozen:ro" -v /tmp/enrg-replay:/out \
+    -w /frozen trader python -m agent.backtest.walkforward \
+    --candles /frozen/4hour --period 4hour \
+    --stop-mode atr --atr-multiple 2 --risk-per-trade 0.02 --out /out
+sha256sum /tmp/enrg-replay/walkforward.csv
+```
+
 
 Tests: `tests/test_backtest_*.py` — 249 of them, and **not one opens a socket**: the transport
 is a parameter, the venue is a list of hand-written bars, the chart is a CSV in `tmp_path`, and
