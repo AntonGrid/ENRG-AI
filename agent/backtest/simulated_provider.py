@@ -189,6 +189,9 @@ class _Order:
     usd: float = 0.0
     units: float = 0.0
     stop_pct: float = 0.0
+    take_profit_pct: float = 0.0
+    trail_pct: float = 0.0
+    max_bars: int = 0
     reason: str = ""
 
 
@@ -214,6 +217,14 @@ class SimulatedProvider:
     entry_price: float = 0.0
     entry_bar: int = -1
     stop_price: float = 0.0
+    take_profit_price: float = 0.0
+    trail_pct: float = 0.0
+    peak_price: float = 0.0
+    max_bars: int = 0
+    mfe: float = 0.0
+    mae: float = 0.0
+    last_mfe: float = 0.0
+    last_mae: float = 0.0
     fills: List[Fill] = field(default_factory=list)
     refusals: List[Refusal] = field(default_factory=list)
     orders: List[_Order] = field(default_factory=list)
@@ -287,11 +298,16 @@ class SimulatedProvider:
         return self.index
 
     def advance(self, steps: int = 1) -> int:
-        """Let ``steps`` bars happen; each one settles due orders and runs the stop.
+        """Let ``steps`` bars happen; each one settles due orders and runs the exits.
 
         The stop runs *after* the settlement, so a position opened at this bar's open can
         be stopped out inside the same bar — which is what happens on a real venue and what
         a backtest must not smooth away.
+
+        The order of the four exits is a judgement, and it is the pessimistic one: the stop
+        is checked before the take-profit, so a bar that touched both is a loss. Nothing in
+        a daily candle says which came first, and a backtest that resolves that ambiguity in
+        its own favour is a backtest reporting an exit it invented.
         """
         for _ in range(max(int(steps), 1)):
             if self.index + 1 >= len(self.series.rows):
@@ -299,6 +315,10 @@ class SimulatedProvider:
             self.index += 1
             self._settle()
             self._stop()
+            self._take_profit()
+            self._trail()
+            self._time_stop()
+            self._mark()
         return self.index
 
     # -- the five the layer is built on ------------------------------------- #
@@ -309,6 +329,9 @@ class SimulatedProvider:
         amount: float,
         *,
         stop_pct: float = 0.0,
+        take_profit_pct: float = 0.0,
+        trail_pct: float = 0.0,
+        max_bars: int = 0,
         reason: str = "open",
     ) -> bool:
         """Buy ``amount`` USDT worth of the instrument; ``True`` when the order was taken.
@@ -339,6 +362,9 @@ class SimulatedProvider:
             due=self.index + max(int(self.latency_bars), 0),
             usd=budget,
             stop_pct=max(float(stop_pct), 0.0),
+            take_profit_pct=max(float(take_profit_pct), 0.0),
+            trail_pct=max(float(trail_pct), 0.0),
+            max_bars=max(int(max_bars), 0),
             reason=str(reason),
         )
         if int(self.latency_bars) <= 0:
@@ -480,12 +506,20 @@ class SimulatedProvider:
         )
 
     def _settle(self) -> None:
-        """Fill every order whose bar has arrived, at that bar's open."""
+        """Fill every order whose bar has arrived, at that bar's open.
+
+        A sell whose position is already gone — the stop fired inside this bar before the
+        queued exit settled — is dropped without a refusal: it is not a mistake by the
+        caller, it is a race the venue won, and a ledger of phantom refusals would be noise
+        pretending to be a reading.
+        """
         if not self.orders:
             return
         due = [order for order in self.orders if order.due <= self.index]
         for order in due:
             self.orders.remove(order)
+            if order.side == "sell" and not self.holding:
+                continue
             self._execute(order)
 
     def _execute(self, order: _Order) -> None:
@@ -516,6 +550,16 @@ class SimulatedProvider:
         self.stop_price = (
             float(price) * (1.0 - float(order.stop_pct)) if float(order.stop_pct) > 0.0 else 0.0
         )
+        self.take_profit_price = (
+            float(price) * (1.0 + float(order.take_profit_pct))
+            if float(order.take_profit_pct) > 0.0
+            else 0.0
+        )
+        self.trail_pct = max(float(order.trail_pct), 0.0)
+        self.peak_price = float(price)
+        self.max_bars = max(int(order.max_bars), 0)
+        self.mfe = 0.0
+        self.mae = 0.0
         self.fills.append(
             Fill(
                 bar=int(self.index),
@@ -545,6 +589,12 @@ class SimulatedProvider:
             self.entry_price = 0.0
             self.entry_bar = -1
             self.stop_price = 0.0
+            self.take_profit_price = 0.0
+            self.trail_pct = 0.0
+            self.peak_price = 0.0
+            self.max_bars = 0
+            self.last_mfe = float(self.mfe)
+            self.last_mae = float(self.mae)
         self.fills.append(
             Fill(
                 bar=int(self.index),
@@ -579,3 +629,87 @@ class SimulatedProvider:
             price * (1.0 - float(self.slippage)),
             _Order(side="sell", due=int(self.index), reason="stop"),
         )
+
+    def _take_profit(self) -> None:
+        """The resting take-profit, executed inside the bar that crosses it.
+
+        A bar that gapped *above* the target fills at the open, not at the target: the gap is
+        real money and a backtest that kept it would be inventing profit. A bar that merely
+        traded through the target fills at the target.
+        """
+        if not self.holding or self.take_profit_price <= 0.0:
+            return
+        bar = self.bar
+        if bar is None or float(bar.high) < float(self.take_profit_price):
+            return
+        target = float(self.take_profit_price)
+        opening = float(bar.open) if bar.open > 0.0 else target
+        price = opening if opening > target else target
+        self._sell(
+            float(self.units),
+            price * (1.0 - float(self.slippage)),
+            _Order(side="sell", due=int(self.index), reason="target"),
+        )
+
+    def _trail(self) -> None:
+        """Ratchet the stop up behind a rising high, and never down.
+
+        The trail is a *fraction of the fill* rather than a fraction of the ATR, because the
+        venue does not know what an ATR is: the engine that wanted an ATR trail multiplies
+        before it hands the number over, which keeps this file free of market statistics.
+        """
+        if not self.holding or self.trail_pct <= 0.0:
+            return
+        bar = self.bar
+        if bar is None:
+            return
+        high = float(bar.high)
+        if high > float(self.peak_price):
+            self.peak_price = high
+        candidate = float(self.peak_price) * (1.0 - float(self.trail_pct))
+        if candidate > float(self.stop_price) and candidate < float(bar.close) * 1.0:
+            self.stop_price = candidate
+
+    def _time_stop(self) -> None:
+        """Queue the exit once the position has lived ``max_bars`` bars.
+
+        The order rides to the *next* open like every other decision in this venue: a rule
+        that sold at a close the caller was allowed to see would be a rule that filled at a
+        price nobody could have traded. Firing the order here and filling it there is the
+        same delay an operator's own automation would impose, and the report counts the
+        holding time on the fills, so the extra bar is visible.
+        """
+        if not self.holding or self.max_bars <= 0:
+            return
+        if int(self.index) - int(self.entry_bar) < int(self.max_bars):
+            return
+        if self.busy:
+            return
+        bar = self.bar
+        if bar is None:
+            return
+        self.orders.append(
+            _Order(
+                side="sell",
+                due=int(self.index) + max(int(self.latency_bars), 1),
+                units=float(self.units),
+                reason="time",
+            )
+        )
+
+    def _mark(self) -> None:
+        """Record the excursions: the best and worst the position ever saw.
+
+        ``mfe`` and ``mae`` are in fractions of the fill and are what a *stop placed after
+        the fact* would have captured. They are the difference between "the trade lost" and
+        "the trade was a winner that the stop cut at the wrong height", which is the whole
+        argument for an ATR stop.
+        """
+        if not self.holding or self.entry_price <= 0.0:
+            return
+        bar = self.bar
+        if bar is None:
+            return
+        entry = float(self.entry_price)
+        self.mfe = max(float(self.mfe), float(bar.high) / entry - 1.0)
+        self.mae = min(float(self.mae), float(bar.low) / entry - 1.0)

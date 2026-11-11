@@ -34,6 +34,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from agent.backtest.admission import add_admission_arguments, admission_from_args
+from agent.backtest.exits import add_exit_arguments, exits_from_args
 from agent.backtest.data import (
     DEFAULT_PERIOD,
     DEFAULT_TIMEOUT,
@@ -142,6 +144,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="print the JSON report to stdout")
     parser.add_argument("--quiet", action="store_true", help="write the files, print nothing")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="feed timeout")
+    add_admission_arguments(parser)
+    add_exit_arguments(parser)
     return parser
 
 
@@ -182,6 +186,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             window=int(args.window),
             min_points=int(args.min_points),
             min_depth=float(args.min_depth),
+            admission=admission_from_args(args),
+            **exits_from_args(args),
             cooldown_bars=int(args.cooldown_bars),
             log_decisions=bool(args.decisions),
         )

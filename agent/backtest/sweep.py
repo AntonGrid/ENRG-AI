@@ -65,6 +65,8 @@ from agent.backtest.data import (
     fetch_klines,
     universe,
 )
+from agent.backtest.admission import add_admission_arguments, admission_from_args
+from agent.backtest.exits import add_exit_arguments, exits_from_args
 from agent.backtest.engine import Backtester, Settings
 from agent.backtest.reporter import Report, stamp
 from agent.backtest.run import EXIT_FEED, EXIT_SHORT, EXIT_USAGE
@@ -472,6 +474,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--delimiter", default=",", help="the CSV separator")
     parser.add_argument("--quiet", action="store_true", help="write the files, print nothing")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="feed timeout")
+    add_admission_arguments(parser)
+    add_exit_arguments(parser)
     return parser
 
 
@@ -497,6 +501,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             window=int(args.window),
             min_points=int(args.min_points),
             min_depth=float(args.min_depth),
+            admission=admission_from_args(args),
+            **exits_from_args(args),
             cooldown_bars=int(args.cooldown_bars),
         )
     except ValueError as exc:

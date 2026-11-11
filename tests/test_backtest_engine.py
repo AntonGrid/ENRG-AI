@@ -482,12 +482,23 @@ def test_the_package_cannot_reach_a_chain_a_key_or_the_live_state():
     assert {path.name for path in modules} == {
         "__init__.py",
         "__main__.py",
+        "admission.py",
+        "criteria.py",
         "data.py",
         "engine.py",
+        "exits.py",
+        "features.py",
+        "labels.py",
+        "policy.py",
+        "power.py",
+        "regime.py",
         "reporter.py",
         "run.py",
         "simulated_provider.py",
         "sweep.py",
+        "train.py",
+        "walkforward.py",
+        "null.py",
     }
     for path in modules:
         imported = "\n".join(_imports_of(path))

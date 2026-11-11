@@ -55,11 +55,14 @@ one.
 """
 from __future__ import annotations
 
+import random
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from agent.backtest.data import CandleSeries, declines
+from agent.backtest.admission import Admission, admit, masked, report as admission_report
+from agent.backtest.features import enrich, series_features
 from agent.backtest.simulated_provider import (
     FEE_RATE,
     FILL_SLIPPAGE,
@@ -106,6 +109,9 @@ ENTRY_VERDICTS = frozenset({PANIC}) | TAKE_PROFIT_VERDICTS
 #: The modes ``Settings.entries`` accepts, and what each of them means.
 ENTRY_MODES = ("panic", "organic", "both")
 
+#: How ``Settings.stop`` is turned into a price: a fixed fraction, or a multiple of the ATR.
+STOP_MODES = ("fixed", "atr")
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -124,6 +130,32 @@ class Settings:
     share: float = 1.0
     #: The stop-loss distance below the fill, as a fraction. ``0`` disables the stop.
     stop: float = 0.02
+    #: How that distance is measured: ``fixed`` (the fraction above) or ``atr`` (a multiple
+    #: of the bar's own true range, never below ``stop``). The sweep's 374 stops on the entry
+    #: bar are the argument for the second mode: a 2 % stop on a pair whose daily ATR is 5 %
+    #: is not a risk limit, it is a coin flip with a fee attached.
+    stop_mode: str = "fixed"
+    #: Bars behind the average true range that ``atr`` mode multiplies.
+    atr_window: int = 14
+    #: The multiple of the ATR that becomes the stop distance.
+    atr_multiple: float = 2.0
+    #: The fraction of equity risked on one trade. ``0`` disables it and leaves sizing to
+    #: ``share``; otherwise the stake is ``cash × risk_per_trade / stop_distance``, capped by
+    #: ``share``. This is the difference between "all the cash" and "two per cent of the book
+    #: at the stop", and it is what makes a 5 % ATR pair and a 2 % ATR pair comparable bets.
+    risk_per_trade: float = 0.0
+    #: Take-profit as a multiple of the stop distance (``R``). ``0`` disables it.
+    take_profit_r: float = 0.0
+    #: Trailing stop as a multiple of ``R``. ``0`` disables it.
+    trail_r: float = 0.0
+    #: Bars after which the position is closed at the next open. ``0`` disables it.
+    time_stop_bars: int = 0
+    #: Enter only on bars whose regime mask is true. Off unless a mask is supplied.
+    require_risk_on: bool = False
+    #: The rate at which a random bar is bought regardless of verdict — the null test of
+    #: :mod:`agent.backtest.null`, and off by default because a random entry is not a strategy.
+    random_entry_rate: float = 0.0
+    random_seed: int = 0
     #: Per-side fee and per-fill slippage, as fractions.
     fee: float = FEE_RATE
     slippage: float = FILL_SLIPPAGE
@@ -139,6 +171,9 @@ class Settings:
     min_points: int = MIN_RECORD
     #: The resting-turnover floor for the ``THIN`` arm, in USDT. ``0`` disables it.
     min_depth: Optional[float] = 0.0
+    #: Which bars may reach the detector at all: the input filter of
+    #: :mod:`agent.backtest.admission`. ``None`` feeds every bar as published.
+    admission: Optional[Admission] = None
     #: Bars of silence between an exit and the next entry decision. ``0`` is the strategy as
     #: written — a stop can be followed by a re-entry on the very next bar — and 30 is the
     #: hunter's own :data:`agent.physics.volatility_hunter.PANIC_COOLDOWN`, which makes one
@@ -170,6 +205,28 @@ class Settings:
             raise ValueError(f"cooldown_bars must not be negative, not {self.cooldown_bars!r}")
         if str(self.entries) not in ENTRY_MODES:
             raise ValueError(f"entries must be one of {ENTRY_MODES}, not {self.entries!r}")
+        if str(self.stop_mode) not in STOP_MODES:
+            raise ValueError(f"stop_mode must be one of {STOP_MODES}, not {self.stop_mode!r}")
+        if int(self.atr_window) < 1:
+            raise ValueError(f"atr_window must be at least one bar, not {self.atr_window!r}")
+        if not float(self.atr_multiple) > 0.0:
+            raise ValueError(f"atr_multiple must be positive, not {self.atr_multiple!r}")
+        if not 0.0 <= float(self.risk_per_trade) <= 1.0:
+            raise ValueError(
+                f"risk_per_trade must be between 0 and 1, not {self.risk_per_trade!r}"
+            )
+        if float(self.take_profit_r) < 0.0:
+            raise ValueError(f"take_profit_r must not be negative, not {self.take_profit_r!r}")
+        if float(self.trail_r) < 0.0:
+            raise ValueError(f"trail_r must not be negative, not {self.trail_r!r}")
+        if int(self.time_stop_bars) < 0:
+            raise ValueError(
+                f"time_stop_bars must not be negative, not {self.time_stop_bars!r}"
+            )
+        if not 0.0 <= float(self.random_entry_rate) <= 1.0:
+            raise ValueError(
+                f"random_entry_rate must be in [0, 1], not {self.random_entry_rate!r}"
+            )
 
     def detector(self) -> PanicDetector:
         """The hunter's two arms, with this run's record floor and depth floor.
@@ -185,6 +242,15 @@ class Settings:
             "capital": round(float(self.capital), 4),
             "share": round(float(self.share), 4),
             "stop": round(float(self.stop), 6),
+            "stop_mode": str(self.stop_mode),
+            "atr_window": int(self.atr_window),
+            "atr_multiple": round(float(self.atr_multiple), 4),
+            "risk_per_trade": round(float(self.risk_per_trade), 6),
+            "take_profit_r": round(float(self.take_profit_r), 4),
+            "trail_r": round(float(self.trail_r), 4),
+            "time_stop_bars": int(self.time_stop_bars),
+            "require_risk_on": bool(self.require_risk_on),
+            "random_entry_rate": round(float(self.random_entry_rate), 6),
             "fee": round(float(self.fee), 6),
             "slippage": round(float(self.slippage), 6),
             "latency_bars": int(self.latency_bars),
@@ -193,6 +259,7 @@ class Settings:
             "window": int(self.window),
             "min_points": int(self.min_points),
             "min_depth": None if self.min_depth is None else round(float(self.min_depth), 2),
+            "admission": None if self.admission is None else self.admission.rules(),
             "cooldown_bars": int(self.cooldown_bars),
             "log_decisions": bool(self.log_decisions),
         }
@@ -223,6 +290,11 @@ class Trade:
     exit_reason: str = ""
     exit_verdict: str = ""
     fees: float = 0.0
+    stop_pct: float = 0.0
+    policy_score: float = 0.0
+    regime: float = 1.0
+    mfe: float = 0.0
+    mae: float = 0.0
 
     @property
     def open(self) -> bool:
@@ -267,6 +339,11 @@ class Trade:
             "pnl": round(float(self.pnl), 6),
             "pnl_pct": round(float(self.pnl_pct), 8),
             "fees": round(float(self.fees), 6),
+            "stop_pct": round(float(self.stop_pct), 8),
+            "policy_score": round(float(self.policy_score), 6),
+            "regime": round(float(self.regime), 4),
+            "mfe": round(float(self.mfe), 8),
+            "mae": round(float(self.mae), 8),
             "open": bool(self.open),
         }
 
@@ -289,6 +366,8 @@ class BacktestResult:
     refusals: List[Dict[str, Any]] = field(default_factory=list)
     decisions: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    #: What the input filter withheld from the detector, per reason — empty when no filter.
+    admissions: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def closed(self) -> List[Trade]:
@@ -315,6 +394,7 @@ class BacktestResult:
             "refusals": list(self.refusals),
             "decisions": list(self.decisions),
             "warnings": list(self.warnings),
+            "admissions": dict(self.admissions),
             "final_equity": round(float(self.final_equity), 6),
         }
 
@@ -332,29 +412,62 @@ class Backtester:
         series: CandleSeries,
         settings: Optional[Settings] = None,
         detector: Optional[PanicDetector] = None,
+        policy: Optional[Any] = None,
+        *,
+        policy_threshold: Optional[float] = None,
+        regime: Optional[Sequence[bool]] = None,
     ) -> None:
         self.series = series
         self.settings = settings or Settings()
         self.detector = detector or self.settings.detector()
+        #: Anything with a ``score(features) -> float`` method: a
+        #: :class:`agent.backtest.policy.LogisticPolicy`, or a stand-in a test writes in
+        #: five lines. Duck-typed on purpose — the engine must not depend on numpy.
+        self.policy = policy
+        self.policy_threshold = (
+            float(policy_threshold)
+            if policy_threshold is not None
+            else float(getattr(policy, "threshold", 0.5))
+        )
+        #: One flag per bar: ``True`` above the benchmark's trend. ``None`` means the caller
+        #: did not supply a regime, and a filter with nothing behind it filters nothing.
+        self.regime = list(regime) if regime is not None else None
+        if self.regime is not None and len(self.regime) != len(series.rows):
+            raise ValueError(
+                f"the regime mask has {len(self.regime)} bars against the series' "
+                f"{len(series.rows)}: a mask that does not line up cannot be used"
+            )
 
     # -- the rules, as one line each ---------------------------------------- #
 
-    def wants_entry(self, signal: PanicSignal) -> bool:
-        """Whether this verdict may open a position, given the mode and the confidence floor.
+    def wants_entry(
+        self, signal: PanicSignal, features: Optional[Mapping[str, float]] = None
+    ) -> bool:
+        """Whether this verdict may open a position, given the mode, the floor and policy.
 
         ``PANIC`` is the hunt and always allowed above the floor. ``CALM``/``GROWTH`` are
         allowed only in the ``organic``/``both`` modes, and only when the record arm passed
         (``HONEST``) — which is what the brief called "ORGANIC": the hunter has no verdict of
         that name, its word for the same finding is the assessment's, and using the core's
         word instead of inventing a second one is the whole point of not touching it.
+
+        The policy is a *veto*, not a second opinion: the detector still decides what is
+        interesting, and the model decides whether it is worth the fee. A model that could
+        buy without a verdict would be a second strategy wearing this one's name.
         """
         if signal.verdict == PANIC:
-            return float(signal.confidence) >= float(self.settings.confidence)
-        if str(self.settings.entries) in ("organic", "both") and signal.verdict in (
+            allowed = float(signal.confidence) >= float(self.settings.confidence)
+        elif str(self.settings.entries) in ("organic", "both") and signal.verdict in (
             TAKE_PROFIT_VERDICTS
         ):
-            return signal.resting_verdict == HONEST
-        return False
+            allowed = signal.resting_verdict == HONEST
+        else:
+            allowed = False
+        if not allowed:
+            return False
+        if self.policy is not None:
+            return float(self.policy.score(features or {})) >= self.policy_threshold
+        return True
 
     def exit_reason(self, signal: PanicSignal, entry_verdict: str) -> Optional[str]:
         """``"convicted"``, ``"take-profit"`` or ``None`` — the live loop's table, verbatim.
@@ -390,7 +503,23 @@ class Backtester:
             )
         yields = declines(rows, window=settings.window)
         volumes = [float(row.volume) for row in rows]
+        # The input filter, applied once and in front of the core: a bar the filter withheld
+        # is handed over as ``nan`` — which the detector drops, exactly as it drops a warm-up
+        # bar — and never as a zero, because a zero is a reading the market did not publish.
+        admitted = admit(rows, settings.admission)
+        if settings.admission is not None:
+            yields = masked(yields, admitted)
+            volumes = masked(volumes, admitted)
         symbol = self.series.symbol or "instrument"
+        # The features are computed once for the whole series and then *read* bar by bar.
+        # The alternative — recomputing the suffix on every bar — would be the same numbers
+        # at a quadratic price, and a policy that could not run on a year of data would be a
+        # policy nobody deploys.
+        features_rows = None
+        if self.policy is not None or str(settings.stop_mode) == "atr":
+            features_rows = series_features(rows, atr_window=int(settings.atr_window))
+        coin = random.Random(int(settings.random_seed))
+        bars_since_panic = 0
         venue = SimulatedProvider(
             series=self.series,
             cash=float(settings.capital),
@@ -427,6 +556,9 @@ class Backtester:
                         entry_confidence=float(decision.get("confidence", 0.0)),
                         entry_reason=str(decision.get("reason", "")),
                         fees=fill.fee,
+                        stop_pct=float(decision.get("stop_pct", 0.0)),
+                        policy_score=float(decision.get("policy_score", 0.0)),
+                        regime=float(decision.get("regime", 0.5)),
                     )
                     trades.append(current)
                     entry_decision = None
@@ -436,11 +568,19 @@ class Backtester:
                     current.exit_price = float(fill.price)
                     current.exit_usd = float(fill.usd)
                     current.fees += fill.fee
+                    current.mfe = float(venue.last_mfe)
+                    current.mae = float(venue.last_mae)
                     if fill.reason == "stop":
                         # The venue's own order: no verdict is attached to it, because the
                         # stop is not a reading of the market — it is a rule that a position
                         # is not held past a loss.
                         current.exit_reason = "stop"
+                        current.exit_verdict = ""
+                    elif fill.reason == "target":
+                        current.exit_reason = "target"
+                        current.exit_verdict = ""
+                    elif fill.reason == "time":
+                        current.exit_reason = "time"
                         current.exit_verdict = ""
                     else:
                         decision = exit_decision or {}
@@ -456,6 +596,20 @@ class Backtester:
                 name=symbol,
             )
             verdicts[signal.verdict] += 1
+            bars_since_panic = 0 if signal.verdict == PANIC else bars_since_panic + 1
+            regime_here = (
+                1.0
+                if self.regime is not None and bool(self.regime[t])
+                else (0.0 if self.regime is not None else 0.5)
+            )
+            case: Dict[str, float] = {}
+            if features_rows is not None:
+                case = enrich(
+                    features_rows[t],
+                    confidence=float(signal.confidence),
+                    regime=regime_here,
+                    bars_since_panic=bars_since_panic,
+                )
             decision = {
                 "bar": int(t),
                 "at": float(rows[t].at),
@@ -464,6 +618,10 @@ class Backtester:
                 "confidence": round(float(signal.confidence), 4),
                 "resting_verdict": signal.resting_verdict,
                 "reason": signal.reason,
+                "regime": regime_here,
+                "policy_score": (
+                    round(float(self.policy.score(case)), 6) if self.policy is not None else 0.0
+                ),
             }
             if settings.log_decisions:
                 decisions.append(decision)
@@ -477,17 +635,47 @@ class Backtester:
                 ):
                     exit_decision = dict(decision, reason=reason)
             elif not venue.holding:
-                if (
-                    int(t) > int(quiet_until)
-                    and self.wants_entry(signal)
-                    and venue.execute_stake(
-                        symbol,
-                        float(venue.cash) * float(settings.share),
-                        stop_pct=float(settings.stop),
-                        reason="open",
+                wanted = self.wants_entry(signal, case) if case else self.wants_entry(signal)
+                if float(settings.random_entry_rate) > 0.0:
+                    # The null test: the coin replaces the verdict, and everything else —
+                    # the stops, the fees, the exits — stays exactly as it is. A random
+                    # entry measured against *this* book is the only honest answer to "how
+                    # much of the result was the signal", because the alternative book is
+                    # identical in every respect except the one under test.
+                    wanted = coin.random() < float(settings.random_entry_rate)
+                if wanted and settings.require_risk_on and self.regime is not None:
+                    wanted = bool(self.regime[t])
+                if wanted and admitted[t]:
+                    # A bar the filter withheld is a bar the detector was not asked about;
+                    # buying it would be acting on a reading nobody made. The position, if
+                    # any, is still held and still exited on the verdicts of readable bars.
+                    wanted = False
+                if int(t) > int(quiet_until) and wanted:
+                    stop_pct = float(settings.stop)
+                    atr_here = (
+                        float(features_rows[t]["atr_pct"]) if features_rows is not None else 0.0
                     )
-                ):
-                    entry_decision = dict(decision)
+                    if str(settings.stop_mode) == "atr" and atr_here > 0.0:
+                        # The ATR is in per cent of the close; the stop is a fraction of it.
+                        stop_pct = max(
+                            stop_pct, float(settings.atr_multiple) * atr_here / 100.0
+                        )
+                    stake = float(venue.cash) * float(settings.share)
+                    if float(settings.risk_per_trade) > 0.0 and stop_pct > 0.0:
+                        stake = min(
+                            stake,
+                            float(venue.cash) * float(settings.risk_per_trade) / stop_pct,
+                        )
+                    if venue.execute_stake(
+                        symbol,
+                        stake,
+                        stop_pct=stop_pct,
+                        take_profit_pct=float(settings.take_profit_r) * stop_pct,
+                        trail_pct=float(settings.trail_r) * stop_pct,
+                        max_bars=int(settings.time_stop_bars),
+                        reason="open",
+                    ):
+                        entry_decision = dict(decision, stop_pct=stop_pct)
             # 4. the book, marked at this bar's close.
             equity.append(
                 {
@@ -506,6 +694,13 @@ class Backtester:
             for verdict, count in verdicts.items()
             if verdict and verdict != "UNMEASURED"
         )
+        admissions = (
+            admission_report(rows, settings.admission)
+            if settings.admission is not None
+            else {}
+        )
+        if admissions.get("sentence"):
+            warnings.append(str(admissions["sentence"]))
         if judged == 0:
             warnings.append(
                 f"the detector never spoke: {len(rows)} bars against a record floor of "
@@ -528,9 +723,15 @@ class Backtester:
             refusals=[refusal.as_dict() for refusal in venue.refusals],
             decisions=decisions,
             warnings=warnings,
+            admissions=admissions,
         )
 
 
-def run_backtest(series: CandleSeries, **settings: Any) -> BacktestResult:
-    """``Backtester(series, Settings(**settings)).run()`` — the one-liner a notebook uses."""
-    return Backtester(series, Settings(**settings)).run()
+def run_backtest(
+    series: CandleSeries,
+    policy: Optional[Any] = None,
+    regime: Optional[Sequence[bool]] = None,
+    **settings: Any,
+) -> BacktestResult:
+    """``Backtester(series, Settings(**settings), policy=…, regime=…).run()`` — the one-liner."""
+    return Backtester(series, Settings(**settings), policy=policy, regime=regime).run()

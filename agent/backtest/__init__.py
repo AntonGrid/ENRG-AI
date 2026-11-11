@@ -36,6 +36,8 @@ and a backtest that wrote to it would be a backtest that could change what the m
 The names below are the public ones; ``python -m agent.backtest.run`` is the entry point.
 """
 
+from agent.backtest.admission import Admission, admit, masked
+from agent.backtest.criteria import Criteria, CriteriaError, declared, verify
 from agent.backtest.data import (
     Candle,
     CandleSeries,
@@ -55,13 +57,29 @@ from agent.backtest.engine import (
     Settings,
     Trade,
 )
+from agent.backtest.exits import add_exit_arguments, describe_exits, exits_from_args
+from agent.backtest.power import (
+    DECLARED_ALPHA,
+    DECLARED_POWER,
+    Resolution,
+    ResolutionError,
+    minimum_edge_bps,
+    resolution,
+    spread_bps,
+    trades_needed,
+)
 from agent.backtest.reporter import Report, write_report
 from agent.backtest.simulated_provider import Fill, SimBalance, SimulatedProvider
 
 __all__ = [
+    "Criteria",
+    "CriteriaError",
+    "DECLARED_ALPHA",
+    "DECLARED_POWER",
     "ENTRY_VERDICTS",
     "EXIT_VERDICTS",
     "TAKE_PROFIT_VERDICTS",
+    "Admission",
     "BacktestResult",
     "Backtester",
     "Candle",
@@ -70,13 +88,26 @@ __all__ = [
     "HtxError",
     "Pair",
     "Report",
+    "Resolution",
+    "ResolutionError",
     "Settings",
     "SimBalance",
     "SimulatedProvider",
     "Trade",
+    "add_exit_arguments",
+    "admit",
+    "declared",
     "declines",
+    "describe_exits",
+    "exits_from_args",
     "fetch_klines",
     "load_csv",
+    "masked",
+    "minimum_edge_bps",
+    "resolution",
+    "spread_bps",
+    "trades_needed",
     "universe",
+    "verify",
     "write_report",
 ]
