@@ -342,3 +342,38 @@ def test_a_regime_ablation_without_a_benchmark_says_so():
     walked = walk_forward(series, folds=[fold], ablations=[ABLATIONS[3]])
     assert "no benchmark" in walked[0].note
 
+
+
+def test_a_run_writes_the_criteria_it_read_the_table_against(monkeypatch, tmp_path):
+    """The gate leaves with the numbers, hashed — a table nobody can audit is a claim."""
+    import json
+
+    from agent.backtest import walkforward
+    from agent.backtest.criteria import declared, verify
+
+    monkeypatch.setattr(walkforward, "_series", lambda *args, **kwargs: market())
+    folder = tmp_path / "wf"
+    code = walkforward.main(
+        [
+            "--symbols",
+            "btcusdt",
+            "--folds",
+            "2021",
+            "--min-train",
+            "60",
+            "--out",
+            str(folder),
+            "--stop-mode",
+            "atr",
+            "--take-profit-r",
+            "1.5",
+        ]
+    )
+
+    assert code == 0
+    document = json.loads((folder / "criteria.json").read_text())
+    assert verify(document) == "", "the written document must hash back to itself"
+    assert document["criteria_sha256"] == declared().fingerprint()
+    # The exits a table was produced with travel with it, or two tables are indistinguishable.
+    assert document["run"]["exits"] == {"stop_mode": "atr", "take_profit_r": 1.5}
+    assert {row["verdict"] for row in document["run"]["summaries"]} == {"unmeasured"}

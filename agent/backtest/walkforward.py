@@ -69,6 +69,7 @@ from agent.backtest.admission import (
     admit,
     masked,
 )
+from agent.backtest.criteria import declared
 from agent.backtest.data import (
     DEFAULT_PERIOD,
     DEFAULT_TIMEOUT,
@@ -1206,11 +1207,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     summaries = summary(all_readings)
     written = _write_csv(Path(args.out) / "walkforward.csv", all_readings, summaries)
+    # The gate is written down beside the numbers it judges, with the hash that proves it was
+    # the one declared before the run: a table that prints a verdict without the criteria it
+    # was read against is a table nobody can audit later, and this repository has one of those.
+    criteria_written = declared().write(
+        Path(args.out) / "criteria.json",
+        run={
+            "readings": len(all_readings),
+            "pairs": measured,
+            "period": str(args.period),
+            "days": float(args.days),
+            "exits": dict(exits),
+            "summaries": [row.as_dict() for row in summaries],
+        },
+    )
     if not args.quiet:
         print()
         print("── pooled over every pair and fold")
         print(format_summary(summaries))
         print(f"   wrote {written}")
+        print(f"   wrote {criteria_written} · criteria {declared().fingerprint()[:12]}")
     best = gate_of(all_readings)
     if not args.quiet:
         if best.verdict == "pass":
