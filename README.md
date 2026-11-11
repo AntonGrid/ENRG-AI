@@ -1264,7 +1264,8 @@ The arithmetic is `agent/backtest/power.py` — a gate of 30 bps read at α 0.05
 needs a spread and a count, and a book with too little of either prints **unmeasured**, not
 **fail**, because a sample that cannot see an edge has not disproved one.
 
-Ten books, one command (`bash scripts/exit_grid.sh`, about 25 minutes on 16 cores):
+Ten books, one command (`bash scripts/exit_grid.sh`, about 25 minutes on 16 cores), and
+`python scripts/exit_grid_report.py` reads the `criteria.json` files back as this table:
 
 ```
 book                       period   folds  trades  bps/trade       t   σ bps  ± bps  needed
