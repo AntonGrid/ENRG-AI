@@ -83,12 +83,15 @@ __all__ = [
     "DEFAULT_TIMEOUT",
     "HTX_ENDPOINT",
     "HTX_ENDPOINTS",
+    "HTX_TICKERS",
+    "HTX_TICKERS_ENDPOINTS",
     "MAX_BARS",
     "PERIOD_SECONDS",
     "USER_AGENT",
     "Candle",
     "CandleSeries",
     "HtxError",
+    "Pair",
     "days_to_bars",
     "declines",
     "fetch_klines",
@@ -96,6 +99,7 @@ __all__ = [
     "load_csv",
     "parse_klines",
     "period_name",
+    "universe",
 ]
 
 #: The public kline endpoint, and the mirror the same venue answers on. Both are read-only
@@ -105,6 +109,16 @@ HTX_ENDPOINTS = (
     "https://api.huobi.pro/market/history/kline",
 )
 HTX_ENDPOINT = HTX_ENDPOINTS[0]
+
+#: The ticker list, from the same venue and under the same rule. It exists here for one
+#: reason: "backtest the top twenty pairs" is a question about the *market*, and the only
+#: non-arbitrary answer is the pairs the market itself traded most — a hand-written list of
+#: famous tickers would quietly measure the operator's taste instead of the venue's volume.
+HTX_TICKERS_ENDPOINTS = (
+    "https://api.htx.com/market/tickers",
+    "https://api.huobi.pro/market/tickers",
+)
+HTX_TICKERS = HTX_TICKERS_ENDPOINTS[0]
 
 #: The same host is identified to the venue as the rest of this layer identifies itself, so
 #: that a misbehaving caller can be found in the venue's logs. It is not a secret.
@@ -468,6 +482,95 @@ def fetch_klines(
             "less than it holds"
         )
     return series
+
+
+# ── which pairs exist, and which of them the market actually trades ─────────
+
+
+@dataclass(frozen=True)
+class Pair:
+    """One tradable pair, and how many dollars of it moved in the last day.
+
+    ``turnover`` is *quote* turnover — dollars, not coins — because a ranking that spans
+    pairs has to be able to compare them, and this is the number the venue already computes
+    for exactly that purpose. ``price`` is carried along so that a sweep can show what the
+    instrument cost while it was being measured, which is often the whole story of a return.
+    """
+
+    symbol: str
+    turnover: float
+    price: float = 0.0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "turnover": float(self.turnover),
+            "price": float(self.price),
+        }
+
+
+def universe(
+    quote: str = "usdt",
+    limit: int = 20,
+    *,
+    fetch: Optional[Callable[[str, float], Any]] = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    endpoint: str = HTX_TICKERS,
+) -> List[Pair]:
+    """The ``limit`` pairs quoted in ``quote`` that traded the most in the last day.
+
+    This is how "backtest the top twenty pairs" becomes a defined question: rank the venue's
+    own tickers by 24-hour quote turnover, take the head of the list, and say so in the
+    report. A list of famous tickers would measure taste; a list the venue publishes measures
+    the market. Note what the ranking is *not*: it is today's volume, applied to a window
+    that ends today, so the sample is survivorship-biased in the same way every
+    volume-ranked study is — pairs that died out of the top twenty are not in it.
+
+    ``fetch`` is the transport, exactly as in :func:`fetch_klines`, and it is the reason a
+    test can rank a universe without a socket.
+    """
+    if int(limit) < 1:
+        raise HtxError(
+            f"a universe of {int(limit)} pairs is not a universe; ask for at least one"
+        )
+    suffix = str(quote).strip().lower()
+    transport = fetch or _http_get
+    payload = transport(f"{endpoint}", float(timeout))
+    if not isinstance(payload, Mapping):
+        raise HtxError(
+            f"the HTX ticker endpoint answered a {type(payload).__name__} where a list of "
+            "pairs was expected"
+        )
+    status = str(payload.get("status", "ok")).lower()
+    if status != "ok":
+        raise HtxError(
+            f"the HTX ticker endpoint refused the request ({payload.get('err-msg') or status})"
+        )
+    rows = payload.get("data")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise HtxError("the HTX ticker endpoint answered no pairs at all")
+    pairs: List[Pair] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        symbol = str(row.get("symbol", "")).strip().lower()
+        if not symbol.endswith(suffix):
+            continue
+        price = _number(row.get("close"))
+        turnover = _number(row.get("vol"))
+        if turnover <= 0.0:
+            turnover = _number(row.get("amount")) * price
+        pairs.append(Pair(symbol=symbol, turnover=turnover, price=price))
+    if not pairs:
+        raise HtxError(
+            f"the HTX ticker endpoint published no pairs quoted in {suffix!r}; "
+            "the quote currency is a venue's business and this one does not trade it"
+        )
+    # Descending turnover, ties broken by name so that the same market always gives the same
+    # twenty in the same order — a sweep whose universe reshuffles between runs cannot be
+    # compared with itself.
+    pairs.sort(key=lambda pair: (-pair.turnover, pair.symbol))
+    return pairs[: int(limit)]
 
 
 # ── a chart from a file: the format an operator can edit ────────────────────

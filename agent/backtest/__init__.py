@@ -19,6 +19,10 @@ Four files, and the wall between them is the design:
 - ``reporter`` — the report: ROI, drawdown, win rate, trades, holding time, and the one
   benchmark that keeps an honest backtest honest (buy-and-hold).
 
+``run`` is one of those runs on a command line, and ``sweep`` is the same run over the
+venue's own top pairs: an anecdote is not a finding, so the table carries ROI, buy-and-hold
+and the difference between them for every pair it measured.
+
 What this package will never do
 ===============================
 
@@ -36,9 +40,11 @@ from agent.backtest.data import (
     Candle,
     CandleSeries,
     HtxError,
+    Pair,
     declines,
     fetch_klines,
     load_csv,
+    universe,
 )
 from agent.backtest.engine import (
     ENTRY_VERDICTS,
@@ -62,6 +68,7 @@ __all__ = [
     "CandleSeries",
     "Fill",
     "HtxError",
+    "Pair",
     "Report",
     "Settings",
     "SimBalance",
@@ -70,5 +77,6 @@ __all__ = [
     "declines",
     "fetch_klines",
     "load_csv",
+    "universe",
     "write_report",
 ]

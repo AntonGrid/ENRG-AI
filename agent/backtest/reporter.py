@@ -47,6 +47,7 @@ __all__ = [
     "Metrics",
     "Report",
     "metrics_of",
+    "stamp",
     "write_report",
 ]
 
@@ -226,7 +227,7 @@ def metrics_of(result: BacktestResult) -> Metrics:
     )
 
 
-def _stamp(at: float) -> str:
+def stamp(at: float) -> str:
     """An ISO-8601 UTC stamp, or an empty string — a JSON report has no ``NaN`` dates."""
     if not at or not math.isfinite(float(at)):
         return ""
@@ -273,8 +274,8 @@ class Report:
             "window": {
                 "first": float(first),
                 "last": float(last),
-                "first_stamp": _stamp(first),
-                "last_stamp": _stamp(last),
+                "first_stamp": stamp(first),
+                "last_stamp": stamp(last),
             },
             "settings": self.result.settings.as_dict(),
             "series": self.result.series.as_dict(),
@@ -295,7 +296,7 @@ class Report:
         first, last = series.span()
         lines = [
             f"── backtest · {series.symbol or 'instrument'} {series.period} · "
-            f"{metrics.bars} bars · {_stamp(first)[:10]} → {_stamp(last)[:10]}",
+            f"{metrics.bars} bars · {stamp(first)[:10]} → {stamp(last)[:10]}",
             f"   capital ${metrics.capital:,.2f} → ${metrics.final_equity:,.2f} · "
             f"ROI {metrics.roi:+.2%} · buy & hold {metrics.buy_hold_roi:+.2%}",
             f"   max drawdown {metrics.max_drawdown:.2%} · "
@@ -385,7 +386,7 @@ class Report:
                 writer.writerow(
                     [
                         int(row["bar"]),
-                        _stamp(float(row["at"])),
+                        stamp(float(row["at"])),
                         row["price"],
                         row["cash"],
                         row["units"],
@@ -418,14 +419,14 @@ class Report:
 def _trade_row(trade: Trade) -> List[Any]:
     """One trade as a CSV row, in the order :meth:`Report.write_trades_csv` declares."""
     return [
-        _stamp(trade.entry_at),
+        stamp(trade.entry_at),
         int(trade.entry_bar),
         round(float(trade.entry_price), 8),
         round(float(trade.entry_usd), 4),
         round(float(trade.units), 10),
         trade.entry_verdict,
         round(float(trade.entry_confidence), 4),
-        _stamp(trade.exit_at),
+        stamp(trade.exit_at),
         int(trade.exit_bar),
         round(float(trade.exit_price), 8),
         round(float(trade.exit_usd), 4),

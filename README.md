@@ -1105,14 +1105,16 @@ far more than its own rest while participation drained* — a capitulation on dr
 `GROWTH` reads as *the rate rose and the depth rose with it*, which on a chart is the same
 fall on rising volume.
 
-### The four files, and what each one owns
+### The files, and what each one owns
 
 | file | what it is |
 | --- | --- |
-| `data.py` | candles from HTX (`/market/history/kline`, 2000 bars a page — the venue ignores `from`/`to`, so there is no pagination to get wrong) or from a CSV (`timestamp,open,high,low,close,volume`); the decline/turnover conversion; one sentence per failure |
+| `data.py` | candles from HTX (`/market/history/kline`, 2000 bars a page — the venue ignores `from`/`to`, so there is no pagination to get wrong) or from a CSV (`timestamp,open,high,low,close,volume`); the decline/turnover conversion; the venue's ticker list, ranked by turnover, for a sweep; one sentence per failure |
 | `simulated_provider.py` | a venue that answers the `IWeb3Provider` operations from the candles: `execute_stake`, `withdraw`, `balance`, `advance` (the clock is a *bar*), plus an empty whitelist and a proof channel that always refuses |
 | `engine.py` | the decisions: one verdict per bar on the prefix that ends there, the entry table, the exit table, the stop, and the equity row per bar |
 | `reporter.py` | the readings: ROI, max drawdown, win rate, trades, mean hold, exposure, fees — and **buy & hold**, the benchmark that keeps an honest backtest honest |
+| `run.py`, `__main__.py` | one pair, one command, one report |
+| `sweep.py` | many pairs, one table: the venue's top pairs by turnover, a row per pair (with ROI, buy & hold and the difference), and `sweep.csv` |
 
 ### The fills are assumptions, and each one is a field
 
@@ -1166,19 +1168,108 @@ never swallowed. A stop followed by a re-entry on the next bar is the strategy a
 `--cooldown-bars 30` (the hunter's own `PANIC_COOLDOWN`) makes one episode one bet instead of
 one bet per bar, and the report tells you which it was.
 
-Tests: `tests/test_backtest_data.py`, `tests/test_backtest_provider.py` and
-`tests/test_backtest_engine.py` — 71 of them, and **not one opens a socket**: the transport is
-a parameter, the venue is a list of hand-written bars, and the chart is a CSV in `tmp_path`.
-What they pin: the newest-first answer reversed once, quote-versus-base volume, every failure
-as a sentence, the decline mapping (a bar that rose pays 0, a warm-up bar pays `nan`), the
-settlement lag, the slippage and the fee on both sides, the stop inside a bar and through a
-gap, one position at a time, the refusal with its reason, the exit table against the live
-loop's constants, **the prefix every verdict was measured on** (the detector is wrapped and
-every prefix length recorded, so a lookahead is a failing test and not a suspicion), the
-metrics read from a hand-built curve, the three files, the CLI's four exit codes, and the wall
-itself: no module in `agent/backtest/` imports `web3`, `agent.trade`, `real_testnet_provider`
-or `subprocess`, and the only `urllib` import in the package is *inside* the default
-transport, where `--csv` and `fetch=` never reach it.
+### One pair is an anecdote: the sweep, over the market's own top twenty
+
+A single pair over a single window answers "what would this have paid" — one instrument in one
+regime. The next question is whether the thesis holds *across* the market, and the only honest
+universe for that is the venue's own: `agent/backtest/sweep.py` ranks HTX's ticker list by
+24-hour quote turnover and runs the same engine once per pair, writing one report per pair plus
+a `sweep.csv` and printing one table.
+
+```bash
+# the twenty pairs HTX traded most, on daily bars for 5.5 years (2000 = the venue's cap)
+python -m agent.backtest.sweep --top 20 --period 1day --days 2000 --capital 1000
+
+# a list an operator chose, or a finer bar over a shorter window
+python -m agent.backtest.sweep --symbols btcusdt,ethusdt,solusdt --days 400
+python -m agent.backtest.sweep --top 20 --period 4hour --days 333 --cooldown-bars 30
+```
+
+Real output, 400 daily bars, 2025-10-08 to 2026-11-11 — a bear year:
+
+```
+── sweep · 3 pairs · 1day · 400 days asked · $1,000.00 each · entries panic
+   · btcusdt      ROI +3.01% · buy & hold -38.39% · 3 trades
+   · ethusdt      ROI +14.57% · buy & hold -51.41% · 5 trades
+   · solusdt      ROI +13.80% · buy & hold -60.97% · 5 trades
+
+symbol   bars  window                 trades      roi  buy & hold     edge  drawdown  win    fees
+───────  ────  ─────────────────────  ──────  ───────  ──────────  ───────  ────────  ───  ──────
+btcusdt   400  2025-10-08→2026-11-11       3   +3.01%     -38.39%  +41.40%     4.10%  67%   $6.09
+ethusdt   400  2025-10-08→2026-11-11       5  +14.57%     -51.41%  +65.98%     4.70%  40%  $10.10
+solusdt   400  2025-10-08→2026-11-11       5  +13.80%     -60.97%  +74.76%     6.72%  40%  $10.11
+   3 pairs measured · mean ROI +10.46% · median +13.80% · mean buy & hold -50.26% ·
+   mean edge +60.72% · beat buy & hold 3/3 · 13 trades · $26.30 in fees
+```
+
+Three columns are the argument: `roi`, `buy & hold`, and `edge` — their difference. A pair
+where the strategy lost 5 % while the coin lost 40 % is a pair where the thesis worked; a pair
+where it made 8 % while the coin made 60 % is a pair where it merely stood in the way less.
+Sorting by ROI alone cannot tell the two apart. A failure is a *row*, never a gap: a dead feed
+or a pair listed too recently keeps its place with the sentence that explains it, and
+`sweep.csv` keeps the fractions, the exit mix and that sentence for a spreadsheet.
+
+And the long window is the one that argues back. The same engine on the venue's own top
+twenty (daily bars, up to 2000 = the venue's cap, so the oldest pairs start 2021-05-22),
+measured 19 of 20:
+
+```
+symbol        bars  window                 trades      roi  buy & hold       edge  drawdown  win     fees
+────────────  ────  ─────────────────────  ──────  ───────  ──────────  ─────────  ────────  ───  ───────
+apepeusdt      476  2025-07-24→2026-11-11       2   -4.53%     -25.88%    +21.35%     4.53%   0%    $3.91
+apeusdt       1702  2022-03-16→2026-11-11     141  -69.72%     -98.66%    +28.94%    70.18%  19%  $159.28
+btcusdt       2000  2021-05-22→2026-11-11      12  +13.66%    +123.47%   -109.81%     6.35%  50%   $26.04
+bttusdt       1749  2022-01-28→2026-11-11      12  +10.63%     -83.25%    +93.89%     8.03%  33%   $23.97
+dogeusdt      2000  2021-05-22→2026-11-11      58  -23.80%     -76.03%    +52.22%    44.35%  31%   $89.36
+ethusdt       2000  2021-05-22→2026-11-11      43  -27.36%      +8.66%    -36.02%    48.07%  16%   $75.00
+htxusdt       1015  2024-02-01→2026-11-11       8   +0.30%     -15.47%    +15.77%     6.72%  38%   $15.61
+hypeusdt       266  2026-02-19→2026-11-11     0+1   +2.86%    +149.44%   -146.58%     0.00%   0%    $1.00
+jstusdt       2000  2021-05-22→2026-11-11      53   -8.38%    +163.84%   -172.23%    25.81%  28%   $98.89
+marscoinusdt    70  2026-09-03→2026-11-11       0   +0.00%     -76.15%    +76.15%     0.00%   0%    $0.00
+qntusdt          —  —                           —        —           —          —         —    —        —
+pepeusdt      1304  2023-04-18→2026-11-11    35+1  -32.70%   +1506.45%  -1539.16%    34.66%  17%   $58.39
+solusdt       2000  2021-05-22→2026-11-11      79  -17.73%    +271.89%   -289.62%    62.96%  16%  $113.65
+suiusdt       1290  2023-05-02→2026-11-11      28  -16.09%     -34.77%    +18.68%    21.33%  21%   $51.62
+usatusdt       289  2026-01-27→2026-11-11       0   +0.00%      -0.21%     +0.21%     0.00%   0%    $0.00
+winusdt       1715  2022-03-03→2026-11-11      33   -8.01%     -78.16%    +70.15%    21.57%  21%   $59.29
+xlmusdt       2000  2021-05-22→2026-11-11      36  -14.88%     -51.72%    +36.84%    29.45%  31%   $58.89
+xmrusdt       1414  2022-12-29→2026-11-11       1   -2.29%    +314.73%   -317.03%     2.29%   0%    $1.98
+xrpusdt       2000  2021-05-22→2026-11-11      31  -13.15%     +49.90%    -63.05%    26.35%  32%   $53.61
+zecusdt       1423  2022-12-20→2026-11-11       5   +2.32%   +2272.87%  -2270.55%     4.70%  60%   $10.23
+   ! qntusdt — 36 bars of 1day is not enough for a verdict — the detector needs more than 64;
+     this pair was listed too recently for the window, or the window is too short
+   19 pairs measured, 1 failed · mean ROI -10.99% · median -8.01% · mean buy & hold
+   +227.42% · mean edge -238.41% · median edge +0.21% · beat buy & hold 10/19 · 577 trades
+   · $900.73 in fees
+```
+
+Read the three numbers together and the bear-year rows above stop being a thesis. Over five
+years the strategy's **median** pair returned -8.01 % and its **median edge was +0.21 %** — a
+coin flip against holding — while the **mean** edge is -238 %, because ten of nineteen pairs
+were measured against a coin that multiplied (ZEC +2272 %, PEPE +1506 %, SOL +272 %) and no
+exit rule that sells within days can sit through that. Where the thesis does work it works as
+designed: DOGE, APE, SUI, WIN, XLM and BTT all fell harder than the strategy did, and BTC's
++13.66 % came with a 6.35 % drawdown against 123 % of holding risk. The honest summary of this
+first sweep is *"the fade of a capitulation is a defensive trade, not an offensive one"* — and
+the next experiment is a shorter bar (4hour, 333 days) or a cooldown, not a longer one.
+
+
+
+Tests: `tests/test_backtest_data.py`, `tests/test_backtest_provider.py`,
+`tests/test_backtest_engine.py` and `tests/test_backtest_sweep.py` — 103 of them, and **not one
+opens a socket**: the transport is a parameter, the venue is a list of hand-written bars, the
+chart is a CSV in `tmp_path`, and the sweep's universe is a dictionary. What they pin: the
+newest-first answer reversed once, quote-versus-base volume, every failure as a sentence, the
+decline mapping (a bar that rose pays 0, a warm-up bar pays `nan`), the settlement lag, the
+slippage and the fee on both sides, the stop inside a bar and through a gap, one position at a
+time, the refusal with its reason, the exit table against the live loop's constants, **the
+prefix every verdict was measured on** (the detector is wrapped and every prefix length
+recorded, so a lookahead is a failing test and not a suspicion), the metrics read from a
+hand-built curve, the three files, the CLI's four exit codes, the universe's ranking and its
+tie-break, a failed pair kept in the table as a row, the sweep's totals, and the wall itself: no
+module in `agent/backtest/` imports `web3`, `agent.trade`, `real_testnet_provider` or
+`subprocess`, and the only `urllib` import in the package is *inside* the default transport,
+where `--csv` and `fetch=` never reach it.
 
 ## Energy generation forecasting
 
@@ -1226,7 +1317,7 @@ python -m agent.main
 pytest
 ```
 
-930 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+965 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the

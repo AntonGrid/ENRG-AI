@@ -487,6 +487,7 @@ def test_the_package_cannot_reach_a_chain_a_key_or_the_live_state():
         "reporter.py",
         "run.py",
         "simulated_provider.py",
+        "sweep.py",
     }
     for path in modules:
         imported = "\n".join(_imports_of(path))
