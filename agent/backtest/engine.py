@@ -60,7 +60,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from agent.backtest.data import CandleSeries, declines
+from agent.backtest.data import CandleSeries, climbs, declines
 from agent.backtest.admission import Admission, admit, masked, report as admission_report
 from agent.backtest.features import enrich, series_features
 from agent.backtest.simulated_provider import (
@@ -108,6 +108,11 @@ ENTRY_VERDICTS = frozenset({PANIC}) | TAKE_PROFIT_VERDICTS
 
 #: The modes ``Settings.entries`` accepts, and what each of them means.
 ENTRY_MODES = ("panic", "organic", "both")
+
+#: The two ways a position can be held. Not a mode of the *rules*: the same rules read a
+#: series for a long book and its mirror for a short one, so a difference between the two
+#: books is a difference in the market rather than in the code that measured it.
+SIDES = ("long", "short")
 
 #: How ``Settings.stop`` is turned into a price: a fixed fraction, or a multiple of the ATR.
 STOP_MODES = ("fixed", "atr")
@@ -165,6 +170,15 @@ class Settings:
     confidence: float = 0.0
     #: Which verdicts may open a position: ``panic``, ``organic`` or ``both``.
     entries: str = "panic"
+    #: Which side the book trades: ``long`` buys the decline, ``short`` sells the rise.
+    #:
+    #: The detector is a *downside* instrument: it asks how much a bar fell, and its whole
+    #: vocabulary — ``PANIC``, ``convicted`` — describes a dislocation closing upwards. A short
+    #: book therefore hands it :func:`agent.backtest.data.climbs` instead of ``declines``: the
+    #: same detector, reading the same question about the other direction. Nothing in the
+    #: detector changes, and the venue's ledger holds a negative position, so the exits, the
+    #: fees and the stop arithmetic are the code that was already tested.
+    direction: str = "long"
     #: Bars the decline is measured over: ``1`` is the per-bar rate.
     window: int = 1
     #: Bars of history the detector needs before it will speak. The core's floor by default.
@@ -205,6 +219,8 @@ class Settings:
             raise ValueError(f"cooldown_bars must not be negative, not {self.cooldown_bars!r}")
         if str(self.entries) not in ENTRY_MODES:
             raise ValueError(f"entries must be one of {ENTRY_MODES}, not {self.entries!r}")
+        if str(self.direction) not in SIDES:
+            raise ValueError(f"direction must be one of {SIDES}, not {self.direction!r}")
         if str(self.stop_mode) not in STOP_MODES:
             raise ValueError(f"stop_mode must be one of {STOP_MODES}, not {self.stop_mode!r}")
         if int(self.atr_window) < 1:
@@ -256,6 +272,7 @@ class Settings:
             "latency_bars": int(self.latency_bars),
             "confidence": round(float(self.confidence), 4),
             "entries": str(self.entries),
+            "direction": str(self.direction),
             "window": int(self.window),
             "min_points": int(self.min_points),
             "min_depth": None if self.min_depth is None else round(float(self.min_depth), 2),
@@ -267,12 +284,16 @@ class Settings:
 
 @dataclass
 class Trade:
-    """One round trip: what was bought, on whose verdict, and what it paid.
+    """One round trip: what was opened, on whose verdict, and what it paid.
 
     The entry side is the *decision* (the verdict and its confidence) and the fill; the exit
     side is the fill and the reason it happened — ``stop``, a conviction, or the panic
     passing. A trade still open on the last bar has no exit fields, and the reporter counts
     it as unrealized rather than pretending it was sold.
+
+    :attr:`side` is which way the position was held, and :attr:`units` is always the
+    *magnitude*: the direction lives in one place so that a short's profit is the entry's
+    proceeds minus the cover's cost, not a second sign hidden in two other fields.
     """
 
     entry_bar: int
@@ -280,6 +301,7 @@ class Trade:
     entry_price: float
     entry_usd: float
     units: float
+    side: str = "long"
     entry_verdict: str = ""
     entry_confidence: float = 0.0
     entry_reason: str = ""
@@ -307,9 +329,17 @@ class Trade:
 
     @property
     def pnl(self) -> float:
-        """Profit in USDT, after both fees — the venue's own numbers, subtracted."""
+        """Profit in USDT, after both fees — the venue's own numbers, subtracted.
+
+        The two sides of the ledger run in opposite directions: a long pays ``entry_usd`` and
+        receives ``exit_usd``, a short receives the sale's proceeds and pays the cover. One
+        subtraction with a sign taken from :attr:`side`, so that a profitable long and a
+        profitable short are both positive numbers here and nowhere else has to know which.
+        """
         if self.open:
             return 0.0
+        if str(self.side) == "short":
+            return float(self.entry_usd) - float(self.exit_usd)
         return float(self.exit_usd) - float(self.entry_usd)
 
     @property
@@ -323,6 +353,7 @@ class Trade:
         return {
             "entry_bar": int(self.entry_bar),
             "entry_at": float(self.entry_at),
+            "side": str(self.side),
             "entry_price": round(float(self.entry_price), 8),
             "entry_usd": round(float(self.entry_usd), 4),
             "units": round(float(self.units), 10),
@@ -501,7 +532,12 @@ class Backtester:
                 f"{len(rows)} bars is not a backtest: at least three are needed to have a "
                 "past, a decision and a fill"
             )
-        yields = declines(rows, window=settings.window)
+        # The series the detector reads: what the bar offered a *buyer* for a long book, and
+        # what it offered a *seller* for a short one. The detector is not told which — it is
+        # the same question about the same bar, and the mirror is the deliberate choice of
+        # which side's question to ask.
+        mirror = climbs if str(settings.direction) == "short" else declines
+        yields = mirror(rows, window=settings.window)
         volumes = [float(row.volume) for row in rows]
         # The input filter, applied once and in front of the core: a bar the filter withheld
         # is handed over as ``nan`` — which the detector drops, exactly as it drops a warm-up
@@ -544,7 +580,7 @@ class Backtester:
             # 1. what the venue did on this bar: a settlement at the open, or a stop.
             for fill in venue.fills[cursor:]:
                 cursor += 1
-                if fill.side == "buy":
+                if fill.side in ("buy", "short"):
                     decision = entry_decision or {}
                     current = Trade(
                         entry_bar=fill.bar,
@@ -552,6 +588,7 @@ class Backtester:
                         entry_price=fill.price,
                         entry_usd=fill.usd,
                         units=fill.units,
+                        side="short" if fill.side == "short" else "long",
                         entry_verdict=str(decision.get("verdict", "")),
                         entry_confidence=float(decision.get("confidence", 0.0)),
                         entry_reason=str(decision.get("reason", "")),
@@ -631,7 +668,7 @@ class Backtester:
             elif venue.holding and current is not None:
                 reason = self.exit_reason(signal, current.entry_verdict)
                 if reason is not None and venue.withdraw(
-                    symbol, float(venue.units), reason=reason
+                    symbol, abs(float(venue.units)), reason=reason
                 ):
                     exit_decision = dict(decision, reason=reason)
             elif not venue.holding:
@@ -674,6 +711,7 @@ class Backtester:
                         trail_pct=float(settings.trail_r) * stop_pct,
                         max_bars=int(settings.time_stop_bars),
                         reason="open",
+                        direction=str(settings.direction),
                     ):
                         entry_decision = dict(decision, stop_pct=stop_pct)
             # 4. the book, marked at this bar's close.
@@ -685,7 +723,7 @@ class Backtester:
                     "cash": round(float(venue.cash), 6),
                     "units": round(float(venue.units), 10),
                     "equity": round(float(venue.equity), 6),
-                    "exposure": bool(venue.units > 0.0),
+                    "exposure": bool(venue.units != 0.0),
                     "verdict": signal.verdict,
                 }
             )

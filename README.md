@@ -1340,7 +1340,7 @@ sha256sum /tmp/enrg-replay/walkforward.csv
 ```
 
 
-Tests: `tests/test_backtest_*.py` — 249 of them, and **not one opens a socket**: the transport
+Tests: `tests/test_backtest_*.py` — 276 of them, and **not one opens a socket**: the transport
 is a parameter, the venue is a list of hand-written bars, the chart is a CSV in `tmp_path`, and
 the sweep's universe is a dictionary. What they pin: the newest-first answer reversed once,
 quote-versus-base volume, every failure as a sentence, the decline mapping (a bar that rose
@@ -1351,9 +1351,83 @@ the exit table against the live loop's constants, **the prefix every verdict was
 not a suspicion), the metrics read from a hand-built curve, the three files, the CLI's four exit
 codes, the universe's ranking and its tie-break, a failed pair kept in the table as a row, the
 sweep's totals, the criteria file that survives an infinite measurement, the freeze that reads
-back as the same floats, and the wall itself: no module in `agent/backtest/` imports `web3`,
+back as the same floats, the short ledger's stop above, target below, trail down and the gap that
+fills at the open through each of them, the mirror that makes `climbs` on a rising chart equal
+`declines` on its reflection, and the wall itself: no module in `agent/backtest/` imports `web3`,
 `agent.trade`, `real_testnet_provider` or `subprocess`, and the only `urllib` import in the
 package is *inside* the default transport, where `--csv` and `fetch=` never reach it.
+
+
+### The other side: a short book, and the count it needs
+
+Everything above measures one book, and it buys. That is not a preference: the detector's question
+— *is this a panic?* — is a question about a **fall with the depth drained out of it**, so a fall is
+the shape it was written to recognise. The same question has a mirror, though, and a rise whose
+turnover drains as it climbs is the shape a short seller is looking for. `--side` asks for it:
+
+```
+python -m agent.backtest.walkforward --top 100 --period 4hour --days 340 --side both
+python -m agent.backtest.walkforward --symbols btcusdt --period 4hour --days 340 --side short
+```
+
+`climbs()` in `data.py` is `declines()` with the sign turned: the same `nan` warm-up over the
+detector's record, and a bar that fell pays 0 where `declines` pays 0 for a bar that rose. It is a
+second function rather than `-declines` because the negation clamps at zero — a short book handed
+the long book's series would never fire, and a table of zeros reads like a market with no setups
+instead of a sign error. Nothing else in the detector changes: features, horizons, the policy, the
+labels' cost and the gate are the same code, so a `short:policy+atr` row can be read beside
+`policy+atr`. The side is in the row's *name* because a table whose rows differ by a setting that is
+not in the row's name is a table of anonymous numbers.
+
+The book is the mirror, in `simulated_provider.py`. A short sells units it does not own, so the
+position is **negative units**, the sale's proceeds sit in `cash`, and `equity = cash + units ×
+price` stays sign-correct on both sides with no second formula. A stop sits *above* the fill and a
+target *below* it; a bar that gaps through either fills at **the open**, which is worse than the
+stop the position named and is the gap's real money; the trail ratchets down and never up; and both
+sides reset through one `_flat()`, so a long and a short cannot leave different residue behind.
+Fees and slippage are charged both ways.
+
+What is **not** modelled is named rather than zeroed: no borrow rate, no funding, no liquidation —
+a 1× price position, not a financed one. A short row read as if it had paid borrow would be read as
+a worse book than it is, and one read as if it could be liquidated would be read as a safer book
+than it is, so every run that measures a short book prints that sentence above its table:
+
+```
+── walkforward · 1 pairs · 4hour · long / short · exits: stop atr · 2x ATR · risk 2.00%
+── walk-forward · 1 pairs · 4hour · 2000 days asked · benchmark btcusdt · gate 30 bps / t 2 / pf 1.3 / sharpe 1
+   shorts: 1x, fee and slippage charged both ways, no borrow, no funding, no liquidation — a price position, not a financed one
+```
+
+Run that over `data/frozen/4hour` and the two books answer differently on the same bars, which is
+the point: two trades for the long book, **zero** for the short one, and the short rows read
+`unmeasured — 0 trade(s): no dispersion, so no resolution` rather than `fail`. btcusdt fell over that
+window; a short book with nothing to sell is a count, not a verdict, and the gate says so in as many
+words. It is one pair, and it is the reason the next run is a hundred.
+
+On the daily frozen pair the short book does trade, and it loses: five trades, −108 bps a trade,
+profit factor **0.00** — every one of the five — against the long book's +79 bps and pf 1.87 over the
+same three folds and the same bars. Five trades is not a verdict (that row is `unmeasured`: 221 bps
+of spread against a gate of 30, so 335 trades would be needed), and one pair is not a universe. What
+the row does establish is that the mirror is a *different book with a different answer*, not the
+same book relabelled — which is the only way a two-sided agent can be measured at all.
+
+Three things hold by construction. `--side both` reads the candles **once** and runs two detector
+passes over mirrored series, so the short book's folds, warm-up and labels are the same measurement
+as the long book's, and the two never share a row in the pooled table. `climbs` on a mirrored series
+is `declines` on the original number for number, so a difference between the two books is a
+difference in the market and not in the measurement — that is a test, not a claim. And the replay
+hash is unchanged, because a long book's arithmetic never sees a short: the same frozen directory
+still gives `b3156728c363fa4f50ef00910b0436c23c2c358c95387a5d7a4250ca08e54076` after this, byte for
+byte.
+
+The side is worth the code for the reason the exit grid already found: **resolution is bought with
+count**, and the gate needs 155 trades on the four-hour book against the 8 that one pair produces.
+One pair, one side, ~1.6 trades a year; `--side both` doubles the count without doubling the
+download or the folds, and `--top 100` is the other half of the same multiplication. That run is the
+next experiment and it is *not* in this commit — what is here is the machinery to make it, verified
+on hand-built charts (a pump chart the short book trades and the long book refuses), on the frozen
+replay's byte-identical hash, and by 27 tests across both books and both ledgers.
+
 
 ## Energy generation forecasting
 
@@ -1401,7 +1475,7 @@ python -m agent.main
 pytest
 ```
 
-965 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+1135 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
@@ -1410,7 +1484,7 @@ name, which is why the full run is a *workspace* command, not a pip-install one.
 Nothing on the deployment path needs any of the three: the trading cycle's own 85
 (`tests/test_trade_loop.py`) and the provider's 109 run anywhere Python does — one of
 those asks for foundry and one for `web3`, and each skips itself by name rather than
-passing quietly. The backtest's 71 (`tests/test_backtest_*.py`) are in the same
+passing quietly. The backtest's 276 (`tests/test_backtest_*.py`) are in the same
 category and even further from a network: the transport is a parameter, so a test hands
 the loader a dictionary and a run hands it a CSV.
 

@@ -261,6 +261,50 @@ def test_a_bar_with_no_previous_close_has_no_rate():
     assert math.isnan(values[1])
 
 
+def test_a_bar_that_rose_pays_the_rise_and_a_bar_that_fell_pays_nothing():
+    values = D.climbs(_series(100.0, 102.5, 100.0, 99.0))
+
+    assert math.isnan(values[0])
+    assert values[1] == pytest.approx(2.5)
+    assert values[2] == 0.0
+    assert values[3] == 0.0
+
+
+def test_the_rise_is_measured_over_the_window_the_same_way_the_fall_is():
+    values = D.climbs(_series(100.0, 95.0, 90.0, 96.0), window=2)
+
+    assert math.isnan(values[0]) and math.isnan(values[1])
+    assert values[2] == pytest.approx(0.0)  # 100 → 90 is a fall
+    assert values[3] == pytest.approx((96.0 / 95.0 - 1.0) * 100.0)  # 95 → 96 is a rise
+
+
+def test_the_two_sides_are_mirrors_and_neither_is_a_negated_call_to_the_other():
+    rows = _series(100.0, 97.5, 100.0, 101.0)
+
+    falls = D.declines(rows)
+    rises = D.climbs(rows)
+
+    # Negating `declines` would give a series that is zero on every rise and negative on
+    # every fall — a series a short book could never enter on. The clamp has to be applied
+    # to the other sign, which is why this is a second function and not a `-1` at the call.
+    assert falls[1] == pytest.approx(2.5) and rises[1] == pytest.approx(0.0)
+    assert rises[3] == pytest.approx(1.0) and falls[3] == pytest.approx(0.0)
+    for fall, rise in zip(falls[1:], rises[1:]):
+        assert min(fall, rise) == 0.0
+        assert max(fall, rise) > 0.0
+
+
+def test_a_bar_with_no_previous_close_has_no_rise_either():
+    rows = [
+        D.Candle(at=1.0, open=0.0, high=0.0, low=0.0, close=0.0),
+        D.Candle(at=2.0, open=1.0, high=1.0, low=1.0, close=1.0),
+    ]
+
+    values = D.climbs(rows)
+
+    assert math.isnan(values[0]) and math.isnan(values[1])
+
+
 # ── a chart from a file ────────────────────────────────────────────────────
 
 

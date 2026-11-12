@@ -76,13 +76,25 @@ def forward_return(
 
 
 def net_forward_return(
-    rows: Sequence[Candle], index: int, horizon: int = 3, *, cost: float = DEFAULT_COST
+    rows: Sequence[Candle],
+    index: int,
+    horizon: int = 3,
+    *,
+    cost: float = DEFAULT_COST,
+    direction: str = "long",
 ) -> Optional[float]:
-    """The same return, in per cent, after the round trip the venue keeps."""
+    """The same return, in per cent, after the round trip the venue keeps.
+
+    ``direction="short"`` negates the *gross* move and leaves the cost alone: a short that
+    covered into a fall of 3 % earned 3 %, and it still paid the venue both ways. Negating the
+    net instead would hand a short book a subsidy of ``2 × cost`` on every trade — the one
+    number the whole sweep turned on.
+    """
     gross = forward_return(rows, index, horizon)
     if gross is None:
         return None
-    return gross - 100.0 * float(cost)
+    moved = -gross if str(direction) == "short" else gross
+    return moved - 100.0 * float(cost)
 
 
 def label_at(
@@ -92,15 +104,18 @@ def label_at(
     *,
     cost: float = DEFAULT_COST,
     threshold: float = 0.0,
+    direction: str = "long",
 ) -> Optional[float]:
     """``1.0`` when the entry paid more than the cost, ``0.0`` when it did not, else ``None``.
 
     ``threshold`` moves the bar: on a market whose round trip is cheap, a label that only
     asks for "more than zero" is a label of a drift, not of an edge. Raising it to one ATR
     would ask for a move worth the risk — that is a choice for the caller, and the fact that
-    it is a parameter is the point.
+    it is a parameter is the point. ``direction`` is the side the entry would have been on,
+    and it is passed rather than assumed because a policy trained on a long's labels is a
+    policy that would veto every short.
     """
-    net = net_forward_return(rows, index, horizon, cost=cost)
+    net = net_forward_return(rows, index, horizon, cost=cost, direction=direction)
     if net is None:
         return None
     return 1.0 if net > float(threshold) else 0.0
@@ -112,6 +127,10 @@ def labels_at(
     *,
     cost: float = DEFAULT_COST,
     threshold: float = 0.0,
+    direction: str = "long",
 ) -> List[Optional[float]]:
     """One label per bar, ``None`` where the future is not in the record."""
-    return [label_at(rows, index, horizon, cost=cost, threshold=threshold) for index in range(len(rows))]
+    return [
+        label_at(rows, index, horizon, cost=cost, threshold=threshold, direction=direction)
+        for index in range(len(rows))
+    ]

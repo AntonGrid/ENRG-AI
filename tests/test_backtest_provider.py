@@ -279,3 +279,140 @@ def test_the_history_it_publishes_stops_at_its_own_clock():
         pytest.approx((1 - 96.0 / 98.0) * 100.0),
         pytest.approx((1 - 94.0 / 96.0) * 100.0),
     ]
+
+
+# ── the other side: a short is the same ledger with its sign turned ────────
+
+
+def test_a_short_sells_borrowed_units_and_the_ledger_goes_negative():
+    provider = venue(
+        (100.0, 100.0, 99.0, 100.0, 1000.0),
+        (100.0, 101.0, 99.0, 100.0, 1000.0),
+    )
+
+    assert provider.execute_stake("sim:btcusdt", 1000.0, direction="short") is True
+    provider.advance()
+
+    fill = provider.fills[0]
+    assert fill.side == "short"
+    assert fill.price == pytest.approx(100.0 * (1.0 - 0.001))
+    assert provider.short is True and provider.holding is True
+    assert provider.units == pytest.approx(-1000.0 / (100.0 * (1.0 - 0.001)))
+    # The proceeds are the collateral: cash holds both the account and the sale, and the debt
+    # is the units times the price. Equity at the fill is the fee, exactly what a long pays.
+    assert provider.cash == pytest.approx(1000.0 + 1000.0 - 1000.0 * 0.001)
+
+
+def test_a_short_that_covers_lower_banks_the_difference():
+    provider = venue(
+        (100.0, 100.0, 99.0, 100.0, 1000.0),
+        (100.0, 101.0, 99.0, 100.0, 1000.0),
+        (90.0, 91.0, 89.0, 90.0, 1000.0),
+    )
+    provider.execute_stake("sim:btcusdt", 1000.0, direction="short")
+    provider.advance()
+    entry = provider.entry_price
+
+    assert provider.withdraw("sim:btcusdt", abs(provider.units)) is True
+    provider.advance()
+
+    cover = provider.fills[1]
+    assert cover.side == "cover"
+    assert cover.price == pytest.approx(90.0 * 1.001)
+    assert provider.holding is False
+    units = 1000.0 / entry
+    assert provider.cash == pytest.approx(
+        1000.0 + 1000.0 * (1.0 - 0.001) - units * cover.price * (1.0 + 0.001)
+    )
+    assert provider.cash > 1000.0
+
+
+def test_a_shorts_stop_sits_above_the_fill_and_a_gap_through_it_fills_at_the_open():
+    provider = venue(
+        (100.0, 100.0, 99.0, 100.0, 1000.0),
+        (100.0, 101.0, 99.0, 100.0, 1000.0),
+        (104.0, 106.0, 103.0, 105.0, 1000.0),
+    )
+    provider.execute_stake("sim:btcusdt", 1000.0, direction="short", stop_pct=0.03)
+    provider.advance()
+    entry = provider.fills[0].price
+
+    assert provider.stop_price == pytest.approx(entry * 1.03)
+
+    provider.advance()
+
+    cover = provider.fills[1]
+    assert cover.side == "cover" and cover.reason == "stop"
+    # The bar opened above the stop: the gap is real money and the fill is the open, which is
+    # *worse* than the stop the position named. Smoothing it would invent a profit.
+    assert cover.price == pytest.approx(104.0 * 1.001)
+    assert cover.price > entry * 1.03
+    assert provider.holding is False
+
+
+def test_a_shorts_take_profit_is_a_floor_and_a_gap_through_it_fills_at_the_open():
+    provider = venue(
+        (100.0, 100.0, 99.0, 100.0, 1000.0),
+        (100.0, 101.0, 99.0, 100.0, 1000.0),
+        (80.0, 81.0, 79.0, 80.0, 1000.0),
+    )
+    provider.execute_stake("sim:btcusdt", 1000.0, direction="short", take_profit_pct=0.05)
+    provider.advance()
+    entry = provider.fills[0].price
+
+    assert provider.take_profit_price == pytest.approx(entry * 0.95)
+
+    provider.advance()
+
+    cover = provider.fills[1]
+    assert cover.reason == "target"
+    assert cover.price == pytest.approx(80.0 * 1.001)
+    assert provider.cash > 1000.0
+
+
+def test_a_shorts_best_excursion_is_the_low_and_its_worst_is_the_high():
+    provider = venue(
+        (100.0, 100.0, 99.0, 100.0, 1000.0),
+        (100.0, 104.0, 95.0, 100.0, 1000.0),
+    )
+    provider.execute_stake("sim:btcusdt", 1000.0, direction="short")
+    provider.advance()
+
+    entry = provider.entry_price
+    assert provider.mfe == pytest.approx(1.0 - 95.0 / entry)
+    assert provider.mae == pytest.approx(1.0 - 104.0 / entry)
+    assert provider.mfe > 0.0 > provider.mae
+
+
+def test_a_shorts_trail_follows_the_low_and_only_moves_the_stop_down():
+    provider = venue(
+        (100.0, 100.0, 99.0, 100.0, 1000.0),
+        (100.0, 100.0, 90.0, 91.0, 1000.0),
+        (91.0, 92.0, 85.0, 86.0, 1000.0),
+    )
+    provider.execute_stake(
+        "sim:btcusdt", 1000.0, direction="short", stop_pct=0.20, trail_pct=0.05
+    )
+    provider.advance()
+
+    # The wide stop the ticket named is replaced by the trail's, which hangs off the low.
+    assert provider.stop_price == pytest.approx(90.0 * 1.05)
+
+    provider.advance()
+
+    assert provider.stop_price == pytest.approx(85.0 * 1.05)
+    assert provider.holding is True
+
+
+def test_a_side_that_is_neither_long_nor_short_is_refused_rather_than_guessed():
+    provider = venue((100.0, 100.0, 99.0, 100.0, 1000.0))
+
+    with pytest.raises(ValueError):
+        provider.execute_stake("sim:btcusdt", 100.0, direction="sideways")
+
+
+def test_a_flat_venue_says_it_has_no_position_to_close_at_all():
+    provider = venue((100.0, 100.0, 99.0, 100.0, 1000.0), (100.0, 100.0, 99.0, 100.0, 1000.0))
+
+    assert provider.withdraw("sim:btcusdt", 1.0) is False
+    assert provider.refusals[-1].reason == "there is no position to close"

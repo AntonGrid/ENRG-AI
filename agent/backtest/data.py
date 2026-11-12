@@ -92,6 +92,7 @@ __all__ = [
     "CandleSeries",
     "HtxError",
     "Pair",
+    "climbs",
     "days_to_bars",
     "declines",
     "fetch_klines",
@@ -335,6 +336,38 @@ def declines(rows: Sequence[Candle], *, window: int = 1) -> List[float]:
         change = now / past - 1.0
         # A bar that rose paid a buyer nothing; a bar that fell paid it the fall.
         values.append(max(0.0, -change * 100.0))
+    return values
+
+
+def climbs(rows: Sequence[Candle], *, window: int = 1) -> List[float]:
+    """One value per row: the rise the bar offered a seller, in per cent, ``nan`` warming up.
+
+    The mirror of :func:`declines`, and a separate function rather than a negated call to it,
+    because the clamp is not symmetric: ``declines`` reports ``max(0, -change)`` and
+    ``-declines`` would report falls as *negative declines*, which is not a rise. A bar that
+    fell paid a seller nothing; a bar that rose paid it the rise. Negating the output of
+    ``declines`` would hand a short book a series that is zero on every up move and negative
+    on every down move — a series that can never rise, and therefore a book that can never
+    enter.
+
+    ``window`` and the warm-up are the same arithmetic as :func:`declines`: the first
+    ``window`` rows answer ``nan``, not ``0.0``, because the detector drops ``nan`` and
+    would otherwise read a fabricated flat bar as history.
+    """
+    span = max(int(window), 1)
+    values: List[float] = []
+    for index, row in enumerate(rows):
+        if index < span:
+            values.append(math.nan)
+            continue
+        past = float(rows[index - span].close)
+        now = float(row.close)
+        if not math.isfinite(past) or not math.isfinite(now) or past <= 0.0:
+            values.append(math.nan)
+            continue
+        change = now / past - 1.0
+        # A bar that fell paid a seller nothing; a bar that rose paid it the rise.
+        values.append(max(0.0, change * 100.0))
     return values
 
 

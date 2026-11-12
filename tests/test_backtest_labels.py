@@ -94,3 +94,29 @@ def test_a_zero_horizon_is_refused_instead_of_looking_at_the_same_bar_twice():
 def test_an_impossible_price_is_no_answer_rather_than_a_division():
     rows = bars(opens=[100.0, 0.0], closes=[100.0, 0.0])
     assert forward_return(rows, 0, horizon=1) is None
+
+
+def test_a_short_label_is_the_mirrored_move_and_the_same_cost():
+    rows = bars(opens=[100.0, 100.0], closes=[100.0, 97.0])
+
+    assert forward_return(rows, 0, horizon=1) == pytest.approx(-3.0)
+    assert net_forward_return(rows, 0, horizon=1) == pytest.approx(-3.0 - 100.0 * DEFAULT_COST)
+    # The move is negated and the cost is not: a short pays the venue both ways, and a
+    # negated *net* would hand the short book a subsidy of `2 × cost` on every trade.
+    assert net_forward_return(rows, 0, horizon=1, direction="short") == pytest.approx(
+        3.0 - 100.0 * DEFAULT_COST
+    )
+
+
+def test_a_short_that_covered_into_a_fall_is_the_win_the_long_calls_a_loss():
+    rows = bars(opens=[100.0, 100.0], closes=[100.0, 97.0])
+
+    assert label_at(rows, 0, horizon=1, direction="short") == 1.0
+    assert label_at(rows, 0, horizon=1) == 0.0
+
+
+def test_a_fall_that_does_not_beat_the_cost_is_no_win_for_a_short_either():
+    rows = bars(opens=[100.0, 100.0], closes=[100.0, 100.0 * (1.0 - 0.9 * DEFAULT_COST)])
+
+    assert net_forward_return(rows, 0, horizon=1, direction="short") < 0.0
+    assert label_at(rows, 0, horizon=1, direction="short") == 0.0

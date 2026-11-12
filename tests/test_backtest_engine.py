@@ -365,6 +365,75 @@ def test_a_semicolon_report_is_written_for_the_locales_that_want_one(tmp_path):
     assert written["trades"].read_text(encoding="utf-8").splitlines()[0].count(";") > 5
 
 
+# ── the other side: a book that sells the rise ─────────────────────────────
+
+
+def pump_chart() -> CandleSeries:
+    """The crash's mirror: a stall, a rally on draining turnover, and a sell-off.
+
+    Being the mirror is the point. The detector is not told which book it is feeding; it is
+    handed ``climbs`` instead of ``declines`` and asks the same question about the other
+    direction, so the same hand-written shape has to produce the same shape of book.
+    """
+    changes = [0.004 if index % 2 == 0 else -0.004 for index in range(40)]
+    volumes = [1.0e6] * 40
+    changes += [-change for change in CRASH]
+    volumes += [4.0e5] * len(CRASH)
+    changes += [-0.012] * 12
+    volumes += [7.0e5] * 12
+    return chart(changes, volumes)
+
+
+def test_a_short_book_sells_a_pump_and_every_trade_says_which_side_it_was():
+    result = E.Backtester(pump_chart(), E.Settings(min_points=20, direction="short")).run()
+
+    assert result.trades, "a rally on draining turnover is the short book's panic"
+    assert {trade.side for trade in result.trades} == {"short"}
+    # The same three trades as its long mirror: two stops and a take-profit.
+    assert [trade.exit_reason for trade in result.closed] == ["stop", "stop", "take-profit"]
+
+
+def test_the_sign_of_a_trades_profit_is_the_sign_of_its_side():
+    result = E.Backtester(pump_chart(), E.Settings(min_points=20, direction="short")).run()
+    stopped, paid = result.closed[0], result.closed[-1]
+
+    # A short that was stopped out was stopped *up*: the price rose, and the trade lost.
+    assert stopped.exit_price > stopped.entry_price > 0.0
+    assert stopped.pnl < 0.0
+    # And one that took profit bought the units back lower, so it gained.
+    assert paid.exit_price < paid.entry_price
+    assert paid.pnl > 0.0
+    # Profit is measured against what the entry put in the account, on both sides.
+    assert paid.pnl_pct == pytest.approx(paid.pnl / paid.entry_usd)
+
+
+def test_an_open_short_is_held_as_negative_units_and_is_marked_as_exposure():
+    result = E.Backtester(pump_chart(), E.Settings(min_points=20, direction="short")).run()
+
+    held = [row for row in result.equity if row["units"] != 0.0]
+    assert held, "the book held a position at some point"
+    assert all(row["units"] < 0.0 for row in held)
+    assert all(row["exposure"] is True for row in held)
+    assert all(row["exposure"] is False for row in result.equity if row["units"] == 0.0)
+
+
+def test_a_short_trade_records_the_size_it_sold_as_a_magnitude():
+    result = E.Backtester(pump_chart(), E.Settings(min_points=20, direction="short")).run()
+    sold = result.closed[0]
+
+    # The direction lives in one field, so the size is what it sold, not a signed number that
+    # every report would have to know how to read.
+    assert sold.units > 0.0
+    assert sold.side == "short" and sold.as_dict()["side"] == "short"
+    # What the entry put in the account is the proceeds less the fee, not the gross sale.
+    assert sold.entry_usd == pytest.approx(sold.units * sold.entry_price * (1.0 - 0.001))
+
+
+def test_a_side_that_is_neither_long_nor_short_is_refused_by_the_settings():
+    with pytest.raises(ValueError):
+        E.Settings(direction="sideways")
+
+
 # ── the command line, which is how this is actually used ───────────────────
 
 

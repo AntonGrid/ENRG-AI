@@ -79,6 +79,7 @@ from agent.backtest.data import (
     PERIOD_SECONDS,
     CandleSeries,
     HtxError,
+    climbs,
     declines,
     fetch_klines,
     load_csv,
@@ -443,7 +444,11 @@ def verdict_series(
     """
     config = settings or Settings()
     rows = series.rows
-    yields = declines(rows, window=config.window)
+    # A short book asks the detector the same question about the other direction: the bar's
+    # rise instead of its fall. Nothing downstream changes — same detector, same thresholds,
+    # same words — which is what makes the two books comparable at all.
+    mirror = climbs if str(config.direction) == "short" else declines
+    yields = mirror(rows, window=config.window)
     volumes = [float(row.volume) for row in rows]
     if config.admission is not None:
         # The same filter the engine applies, on the same bars: a panel trained on verdicts
@@ -457,6 +462,34 @@ def verdict_series(
         detector.measure(yields[: index + 1], volumes[: index + 1], name=name)
         for index in range(len(rows))
     ]
+
+
+class _Measured:
+    """A detector that answers with verdicts already measured on these bars.
+
+    :func:`verdict_series` walks the whole series once, and the four ablations used to walk it
+    again from the first bar each: the verdict on bar ``t`` is a function of the prefix ending
+    at ``t`` and of nothing else, so the second walk is the same arithmetic for the same
+    answer. Handing the measured series back by prefix length turns five passes into one —
+    the same rows, byte for byte, at a fifth of the price.
+
+    It refuses a prefix it never measured instead of answering something close. A cache that
+    silently served a verdict from another series would be the one bug that makes every row of
+    the table wrong in the same direction, and nothing in the table would show it.
+    """
+
+    def __init__(self, signals: Sequence[PanicSignal]) -> None:
+        self._signals = list(signals)
+
+    def measure(
+        self, apy: Sequence[float], tvl: Optional[Sequence[float]] = None, **_: Any
+    ) -> PanicSignal:
+        index = len(apy) - 1
+        if 0 <= index < len(self._signals):
+            return self._signals[index]
+        raise ValueError(
+            f"this detector measured {len(self._signals)} bars; the prefix ends at {index}"
+        )
 
 
 def panel(
@@ -515,8 +548,17 @@ def panel(
                     regime=regime,
                     bars_since_panic=bars_since_panic,
                 ),
-                net=net_forward_return(rows, index, horizon, cost=cost),
-                label=label_at(rows, index, horizon, cost=cost, threshold=threshold),
+                net=net_forward_return(
+                    rows, index, horizon, cost=cost, direction=str(config.direction)
+                ),
+                label=label_at(
+                    rows,
+                    index,
+                    horizon,
+                    cost=cost,
+                    threshold=threshold,
+                    direction=str(config.direction),
+                ),
             )
         )
     return out
@@ -616,6 +658,11 @@ def _window(
     price_in = float(rows[start - 1].close)
     price_out = float(rows[end - 1].close)
     buy_hold = (price_out / price_in - 1.0) if price_in > 0.0 else 0.0
+    if str(result.settings.direction) == "short":
+        # The passive alternative to a short book is being short, so the benchmark is the same
+        # move with the sign turned — and not the long's buy-and-hold, which would price a
+        # short against the other side's market and call the difference alpha.
+        buy_hold = -buy_hold
     trades = [
         trade
         for trade in result.trades
@@ -660,6 +707,7 @@ def walk_forward(
     l2: float = DEFAULT_L2,
     regime_window: int = DEFAULT_REGIME_WINDOW,
     features: Sequence[str] = POLICY_FEATURES,
+    direction: str = "long",
     on_reading: Optional[Callable[[Reading], None]] = None,
 ) -> List[Reading]:
     """Fit on the past, measure on the future, once per fold and per ablation.
@@ -669,12 +717,21 @@ def walk_forward(
     which slice is which rather than a second measurement. The policy is refitted inside every
     fold on that fold's training slice alone — a policy fitted once on all the panics and then
     judged on them is the in-sample illusion this file exists to refuse.
+
+    ``direction`` is the side of the book, and it changes three things and only three: the
+    series the detector reads (``climbs`` instead of ``declines``), the sign of the label the
+    policy is fitted to, and the entry the venue is told to open. The exits, the fees and the
+    gate are the same code, so a short row can be read beside a long one. Its name carries the
+    side — ``short:policy+atr`` — because a table whose rows differ by a setting that is not
+    printed in the name is a table that lies about what it compared.
     """
-    config = settings or Settings()
+    config = replace(settings or Settings(), direction=str(direction))
     rows = series.rows
     splits = list(folds) if folds is not None else expanding_folds(rows)
     if not splits:
         return []
+    # Measured once and used by both halves: the panel labels it, the engine decides on it.
+    words = verdict_series(series, config)
     samples = panel(
         series,
         config,
@@ -682,6 +739,7 @@ def walk_forward(
         horizon=horizon,
         cost=cost,
         threshold=threshold,
+        signals=words,
     )
     mask = (
         align_regime(rows, benchmark.rows, window=int(regime_window))
@@ -731,13 +789,14 @@ def walk_forward(
             result = Backtester(
                 series,
                 config_here,
+                detector=_Measured(words),
                 policy=policy if ablation.use_policy else None,
                 regime=mask,
             ).run()
             reading = _window(
                 result,
                 fold,
-                ablation.name,
+                ablation.name if str(config.direction) == "long" else f"short:{ablation.name}",
                 len(train),
                 bars_per_year,
                 note=note,
@@ -939,6 +998,20 @@ def format_summary(summaries: Sequence[Summary]) -> str:
 # ── the command line ───────────────────────────────────────────────────────
 
 
+def _sides(value: Any) -> List[str]:
+    """Which books ``--side`` asked for: one name, or both in the order they are printed.
+
+    ``both`` is one run and two books, not two runs: the candles are read once, the folds are
+    the same folds, and the pooled table carries a row per side because the ablation's name
+    says which side it is. A ``both`` run of one pair therefore costs what a ``long`` run costs
+    plus the detector pass over the mirrored series — not twice the download.
+    """
+    name = str(value or "long").strip().lower()
+    if name == "both":
+        return ["long", "short"]
+    return [name]
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent.backtest.walkforward",
@@ -961,6 +1034,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--benchmark", default="btcusdt", help="the regime's benchmark; '' disables")
     parser.add_argument("--regime-window", type=int, default=DEFAULT_REGIME_WINDOW, help="bars in the benchmark's mean")
+    parser.add_argument(
+        "--side",
+        default="long",
+        choices=("long", "short", "both"),
+        help="which book to measure: the fall (long), the rise (short), or both",
+    )
     parser.add_argument("--capital", type=float, default=1000.0, help="the starting book, USDT")
     parser.add_argument("--share", type=float, default=1.0, help="the share of cash one entry may spend")
     parser.add_argument("--stop", type=float, default=0.02, help="the fixed stop below the fill")
@@ -1186,7 +1265,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not args.quiet and exits:
         print(
-            f"── walkforward · {len(symbols)} pairs · {args.period} · {describe_exits(exits)}"
+            f"── walkforward · {len(symbols)} pairs · {args.period} · "
+            f"{' / '.join(_sides(args.side))} · {describe_exits(exits)}"
         )
     endpoint = HTX_ENDPOINTS[1 if str(args.exchange) == "huobi" else 0]
     frozen = Path(args.candles) if str(args.candles).strip() else None
@@ -1219,6 +1299,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"benchmark {args.benchmark or 'none'} · gate {GATE['edge_bps']:.0f} bps / "
             f"t {GATE['t_stat']:.0f} / pf {GATE['profit_factor']:.1f} / sharpe {GATE['sharpe']:.0f}"
         )
+        if "short" in _sides(args.side):
+            # Said once, where the numbers are produced, and not only in the README: a short
+            # row that is read as if it had been borrowed at a cost would be read as a worse
+            # book than it is, and one read as if it could be liquidated would be read as a
+            # safer book than it is. Both are errors about the same missing constant.
+            print(
+                "   shorts: 1x, fee and slippage charged both ways, no borrow, no funding, "
+                "no liquidation — a price position, not a financed one"
+            )
 
     all_readings: List[Reading] = []
     measured = 0
@@ -1246,18 +1335,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 splits=int(args.splits),
                 min_train=int(args.min_train),
             )
-            readings = walk_forward(
-                series,
-                settings=settings,
-                ablations=pinned_ablations(exits),
-                benchmark=benchmark,
-                folds=folds,
-                horizon=int(args.horizon),
-                cost=float(args.cost),
-                threshold=float(args.threshold),
-                l2=float(args.l2),
-                regime_window=int(args.regime_window),
-            )
+            readings = []
+            for side in _sides(args.side):
+                readings.extend(
+                    walk_forward(
+                        series,
+                        settings=settings,
+                        ablations=pinned_ablations(exits),
+                        benchmark=benchmark,
+                        folds=folds,
+                        horizon=int(args.horizon),
+                        cost=float(args.cost),
+                        threshold=float(args.threshold),
+                        l2=float(args.l2),
+                        regime_window=int(args.regime_window),
+                        direction=side,
+                    )
+                )
         except (ValueError, HtxError) as exc:
             print(f"   ! {symbol:<12} {exc}", file=sys.stderr)
             continue
@@ -1271,7 +1365,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.quiet:
             print()
             print(f"   {symbol} · {len(series.rows)} bars · folds "
-                  f"{', '.join(fold.name for fold in folds)}")
+                  f"{len(folds)}: {', '.join(fold.name for fold in folds)}")
             print(format_readings(readings))
 
     if not measured:
@@ -1289,6 +1383,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "readings": len(all_readings),
             "pairs": measured,
             "period": str(args.period),
+            "side": str(args.side),
             "days": float(args.days),
             "exits": dict(exits),
             "candles": (

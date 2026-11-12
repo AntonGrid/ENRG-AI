@@ -40,6 +40,7 @@ from agent.backtest.walkforward import (
     summary,
     verdict_series,
     walk_forward,
+    _Measured,
     _window,
 )
 from agent.physics.volatility_hunter import PANIC
@@ -449,3 +450,124 @@ def test_saving_candles_writes_what_the_run_read(monkeypatch, tmp_path):
     document = json.loads((tmp_path / "wf" / "criteria.json").read_text())
     # Nothing was read from a frozen directory, so the run is not claimed to be replayable.
     assert document["run"]["candles"]["dir"] == ""
+
+# ── the other side: the same rules, reading the rise ───────────────────────
+
+
+def test_the_two_sides_read_mirrored_series_and_the_detector_is_never_told_which():
+    falling = market()
+    rising = chart([-change for change in CHANGES], VOLUMES)
+
+    long_words = verdict_series(falling, Settings())
+    short_words = verdict_series(rising, Settings(direction="short"))
+
+    # ``climbs`` on the mirrored series is ``declines`` on the original, number for number, so
+    # the detector cannot tell the two books apart. That is what makes a difference between
+    # their tables a difference in the market rather than in the measurement. The readings agree
+    # to within the rounding of a product of returns, which is where the mirror is not exact.
+    assert [word.verdict for word in short_words] == [word.verdict for word in long_words]
+    assert [float(word.confidence) for word in short_words] == pytest.approx(
+        [float(word.confidence) for word in long_words]
+    )
+    assert any(word.verdict == PANIC for word in short_words)
+
+
+def test_a_short_walk_forward_names_every_row_with_its_side():
+    series = market()
+    fold = Fold("late", 100, len(series.rows))
+
+    long_rows = walk_forward(series, folds=[fold])
+    short_rows = walk_forward(series, folds=[fold], direction="short")
+
+    assert [row.ablation for row in long_rows] == [item.name for item in ABLATIONS]
+    assert [row.ablation for row in short_rows] == [
+        f"short:{item.name}" for item in ABLATIONS
+    ]
+    # The pooled table groups rows by that name, so the two books are never averaged together
+    # into a return that neither of them earned.
+    assert [row.ablation for row in summary(long_rows + short_rows)] == [
+        item.name for item in ABLATIONS
+    ] + [f"short:{item.name}" for item in ABLATIONS]
+
+
+def test_a_short_reading_is_priced_against_the_short_side_of_the_move():
+    series = market()
+    fold = Fold("late", 100, len(series.rows))
+
+    long_row = walk_forward(series, folds=[fold])[0]
+    short_row = walk_forward(series, folds=[fold], direction="short")[0]
+
+    # The passive alternative to a short book is being short, not owning the fall: a window the
+    # long book lost money simply sitting in is a window the short book made money sitting in.
+    assert short_row.fold == long_row.fold
+    assert short_row.buy_hold == pytest.approx(-long_row.buy_hold)
+
+
+# ── the cache the detector is measured through ─────────────────────────────
+
+
+def test_the_cached_detector_answers_by_prefix_and_refuses_a_prefix_it_never_measured():
+    words = verdict_series(market(), Settings())
+    detector = _Measured(words)
+
+    assert detector.measure([0.0] * 5) is words[4]
+    assert detector.measure([0.0] * len(words), [0.0] * len(words), name="btcusdt") is words[-1]
+    # A prefix longer than the record is a different question, and guessing it would put a
+    # number in a table that no run produced.
+    with pytest.raises(ValueError):
+        detector.measure([0.0] * (len(words) + 1))
+
+
+def test_the_cached_detector_changes_the_speed_of_the_run_and_not_the_table():
+    series = market()
+    settings = Settings(min_points=20)
+
+    plain = Backtester(series, settings).run()
+    cached = Backtester(
+        series, settings, detector=_Measured(verdict_series(series, settings))
+    ).run()
+
+    assert cached.as_dict() == plain.as_dict()
+
+
+def test_the_cli_runs_both_books_and_prints_how_many_folds_it_read(monkeypatch, tmp_path, capsys):
+    from agent.backtest import walkforward
+
+    monkeypatch.setattr(walkforward, "_series", lambda *args, **kwargs: market())
+    out = tmp_path / "both"
+
+    assert walkforward.main(
+        ["--symbols", "btcusdt", "--folds", "2021", "--min-train", "60",
+         "--benchmark", "", "--side", "both", "--out", str(out)]
+    ) == 0
+
+    printed = capsys.readouterr().out
+    # ``folds 1: 2021`` and not a bare count: a fold's name is a year, and one run of one pair
+    # printing "folds 1" over a table of rows tagged 2021 reads like a fold that was dropped.
+    assert "folds 1: 2021" in printed
+    assert "shorts: 1x" in printed
+
+    table = (out / "walkforward.csv").read_text(encoding="utf-8")
+    readings, pooled = table.split("\n\n")[:2]
+    rows = [line.split(",") for line in readings.splitlines()]
+    column = rows[0].index("ablation")
+    assert [row[column] for row in rows[1:]] == [item.name for item in ABLATIONS] + [
+        f"short:{item.name}" for item in ABLATIONS
+    ]
+    # And the pooled verdict below it keeps the two books apart rather than pooling them.
+    assert "short:baseline" in pooled
+
+
+def test_naming_one_side_runs_only_that_side(monkeypatch, tmp_path):
+    from agent.backtest import walkforward
+
+    monkeypatch.setattr(walkforward, "_series", lambda *args, **kwargs: market())
+    out = tmp_path / "long"
+
+    assert walkforward.main(
+        ["--symbols", "btcusdt", "--folds", "2021", "--min-train", "60",
+         "--benchmark", "", "--side", "long", "--out", str(out), "--quiet"]
+    ) == 0
+
+    assert "short:" not in (out / "walkforward.csv").read_text(encoding="utf-8")
+

@@ -277,7 +277,26 @@ class SimulatedProvider:
 
     @property
     def holding(self) -> bool:
-        return self.units > 0.0
+        """True on either side: a short is a position, and a venue that answered otherwise
+        would let its caller open a second one on top of it."""
+        return float(self.units) != 0.0
+
+    @property
+    def long(self) -> bool:
+        """True while the ledger holds units it bought — the side every exit rule knew first."""
+        return float(self.units) > 0.0
+
+    @property
+    def short(self) -> bool:
+        """True while the ledger owes units it sold — the same position with the sign turned.
+
+        The units are negative and the proceeds of the sale sit in :attr:`cash` as collateral,
+        so :attr:`equity` — ``cash + units × price`` — stays the one arithmetic that is right
+        on both sides. There is no borrow fee, no funding rate and no liquidation price in this
+        ledger: they are declared absent in the report rather than modelled as zero, because a
+        zero that looks like a measurement is worse than a sentence that says what is missing.
+        """
+        return float(self.units) < 0.0
 
     @property
     def busy(self) -> bool:
@@ -333,8 +352,9 @@ class SimulatedProvider:
         trail_pct: float = 0.0,
         max_bars: int = 0,
         reason: str = "open",
+        direction: str = "long",
     ) -> bool:
-        """Buy ``amount`` USDT worth of the instrument; ``True`` when the order was taken.
+        """Open ``amount`` USDT of exposure; ``True`` when the order was taken.
 
         ``protocol_address`` is ignored on purpose and the argument is kept because the
         interface declares it: on a chain it names the vault, and here there is exactly one
@@ -342,23 +362,34 @@ class SimulatedProvider:
         rather than arriving later, because a stop is a property of the position being
         opened and a venue that could open a position without one would be a venue that
         could be held overnight with no exit by a bug in the caller.
+
+        ``direction="short"`` opens the same size on the other side: the venue sells units it
+        does not own and keeps the proceeds as collateral, so the ledger's position is
+        negative and every rule below — the stop, the target, the trail, the clock — reads the
+        same fields with the sign of the move it is watching. The size is capped by cash and
+        not by leverage: this is a 1× book, and a 1× book cannot be liquidated by a wick.
         """
+        wanted = str(direction).strip().lower()
+        if wanted not in ("long", "short"):
+            raise ValueError(f"direction must be 'long' or 'short', not {direction!r}")
+        side = "buy" if wanted == "long" else "short"
         if self.holding:
-            self._refuse("buy", float(amount), "this venue holds one position at a time")
+            self._refuse(side, float(amount), "this venue holds one position at a time")
             return False
         if self.busy:
-            self._refuse("buy", float(amount), "an order is already waiting for its bar")
+            self._refuse(side, float(amount), "an order is already waiting for its bar")
             return False
         budget = self._budget(float(amount))
         if budget <= 0.0:
             self._refuse(
-                "buy",
+                side,
                 float(amount),
-                f"${float(amount):,.2f} against ${self.cash:,.2f} of cash is nothing to buy",
+                f"${float(amount):,.2f} against ${self.cash:,.2f} of cash is nothing to "
+                f"{'buy' if wanted == 'long' else 'short'}",
             )
             return False
         order = _Order(
-            side="buy",
+            side=side,
             due=self.index + max(int(self.latency_bars), 0),
             usd=budget,
             stop_pct=max(float(stop_pct), 0.0),
@@ -380,25 +411,28 @@ class SimulatedProvider:
         *,
         reason: str = "verdict",
     ) -> bool:
-        """Sell ``amount`` **units** of the instrument; ``True`` when the order was taken.
+        """Close ``amount`` **units** of the position; ``True`` when the order was taken.
 
         Units and not dollars, because that is what the live provider's ``withdraw`` takes
         out of a vault: the engine sells *the position it holds*, and a sell sized in
         dollars would leave a residue that is an artefact of the price rather than a
-        decision.
+        decision. ``amount`` is a magnitude, so the same call closes a long (a sell) and a
+        short (a cover) — the caller says how much of the position to be done with, and the
+        venue is the one that knows which side it is holding.
         """
+        side = "sell" if self.long else "cover"
         if not self.holding:
             self._refuse("sell", float(amount), "there is no position to close")
             return False
         if self.busy:
-            self._refuse("sell", float(amount), "an order is already waiting for its bar")
+            self._refuse(side, float(amount), "an order is already waiting for its bar")
             return False
-        units = min(float(amount), self.units)
+        units = min(abs(float(amount)), abs(float(self.units)))
         if units <= 0.0:
-            self._refuse("sell", float(amount), "nothing to sell")
+            self._refuse(side, float(amount), "nothing to sell")
             return False
         order = _Order(
-            side="sell",
+            side=side,
             due=self.index + max(int(self.latency_bars), 0),
             units=units,
             reason=str(reason),
@@ -518,7 +552,9 @@ class SimulatedProvider:
         due = [order for order in self.orders if order.due <= self.index]
         for order in due:
             self.orders.remove(order)
-            if order.side == "sell" and not self.holding:
+            if order.side == "sell" and not self.long:
+                continue
+            if order.side == "cover" and not self.short:
                 continue
             self._execute(order)
 
@@ -530,6 +566,13 @@ class SimulatedProvider:
         opening = float(bar.open) if bar.open > 0.0 else float(bar.close)
         if order.side == "buy":
             self._buy(order.usd, opening * (1.0 + float(self.slippage)), order)
+        elif order.side == "short":
+            # Borrowed units are sold at the bid, *below* the mid: the entry pays the same
+            # slippage a long pays, in the direction the position is pointing.
+            self._open_short(order.usd, opening * (1.0 - float(self.slippage)), order)
+        elif order.side == "cover":
+            # And they are bought back at the ask, *above* the mid, again against the position.
+            self._cover(order.units, opening * (1.0 + float(self.slippage)), order)
         else:
             self._sell(order.units, opening * (1.0 - float(self.slippage)), order)
 
@@ -585,16 +628,7 @@ class SimulatedProvider:
         self.cash = float(self.cash) + gross - charged
         self.units = float(self.units) - held
         if self.units <= 1.0e-12:
-            self.units = 0.0
-            self.entry_price = 0.0
-            self.entry_bar = -1
-            self.stop_price = 0.0
-            self.take_profit_price = 0.0
-            self.trail_pct = 0.0
-            self.peak_price = 0.0
-            self.max_bars = 0
-            self.last_mfe = float(self.mfe)
-            self.last_mae = float(self.mae)
+            self._flat()
         self.fills.append(
             Fill(
                 bar=int(self.index),
@@ -608,6 +642,106 @@ class SimulatedProvider:
             )
         )
 
+    def _open_short(self, usd: float, price: float, order: _Order) -> None:
+        """Sell borrowed units: the position goes negative and the proceeds sit in cash.
+
+        The arithmetic is the long's, turned around. A long spends ``budget`` and receives
+        ``(budget - fee) / price`` units; a short borrows ``budget / price`` units, sells them
+        for ``budget``, pays the fee out of the proceeds and owes the units back — so equity at
+        the fill is ``cash - fee``, exactly what a long pays to open. The stop is placed
+        *above* the fill and the target *below* it: the two prices have swapped sides, and the
+        rest of this file reads them by position rather than by direction.
+        """
+        budget = self._budget(usd)
+        if budget <= 0.0 or price <= 0.0:
+            self._refuse("short", usd, "the account had nothing left to short when it opened")
+            return
+        charged = budget * float(self.fee)
+        units = budget / float(price)
+        if units <= 0.0:
+            self._refuse("short", usd, "the fee consumed the whole order at this price")
+            return
+        self.cash = float(self.cash) + budget - charged
+        self.units = -float(units)
+        self.entry_price = float(price)
+        self.entry_bar = int(self.index)
+        self.stop_price = (
+            float(price) * (1.0 + float(order.stop_pct)) if float(order.stop_pct) > 0.0 else 0.0
+        )
+        self.take_profit_price = (
+            float(price) * (1.0 - float(order.take_profit_pct))
+            if float(order.take_profit_pct) > 0.0
+            else 0.0
+        )
+        self.trail_pct = max(float(order.trail_pct), 0.0)
+        # The extreme the trail follows: the highest high for a long, the lowest low for a
+        # short. One field, because a ratchet only ever needs the worst price already seen.
+        self.peak_price = float(price)
+        self.max_bars = max(int(order.max_bars), 0)
+        self.mfe = 0.0
+        self.mae = 0.0
+        self.fills.append(
+            Fill(
+                bar=int(self.index),
+                at=self.at,
+                side="short",
+                price=float(price),
+                units=float(units),
+                # The proceeds, net of the fee — what the entry put in the account, and the
+                # number a trade's profit is measured against.
+                usd=float(budget - charged),
+                fee=float(charged),
+                reason=order.reason,
+            )
+        )
+
+    def _cover(self, units: float, price: float, order: _Order) -> None:
+        """Buy the borrowed units back, paying the ask and the fee out of the collateral."""
+        held = min(abs(float(units)), abs(float(self.units)))
+        if held <= 0.0 or price <= 0.0:
+            self._refuse(
+                "cover", float(units), "there was no short left to cover when the bar opened"
+            )
+            return
+        gross = held * float(price)
+        charged = gross * float(self.fee)
+        self.cash = float(self.cash) - gross - charged
+        self.units = float(self.units) + held
+        if abs(float(self.units)) <= 1.0e-12:
+            self._flat()
+        self.fills.append(
+            Fill(
+                bar=int(self.index),
+                at=self.at,
+                side="cover",
+                price=float(price),
+                units=float(held),
+                # What the cover cost, fee included: a short's profit is the entry's proceeds
+                # minus this number, with no sign to remember.
+                usd=float(gross + charged),
+                fee=float(charged),
+                reason=order.reason,
+            )
+        )
+
+    def _flat(self) -> None:
+        """The ledger with no position in it: every field a position owns forgets it.
+
+        One place, called by both sides, so that a long and a short cannot leave a different
+        residue behind — a stop price outliving the position is the kind of ghost that would
+        fire on the next one.
+        """
+        self.units = 0.0
+        self.entry_price = 0.0
+        self.entry_bar = -1
+        self.stop_price = 0.0
+        self.take_profit_price = 0.0
+        self.trail_pct = 0.0
+        self.peak_price = 0.0
+        self.max_bars = 0
+        self.last_mfe = float(self.mfe)
+        self.last_mae = float(self.mae)
+
     def _stop(self) -> None:
         """The resting stop, executed inside the bar that crosses it.
 
@@ -615,14 +749,30 @@ class SimulatedProvider:
         the price the bar actually opened at. When the bar opened *below* the stop the order
         fills at the open — the gap is real, and a backtest that filled it at the stop would
         be inventing the difference — and otherwise it fills at the stop itself.
+
+        A short's stop sits *above* the fill, so the same rule runs with the comparison turned
+        around: a bar that gapped up through it fills at its open, which is worse than the
+        stop, and the money the gap took is in the ledger rather than in a footnote.
         """
         if not self.holding or self.stop_price <= 0.0:
             return
         bar = self.bar
-        if bar is None or float(bar.low) > float(self.stop_price):
+        if bar is None:
             return
         crossing = float(self.stop_price)
         opening = float(bar.open) if bar.open > 0.0 else crossing
+        if self.short:
+            if float(bar.high) < crossing:
+                return
+            price = opening if opening > crossing else crossing
+            self._cover(
+                float(self.units),
+                price * (1.0 + float(self.slippage)),
+                _Order(side="cover", due=int(self.index), reason="stop"),
+            )
+            return
+        if float(bar.low) > crossing:
+            return
         price = opening if opening < crossing else crossing
         self._sell(
             float(self.units),
@@ -635,15 +785,28 @@ class SimulatedProvider:
 
         A bar that gapped *above* the target fills at the open, not at the target: the gap is
         real money and a backtest that kept it would be inventing profit. A bar that merely
-        traded through the target fills at the target.
+        traded through the target fills at the target. For a short the target is a floor, and
+        the same sentence holds with the sign of the move turned around.
         """
         if not self.holding or self.take_profit_price <= 0.0:
             return
         bar = self.bar
-        if bar is None or float(bar.high) < float(self.take_profit_price):
+        if bar is None:
             return
         target = float(self.take_profit_price)
         opening = float(bar.open) if bar.open > 0.0 else target
+        if self.short:
+            if float(bar.low) > target:
+                return
+            price = opening if opening < target else target
+            self._cover(
+                float(self.units),
+                price * (1.0 + float(self.slippage)),
+                _Order(side="cover", due=int(self.index), reason="target"),
+            )
+            return
+        if float(bar.high) < target:
+            return
         price = opening if opening > target else target
         self._sell(
             float(self.units),
@@ -652,16 +815,29 @@ class SimulatedProvider:
         )
 
     def _trail(self) -> None:
-        """Ratchet the stop up behind a rising high, and never down.
+        """Ratchet the stop behind the move, and never back.
 
         The trail is a *fraction of the fill* rather than a fraction of the ATR, because the
         venue does not know what an ATR is: the engine that wanted an ATR trail multiplies
         before it hands the number over, which keeps this file free of market statistics.
+
+        The extreme it follows is the highest high for a long and the lowest low for a short —
+        :attr:`peak_price` is whichever of the two the position is watching — and the stop only
+        ever moves in the direction that protects what is already on the table.
         """
         if not self.holding or self.trail_pct <= 0.0:
             return
         bar = self.bar
         if bar is None:
+            return
+        if self.short:
+            low = float(bar.low)
+            if low < float(self.peak_price):
+                self.peak_price = low
+            candidate = float(self.peak_price) * (1.0 + float(self.trail_pct))
+            current = float(self.stop_price)
+            if (current <= 0.0 or candidate < current) and candidate > float(bar.close):
+                self.stop_price = candidate
             return
         high = float(bar.high)
         if high > float(self.peak_price):
@@ -690,7 +866,7 @@ class SimulatedProvider:
             return
         self.orders.append(
             _Order(
-                side="sell",
+                side="cover" if self.short else "sell",
                 due=int(self.index) + max(int(self.latency_bars), 1),
                 units=float(self.units),
                 reason="time",
@@ -711,5 +887,11 @@ class SimulatedProvider:
         if bar is None:
             return
         entry = float(self.entry_price)
+        if self.short:
+            # The best a short saw is the low, the worst is the high, and both are measured
+            # against the fill — the same denominator a long's excursions are measured in.
+            self.mfe = max(float(self.mfe), 1.0 - float(bar.low) / entry)
+            self.mae = min(float(self.mae), 1.0 - float(bar.high) / entry)
+            return
         self.mfe = max(float(self.mfe), float(bar.high) / entry - 1.0)
         self.mae = min(float(self.mae), float(bar.low) / entry - 1.0)
