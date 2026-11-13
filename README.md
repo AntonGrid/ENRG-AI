@@ -1115,6 +1115,8 @@ fall on rising volume.
 | `reporter.py` | the readings: ROI, max drawdown, win rate, trades, mean hold, exposure, fees — and **buy & hold**, the benchmark that keeps an honest backtest honest |
 | `run.py`, `__main__.py` | one pair, one command, one report |
 | `sweep.py` | many pairs, one table: the venue's top pairs by turnover, a row per pair (with ROI, buy & hold and the difference), and `sweep.csv` |
+| `panel.py` | many pairs on **one calendar**: a union of timestamps with holes left visible, no forward fill, one bar width or a refusal that names both |
+| `crosssection.py` | the market-neutral basket: rank, long the top, short the bottom, fill at the open, mark at the close, read against a gate and a resolution |
 
 ### The fills are assumptions, and each one is a field
 
@@ -1340,7 +1342,7 @@ sha256sum /tmp/enrg-replay/walkforward.csv
 ```
 
 
-Tests: `tests/test_backtest_*.py` — 276 of them, and **not one opens a socket**: the transport
+Tests: `tests/test_backtest_*.py` — 328 of them, and **not one opens a socket**: the transport
 is a parameter, the venue is a list of hand-written bars, the chart is a CSV in `tmp_path`, and
 the sweep's universe is a dictionary. What they pin: the newest-first answer reversed once,
 quote-versus-base volume, every failure as a sentence, the decline mapping (a bar that rose
@@ -1429,6 +1431,161 @@ on hand-built charts (a pump chart the short book trades and the long book refus
 replay's byte-identical hash, and by 27 tests across both books and both ledgers.
 
 
+### A cross-section: a book that earns on a Tuesday
+
+Everything above buys one name at a time and waits for a shape — a capitulation with the depth
+drained out of it — so its unit of account is a *trade*, and a trade is rare: two a year on the
+four-hour pair, eight over three folds on the daily one. The complaint that produced this
+section is the obvious one: **an agent that earns on the eight days a panic happened does not
+earn.** The other question is not "would this have paid" but *"which of these hundred coins is
+the one to be long today"*, and that is a comparison, so it needs a different data structure
+before it needs a different signal.
+
+`panel.py` is that structure: one calendar, many columns. `ats` is the sorted union of every
+bar time in the panel and is the clock the whole book is read on; `bars[symbol][at]` is the bar
+itself, so the caller who needs the *open* (the fill) and the caller who needs the *close* (the
+mark) read the same object. It is strict about three things that decide whether a
+cross-sectional backtest measures a market or an artefact:
+
+* **a missing bar is a hole and never a fill.** A name that was not listed yet, died, or
+  simply has no bar at a timestamp did not trade at that timestamp, and carrying its last close
+  forward would invent a price it never had. `Panel.ret` refuses a window that is not
+  contiguous — the honest answers are "not a candidate today" and "you cannot hold what the
+  venue stopped quoting", and both are true statements rather than a filled-in `nan`;
+* **survivorship is in the holes.** A universe assembled today is the set of pairs that
+  *survived* to today, and nothing in a candle file can undo that. So the panel keeps the hole
+  visible (`missing()`, and a `holes` count in every report) instead of letting a delisting
+  look like a long-running position marked to a stale price;
+* **one interval, or it is not one market.** Two bar widths in one panel would compare a
+  four-hour move with a daily one, and the refusal names both. The width comes from what the
+  caller declared; a frozen directory measures its own finest gap, because a hole can only
+  *widen* a gap and so the finest gap in a correctly sampled record *is* the bar.
+
+`crosssection.py` is the book on top of it: rank every name by its own `lookback`-bar return,
+long the top `legs`, short the bottom `legs`, equal weight, both sides sized off the same
+equity. The order of operations inside one bar is the contract, and each step is a way a
+backtest can make money that nobody could make in a market:
+
+1. **close what the venue stopped quoting** — before the decision, at the name's last
+   published close, and with the fee paid, because a position in something the venue stopped
+   quoting is not a position;
+2. **decide** from closes up to `i - latency`, never from the fill bar's own close;
+3. **fill** at the fill bar's *open*, with slippage against the book and the fee on the
+   notional, and never at a price from another day;
+4. **mark** at the fill bar's *close*.
+
+Steps 3 and 4 in that order are what make a bar's P&L a real holding period instead of the same
+close counted twice: a book bought at the open earns the open-to-close move and pays for the
+turn; a book bought at the close earns neither. `latency_bars` cannot be zero — a book that
+fills on the bar it decided with is filling before it decided.
+
+```bash
+# a frozen universe: one <pair>.csv per symbol, read back as one calendar
+python -m agent.backtest.crosssection --candles /tmp/panel-plant-100 --out data/crosssection
+# the same book on the venue's own top hundred (needs a networked host: see below)
+python -m agent.backtest.crosssection --top 100 --period 1day --days 730 --out data/crosssection
+# freeze a venue panel first, then replay it byte for byte
+python -m agent.backtest.crosssection --top 100 --period 1day --freeze data/panel/1day --out /tmp/x
+```
+
+The same run inside the deployment image. Nothing extra has to ship: `COPY agent/` carries both
+modules, so a rebuild is the whole deployment, and a container built off this commit prints the
+identical table to the host's — verified, uid 10001, writing through the `./data` volume:
+
+```bash
+docker compose build trader
+docker compose run --rm trader python -m agent.backtest.crosssection \
+    --top 100 --period 1day --days 730 --out /data/crosssection --freeze /data/panel/1day
+# replay exactly what that run read, offline and byte for byte:
+docker compose run --rm trader python -m agent.backtest.crosssection \
+    --candles /data/panel/1day --out /data/crosssection-replay
+```
+
+The declared grid is sixteen configs — four lookbacks, two rebalances, two signs — and every
+one of them is printed. Nothing is selected, because the point of a declared grid is that the
+*reader* can count how many rows look like edges instead of being shown the one that does. The
+table, the JSON and a hashed `criteria.json` land in `--out`; the run's own warnings (a hole
+closed, a ranked name with no bar to fill in, the book standing aside for want of names) print
+under it.
+
+And the resolution rule sits beside every daily mean, because a mean is only as wide as its
+sample allows: a reading whose measured `bps/day` is inside its own `min_edge_bps` band is
+**unresolvable**, whatever the gate's floor says. That is not pedantry — it is the difference
+between "this edge is small" and "this sample cannot tell", and the two want opposite next
+steps.
+
+Here is the whole grid on two frozen 100-name, 730-bar panels built for the purpose: one with
+nothing in it (`null` — an ordinary random walk per name), and one with a planted reversal
+(each new bar fades half of the last two bars' move). Same code, same gate, same command; only
+the data differs:
+
+```
+── crosssection · 100 symbols · 1day · 730 bars · 100.0% filled · 10 a side · gross 1.00 · $1,000.00
+   gate: 5 bps/day · t 2.0 · sharpe 1.0 · dd <= 20% · |beta| <= 0.20 · split 60%/40%
+
+         config  days    bps       t  sharpe     dd  hit   beta    fees$    turn  names  res  in bps  out bps   out t  verdict
+---------------  ----  -----  ------  ------  -----  ---  -----  -------  ------  -----  ---  ------  -------  ------  -------
+ reversal-l3-r1   725   -0.8   -0.47   -0.34  12.2%  49%  +0.03   833.72  875.80     20    5    +0.3     -2.6   -1.05     fail
+ reversal-l3-r7   725  +13.7   +7.75    5.50   2.5%  60%  +0.01   314.32  190.48     20    6   +11.8    +16.4   +5.94     pass
+ reversal-l7-r1   721  +24.5  +13.91    9.90   2.1%  71%  +0.07  1813.80  634.10     20    6   +25.4    +22.9   +7.60     pass
+ reversal-l7-r7   721  +14.6   +8.18    5.82   2.3%  60%  +0.04   348.94  195.62     20    6   +14.3    +14.8   +5.39     pass
+reversal-l14-r1   714  +10.8   +6.27    4.48   3.6%  61%  +0.03   703.89  484.89     20    6    +9.5    +12.6   +4.58     pass
+reversal-l14-r7   714   +8.8   +5.14    3.68   3.4%  58%  -0.03   200.57  149.86     20    6    +7.1    +11.0   +3.90     pass
+reversal-l30-r1   698   +8.9   +5.15    3.73   3.8%  57%  -0.04   488.63  356.43     20    6    +8.4     +9.9   +3.65     pass
+reversal-l30-r7   698   +4.8   +2.76    2.00   5.4%  54%  +0.02   126.21  109.17     20    6    +3.8     +6.2   +2.28     fail
+ momentum-l3-r1   725  -47.2  -28.63  -20.32  96.8%  14%  -0.02   255.32  875.10     20    5   -48.4    -45.1  -17.76     fail
+ momentum-l7-r1   721  -59.4  -34.43  -24.51  98.7%  10%  -0.07   143.08  660.20     20    6   -60.9    -57.2  -19.46     fail
+ momentum-l7-r7   721  -25.7  -13.05   -9.29  84.5%  33%  -0.11    88.61  199.67     20    6   -25.2    -26.3   -8.86     fail
+momentum-l30-r7   698  -11.0   -6.12   -4.42  54.5%  40%  -0.02    79.36  110.94     20    6   -10.0    -12.5   -4.45     fail
+   6 of 16 declared configs clear the gate and hold their sign out of sample (reversal-l3-r7,
+   reversal-l7-r1, reversal-l7-r7, reversal-l14-r1, +2 more). With 16 tries, some pass is
+   expected by chance alone: the survivors are a hypothesis to take to a fresh panel, not a
+   book to fund.
+```
+
+On the `null` panel the same command prints **0 of 16**: every config is negative, from -1.3 to
+-23.6 bps a day, which is what a book with no signal and 20 bps a day of turnover should lose.
+That the two panels separate at all is the *only* thing these numbers establish, because both
+are synthetic — the venue is not reachable from the machine this was built on, so the real
+`--top 100` run is the next experiment and is not in this commit. What the run does establish is
+that the machinery separates a signal from a null on data where the answer is known, at the
+declared costs, with no look-ahead — which is the point of a frozen panel.
+
+Three rows are worth reading twice. `reversal-l30-r7` has a positive mean of +4.8 bps and still
+says **fail**: its own resolution is 6 bps, so the mean is inside the band — *unmeasured*, not
+*small*. The daily rows carry three to six times the turnover of the weekly ones (876 against
+190 on the same lookback) and on the reversal panel the fast book earns *more* (+24.5 against
++14.6), which is exactly what a one-bar effect should look like — while on the `null` panel the
+same daily rows lose three to five times as much (-23.6 against -5.3). Turnover is what speed
+costs, and the grid prints both sides of that trade rather than assuming one; the sign of the
+answer is what decides whether the speed was worth buying. And the momentum rows are the
+planted effect read backwards — -47 to -59 bps a day with a 97 % drawdown — which is the check
+that the two signs are one axis and not two stories.
+
+The criteria file is written before the table is read and hashed with the gate, the acceptance
+list and the limits, so a passing run cannot quietly drop the sentence that says what it did not
+prove. The limits, in full: that a cross-section of *today's* listed pairs is the cross-section
+of the past (the universe is survivorship-biased by construction, and the holes are visible but
+not fixed); anything about borrowing the shorts (spot shorting needs a lender, and no funding,
+borrow or liquidation term is charged here); anything about impact beyond a constant slippage per
+fill (a hundred-name book selling a thin alt is a market event the venue prices differently from
+a percentage); anything about live slippage on rebalance day (every name is assumed fillable at
+the bar's own open, which is exactly what a crowded rebalance is not); that the grid was not
+chosen after the fact (every declared config is printed, and the multiple-comparison problem is
+shown rather than corrected); and profit on a real account.
+
+The properties that *are* structural — if any of them breaks, the book is not the book this
+section describes — are pinned by `tests/test_backtest_crosssection.py`: a flat market and a
+market-wide +10 % gap both leave equity where it was, with `long == short` at every mark, so
+"neutral" is arithmetic and not vocabulary; a panel truncated one bar earlier produces
+byte-identical marks up to the cut, so no future bar reached the past; a name the venue stops
+quoting is closed at its last close and pays the fee to leave; and costs are exactly the declared
+rate on the notional that changed hands, that exit included. `tests/test_backtest_panel.py` pins
+the calendar itself: a union of timestamps with holes rather than fills, a window that spans a
+hole is not a return over that window, a symbol listed last week has no fourteen-bar history, and
+two bar widths are refused with a sentence that names both. 52 tests, no network, no venue.
+
+
 ## Energy generation forecasting
 
 Live forecast from the real oracle proof stream (Wh per bucket, Holt linear
@@ -1475,7 +1632,7 @@ python -m agent.main
 pytest
 ```
 
-1135 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
+1187 tests, no network, no key, no chain. Three dependencies are *workspace* ones,
 and are named rather than hidden: the Anvil tests skip when foundry is absent, the
 tests for the sibling `axis_core` package skip when that package is not installed,
 and the `entrain_infer` core plus the scikit-learn datasets are needed by the
@@ -1484,7 +1641,7 @@ name, which is why the full run is a *workspace* command, not a pip-install one.
 Nothing on the deployment path needs any of the three: the trading cycle's own 85
 (`tests/test_trade_loop.py`) and the provider's 109 run anywhere Python does — one of
 those asks for foundry and one for `web3`, and each skips itself by name rather than
-passing quietly. The backtest's 276 (`tests/test_backtest_*.py`) are in the same
+passing quietly. The backtest's 328 (`tests/test_backtest_*.py`) are in the same
 category and even further from a network: the transport is a parameter, so a test hands
 the loader a dictionary and a run hands it a CSV.
 
