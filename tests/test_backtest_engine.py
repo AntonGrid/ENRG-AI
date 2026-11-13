@@ -553,6 +553,7 @@ def test_the_package_cannot_reach_a_chain_a_key_or_the_live_state():
         "__main__.py",
         "admission.py",
         "carry.py",
+        "carry_engine.py",
         "criteria.py",
         "crosssection.py",
         "data.py",
