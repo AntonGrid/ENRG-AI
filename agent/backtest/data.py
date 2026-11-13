@@ -811,7 +811,8 @@ def _http_get(url: str, timeout: float = DEFAULT_TIMEOUT) -> Any:
     except OSError as exc:
         raise HtxError(
             f"the HTX endpoint did not answer ({exc}); the backtest needs a price history "
-            "and will not invent one — pass --csv to run from a file instead"
+            "and will not invent one — run from a frozen file instead (--csv for one pair, "
+            "--candles for a panel)"
         ) from exc
     try:
         return json.loads(raw.decode("utf-8"))
