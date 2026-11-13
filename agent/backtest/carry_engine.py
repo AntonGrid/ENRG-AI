@@ -602,6 +602,34 @@ def simulate(
 
 
 
+def _waterline(start: float, deltas: Sequence[float]) -> Tuple[float, int, int]:
+    """The deepest fall below a running peak, and the stretch that produced it.
+
+    ``start`` is the level before the first step and the returned indices count *steps*, so
+    ``deltas[peak:trough]`` is exactly the stretch in which the curve gave the money back. A
+    peak with no fall after it is not a drawdown: the pair returns zero depth and an empty cut.
+
+    Returned as a triple rather than a number because a drawdown that names its own window is
+    the only kind that can be attributed: "the book lost 3 %" is a fact, "the book lost 3 %
+    between these two settlements and 2.9 points of it were funding" is a decision.
+    """
+    level = float(start)
+    peak_level = level
+    peak = 0
+    depth = 0.0
+    worst_peak = 0
+    worst_trough = 0
+    for index, delta in enumerate(deltas, start=1):
+        level += float(delta)
+        if level > peak_level:
+            peak_level = level
+            peak = index
+        if peak_level - level > depth:
+            depth = peak_level - level
+            worst_peak, worst_trough = peak, index
+    return depth, worst_peak, worst_trough
+
+
 def _mark_block(
     run: CarryRun,
     held: Sequence[Any],
@@ -615,6 +643,12 @@ def _mark_block(
     the reason the first covered period contributes no basis PnL — it is the reference. The
     carry-forward is bounded by one funding period, so a bar from six years ago is not allowed
     to stand in for a settlement it never saw.
+
+    The drawdown is then split by leg. The depth is one number and the gate reads it, but the
+    *cause* is what a book is managed on: a fall carried by a negative rate says the trade is
+    still the trade and the venue is charging rent, while a fall carried by the spread says the
+    hedge is moving and no settlement will undo it. ``drawdown_driver`` names the larger of the
+    two inside the worst window, because a reader deciding to stay or leave needs the leg.
     """
     ordered = sorted((float(at), float(bps)) for at, bps in marks)
     times = [at for at, _ in ordered]
@@ -637,6 +671,11 @@ def _mark_block(
         "basis_drift_bps": None,
         "basis_pnl_usdt": None,
         "drawdown": None,
+        "funding_drawdown": None,
+        "basis_drawdown": None,
+        "drawdown_driver": None,
+        "drawdown_split": None,
+        "worst_window": None,
         "note": (
             "the price files share fewer than two funding periods with this history, so the "
             "basis is not reported at all rather than reported as flat"
@@ -645,20 +684,51 @@ def _mark_block(
     if len(covered) < 2:
         return block
     notional = float(run.settings.notional)
+    capital = float(run.settings.capital)
     drift = covered[-1][0] - covered[0][0]
-    equity = float(run.settings.capital) - float(run.entry_cost_usdt)
-    peak = equity
-    drawdown = 0.0
+    start = capital - float(run.entry_cost_usdt)
+    # Each settlement is two numbers, not one: what the short was paid, and what the spread
+    # moved. A single total can say the book fell; only the pair can say whether the rate
+    # flipped or the hedge drifted, and those two answer differently — one is a reason to wait
+    # for the next settlement, the other a reason to close before it.
+    steps: List[Tuple[float, float]] = []
     for index in range(1, len(covered)):
-        equity -= notional * (covered[index][0] - covered[index - 1][0]) / 1e4
         rate = covered[index][1]
-        if rate is not None:
-            equity += notional * rate
-        peak = max(peak, equity)
-        drawdown = max(drawdown, peak - equity)
+        paid = notional * float(rate) if rate is not None else 0.0
+        moved = -notional * (covered[index][0] - covered[index - 1][0]) / 1e4
+        steps.append((paid, moved))
+    depth, peak_at, trough_at = _waterline(start, [paid + moved for paid, moved in steps])
+    funding_depth, _, _ = _waterline(start, [paid for paid, _ in steps])
+    basis_depth, _, _ = _waterline(0.0, [moved for _, moved in steps])
+    window = steps[peak_at:trough_at]
+    funding_drop = -sum(min(0.0, paid) for paid, _ in window)
+    basis_drop = -sum(min(0.0, moved) for _, moved in window)
+    flips = sum(
+        1
+        for index in range(peak_at + 1, trough_at + 1)
+        if covered[index][1] is not None and float(covered[index][1]) < 0.0
+    )
     block["basis_drift_bps"] = drift
     block["basis_pnl_usdt"] = -notional * drift / 1e4
-    block["drawdown"] = drawdown / float(run.settings.capital)
+    block["drawdown"] = depth / capital
+    block["funding_drawdown"] = funding_depth / capital
+    block["basis_drawdown"] = basis_depth / capital
+    block["worst_window"] = {
+        "from": covered[peak_at][0],
+        "to": covered[trough_at][0],
+        "funding_negative_periods": flips,
+    }
+    total_drop = funding_drop + basis_drop
+    if depth > 0.0 and total_drop > 0.0:
+        share = funding_drop / total_drop
+        block["drawdown_split"] = {
+            "funding_usdt": funding_drop,
+            "basis_usdt": basis_drop,
+            "funding_share": share,
+        }
+        block["drawdown_driver"] = (
+            "funding" if share >= 0.7 else "basis" if share <= 0.3 else "mixed"
+        )
     block["note"] = (
         "the marks cover one page of price bars, which is shorter than the funding history: "
         "the drift, the PnL and the drawdown in this block are on a different clock and are "
@@ -886,6 +956,17 @@ def format_summary(run: CarryRun) -> str:
             f"   basis marks: {int(run.marks.get('marked_periods') or 0)} period(s), "
             f"{_pct(run.marks.get('covered_share'))} of the window, drift {drift_text}"
         )
+        driver = run.marks.get("drawdown_driver")
+        if driver:
+            split = run.marks.get("drawdown_split") or {}
+            window = run.marks.get("worst_window") or {}
+            lines.append(
+                f"   marked drawdown {_pct(run.marks.get('drawdown'))} of capital, "
+                f"{driver}-driven: funding {_pct(run.marks.get('funding_drawdown'))} on its own, "
+                f"basis {_pct(run.marks.get('basis_drawdown'))} on its own, "
+                f"{float(split.get('funding_share') or 0.0) * 100.0:.1f} % of the fall from the "
+                f"rate in {int(window.get('funding_negative_periods') or 0)} negative period(s)"
+            )
     for note in run.warnings:
         lines.append(f"   note: {note}")
     return "\n".join(lines)

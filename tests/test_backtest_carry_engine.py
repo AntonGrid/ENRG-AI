@@ -37,6 +37,20 @@ def flat_year(rate=0.0001, days=365):
     return series_of([rate] * (int(days * 3) + 1))
 
 
+def marks_flat(series, bps=5.0):
+    """A mark on every settlement at one spread: the hedge never drifts."""
+    return [(record.at, float(bps)) for record in series.records]
+
+
+def marks_ramp(series, *, step_bps=5.0, from_index=0, periods=None):
+    """A spread that widens by ``step_bps`` a settlement from ``from_index`` on."""
+    marks = [(record.at, 5.0) for record in series.records]
+    end = len(series.records) if periods is None else from_index + int(periods)
+    for index in range(from_index, min(end, len(series.records))):
+        marks[index] = (marks[index][0], 5.0 + step_bps * (index - from_index + 1))
+    return marks
+
+
 def test_a_flat_rate_pays_the_notional_and_the_apy_divides_by_capital():
     run = E.simulate(flat_year(0.0001), settings=E.Settings(), turnover=1e9)
     book = run.settings
@@ -323,3 +337,59 @@ def test_a_gate_without_a_line_is_refused_rather_than_defaulted():
     assert "max_drawdown" in str(caught.value)
     assert "never declared" in str(caught.value)
 
+
+
+
+def test_a_drawdown_from_the_rate_flipping_is_named_funding():
+    """Three negative settlements and a flat spread: the fall is the venue charging rent."""
+    rates = [0.0001] * 400 + [-0.005] * 3 + [0.0001] * 10
+    series = series_of(rates)
+    run = E.simulate(series, marks=marks_flat(series))
+    marks = run.marks
+    book = run.settings
+    funding_fall = 3 * 0.005 * book.notional / book.capital
+    assert marks["drawdown"] == pytest.approx(funding_fall)
+    assert marks["funding_drawdown"] == pytest.approx(funding_fall)
+    assert marks["basis_drawdown"] == pytest.approx(0.0)
+    assert marks["drawdown_driver"] == "funding"
+    assert marks["drawdown_split"]["funding_share"] == pytest.approx(1.0)
+    assert marks["worst_window"]["funding_negative_periods"] == 3
+    assert "funding-driven" in E.format_summary(run)
+
+
+def test_a_drawdown_from_the_spread_moving_is_named_basis():
+    """A positive rate every period and a widening spread: no settlement undoes this one."""
+    series = flat_year(0.0001)
+    run = E.simulate(series, marks=marks_ramp(series, step_bps=5.0))
+    marks = run.marks
+    book = run.settings
+    assert marks["funding_drawdown"] == pytest.approx(0.0), "a flat positive rate only pays"
+    assert marks["basis_drawdown"] > 0.0
+    assert marks["drawdown_driver"] == "basis"
+    assert marks["drawdown_split"]["funding_share"] == pytest.approx(0.0)
+    assert marks["worst_window"]["funding_negative_periods"] == 0
+
+
+def test_two_legs_carrying_a_fall_together_are_called_mixed():
+    rates = [0.0001] * 400 + [-0.005] * 3 + [0.0001] * 10
+    series = series_of(rates)
+    marks = [(record.at, 5.0) for record in series.records]
+    for offset in range(4):
+        index = 401 + offset
+        marks[index] = (marks[index][0], 5.0 + 30.0 * (offset + 1))
+    run = E.simulate(series, marks=marks)
+    split = run.marks["drawdown_split"]
+    assert 0.3 < split["funding_share"] < 0.7
+    assert run.marks["drawdown_driver"] == "mixed"
+
+
+def test_a_curve_that_never_falls_has_no_driver_to_name():
+    series = flat_year(0.0005)
+    run = E.simulate(series, marks=marks_flat(series))
+    marks = run.marks
+    assert marks["drawdown"] == pytest.approx(0.0)
+    assert marks["drawdown_driver"] is None
+    assert marks["drawdown_split"] is None
+    assert marks["funding_drawdown"] == pytest.approx(0.0)
+    assert marks["basis_drawdown"] == pytest.approx(0.0)
+    assert "marked drawdown" not in E.format_summary(run)
