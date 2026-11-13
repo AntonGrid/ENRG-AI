@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import random
 
 import pytest
@@ -30,11 +31,13 @@ import pytest
 from agent.backtest.criteria import verify
 from agent.backtest.crosssection import (
     HEADER,
+    MAKER_FEE,
     BasketReading,
     BasketResult,
     BasketSettings,
     Mark,
     Window,
+    _per_day_bps,
     _target_weights,
     book,
     configs,
@@ -71,8 +74,29 @@ def chart(name, closes, *, start=0.0, step=DAY):
     return CandleSeries(symbol=name, period="1day", rows=rows)
 
 
-def panel_of(paths, *, period="1day") -> Panel:
-    return build_panel([chart(name, values) for name, values in paths.items()], period=period)
+def bars(name, rows):
+    """Explicit OHLC rows — the maker tests need a bar that does not touch its own open."""
+    return CandleSeries(
+        symbol=name,
+        period="1day",
+        rows=[
+            Candle(
+                at=index * DAY,
+                open=float(opening),
+                high=float(high),
+                low=float(low),
+                close=float(close),
+                volume=1000.0,
+            )
+            for index, (opening, high, low, close) in enumerate(rows)
+        ],
+    )
+
+
+def panel_of(paths, *, period="1day", step=DAY) -> Panel:
+    return build_panel(
+        [chart(name, values, step=step) for name, values in paths.items()], period=period
+    )
 
 
 def flat(symbols, bars, price=100.0):
@@ -345,9 +369,9 @@ def test_the_config_name_is_the_hypothesis_in_one_word():
 
 
 
-def crafted(equities):
+def crafted(equities, *, step=DAY, period="1day"):
     """A finished run with a hand-written equity curve — a reading test needs exact returns."""
-    panel = panel_of(flat(["aaa", "bbb", "ccc", "ddd"], len(equities)))
+    panel = panel_of(flat(["aaa", "bbb", "ccc", "ddd"], len(equities)), period=period, step=step)
     marks = [
         Mark(
             at=float(panel.ats[index]),
@@ -362,6 +386,191 @@ def crafted(equities):
         for index, value in enumerate(equities)
     ]
     return BasketResult(settings=BasketSettings(), panel=panel, marks=marks)
+
+
+def test_a_maker_order_the_bar_never_reaches_is_not_filled_at_all():
+    """Posting is not taking with a smaller fee: an unreached limit is no position, no fee."""
+    panel = build_panel(
+        [
+            bars(
+                "aaa",
+                [(100, 100, 100, 100), (90, 90, 90, 90), (91, 92, 90.5, 92)],
+            ),
+            bars(
+                "bbb",
+                [(100, 100, 100, 100), (95, 95, 95, 95), (96, 97, 94, 96)],
+            ),
+            bars(
+                "ccc",
+                [(100, 100, 100, 100), (105, 105, 105, 105), (104, 105.5, 103, 105)],
+            ),
+            bars(
+                "ddd",
+                [(100, 100, 100, 100), (110, 110, 110, 110), (109, 109.5, 108, 109)],
+            ),
+        ],
+        period="1day",
+    )
+    settings = BasketSettings(
+        lookback=1,
+        legs=2,
+        min_names=4,
+        max_weight=0.5,
+        rebalance_bars=1,
+        fill="maker",
+        maker_fee=0.0002,
+    )
+
+    result = book(panel, settings)
+
+    # aaa fell hardest and is bought at its decision close of 90, but the bar's low is 90.5 —
+    # the bar never traded *through* the limit, so the order simply is not filled. ddd rose
+    # hardest and is sold at 110, but the bar's high is 109.5, and it is refused the same way.
+    assert result.unfilled == 2
+    assert result.fills == 2
+    assert result.marks[-1].names == 2
+    # bbb is filled at its own limit of 95 and ccc at 105 — not at the better of the limit and
+    # the open, because a resting order's price is its own: 250 of each side, 2 bps on 500.
+    assert result.traded == pytest.approx(500.0)
+    assert result.fees == pytest.approx(500.0 * 0.0002)
+    assert any("never traded through" in line for line in result.warnings)
+
+
+def test_the_taker_fills_the_same_panel_where_the_maker_was_refused():
+    panel = build_panel(
+        [
+            bars("aaa", [(100, 100, 100, 100), (90, 90, 90, 90), (91, 92, 90.5, 92)]),
+            bars("bbb", [(100, 100, 100, 100), (95, 95, 95, 95), (96, 97, 94, 96)]),
+            bars("ccc", [(100, 100, 100, 100), (105, 105, 105, 105), (104, 105.5, 103, 105)]),
+            bars("ddd", [(100, 100, 100, 100), (110, 110, 110, 110), (109, 109.5, 108, 109)]),
+        ],
+        period="1day",
+    )
+    base = dict(lookback=1, legs=2, min_names=4, max_weight=0.5, rebalance_bars=1)
+
+    taking = book(panel, BasketSettings(**base))
+    posting = book(panel, BasketSettings(fill="maker", **base))
+
+    assert taking.unfilled == 0 and taking.fills == 4
+    assert taking.marks[-1].names == 4
+    assert posting.marks[-1].names == 2
+    assert taking.fees > posting.fees
+
+
+def test_a_maker_fill_at_a_zero_rate_pays_nothing_and_still_moves_the_book():
+    """Slippage is the taker's cost: a passive fill at its own limit cannot pay a spread."""
+    panel = panel_of(walk(11, NAMES, 60))
+    base = dict(lookback=3, legs=3, min_names=4, max_weight=0.5, rebalance_bars=1)
+
+    free = book(panel, BasketSettings(fill="maker", maker_fee=0.0, **base))
+
+    assert free.traded > 0.0
+    assert free.fees == 0.0
+    assert free.marks[-1].names > 0
+
+
+def test_the_maker_book_pays_less_and_is_handed_the_trades_that_went_against_it():
+    """A limit at the price you saw is not a discount: it fills only when price goes through."""
+    panel = panel_of(walk(21, NAMES, 120, plant=0.6, look=3))
+    base = dict(lookback=3, legs=3, min_names=4, max_weight=0.5, rebalance_bars=1)
+
+    taking = book(panel, BasketSettings(**base))
+    posting = book(panel, BasketSettings(fill="maker", **base))
+
+    assert posting.fees < taking.fees
+    assert posting.unfilled > 0
+    # On these bars the limit is the previous close, so a buy is filled only on the bars that
+    # traded down through it: the book is handed the names that kept falling and refused the
+    # ones that bounced, and the bounce is the whole reversal it was trying to own. The cheaper
+    # fee is paid for in a book that ends up holding the wrong half of its own signal.
+    assert read(posting).mean_bps < read(taking).mean_bps
+    assert posting.fees == pytest.approx(posting.traded * MAKER_FEE)
+
+
+def test_the_settings_refuse_a_fill_mode_that_does_not_exist():
+    with pytest.raises(ValueError) as failed:
+        BasketSettings(fill="midpoint")
+    assert "fill 'midpoint'" in str(failed.value)
+
+    with pytest.raises(ValueError) as failed:
+        BasketSettings(fill="maker", maker_fee=0.5)
+    assert "maker_fee 0.5" in str(failed.value)
+
+
+def test_the_config_name_says_when_the_book_posts_instead_of_taking():
+    assert BasketSettings(lookback=14, rebalance_bars=1).config == "reversal-l14-r1"
+    assert (
+        BasketSettings(lookback=14, rebalance_bars=1, fill="maker").config
+        == "reversal-l14-r1-maker"
+    )
+
+
+def test_the_book_is_sized_off_the_equity_the_decision_could_see():
+    """The fill bar's close is the future: sizing an open order off it is a quiet look-ahead."""
+    panel = build_panel(
+        [
+            bars(
+                "aaa",
+                [(100, 100, 100, 100), (100, 100, 90, 90), (90, 90, 81, 81), (81, 81, 72.9, 72.9)],
+            ),
+            bars(
+                "bbb",
+                [(100, 100, 100, 100), (100, 100, 95, 95), (95, 95, 90.25, 90.25),
+                 (90.25, 90.25, 87.5425, 87.5425)],
+            ),
+            bars(
+                "ccc",
+                [(100, 100, 100, 100), (100, 105, 100, 105), (105, 110.25, 105, 110.25),
+                 (110.25, 119.07, 110.25, 119.07)],
+            ),
+            bars(
+                "ddd",
+                [(100, 100, 100, 100), (100, 110, 100, 110), (110, 121, 110, 121),
+                 (121, 145.2, 121, 145.2)],
+            ),
+        ],
+        period="1day",
+    )
+    settings = BasketSettings(
+        lookback=1,
+        legs=2,
+        min_names=4,
+        max_weight=0.5,
+        rebalance_bars=1,
+        fee=0.0,
+        slippage=0.0,
+    )
+
+    result = book(panel, settings)
+
+    # The first fill buys 250 of aaa at 90 and bbb at 95 and sells 250 of ccc at 105 and ddd at
+    # 110, so the bar it is marked on takes the book from 1000 to 925. The next decision is made
+    # on those 925 and the fourth bar's opens, so each name is re-targeted at 231.25 and the
+    # whole re-target trades 87.5 of notional. A book sized off the fourth bar's own closes
+    # (which mark it at 819.375) would instead trade 180.7 -- eighty of it on a bar it had
+    # already lost the money for.
+    assert result.marks[0].equity == pytest.approx(925.0)
+    assert result.marks[-1].traded == pytest.approx(87.5, abs=1e-6)
+    assert result.fees == 0.0
+
+
+def test_the_reading_says_how_much_an_overlapping_window_inflates_its_t():
+    panel = panel_of(walk(31, NAMES, 160))
+
+    reading = grid(panel, lookbacks=[14], rebalances=[1], signs=["reversal"])[0]
+
+    note = reading.warnings[-1]
+    assert "overlaps itself" in note
+    assert "t/sqrt(14)" in note
+    assert f"{reading.full.t_stat / math.sqrt(14.0):+.2f}" in note
+
+
+def test_a_one_bar_window_needs_no_overlap_adjustment_and_says_so():
+    panel = panel_of(walk(32, NAMES, 80))
+
+    reading = grid(panel, lookbacks=[1], rebalances=[1], signs=["reversal"])[0]
+
+    assert "no overlap adjustment applies" in reading.warnings[-1]
 
 
 def test_a_reading_is_the_book_s_own_returns_and_counts_the_fee_once():
@@ -422,6 +631,55 @@ def test_a_clear_mean_on_a_narrow_spread_is_measurable_and_passes():
     assert window.measurable is True
     assert window.passed is True, window.failures
     assert window.max_drawdown < 0.01
+
+
+def test_a_four_hour_mark_is_a_quarter_of_a_day_and_the_reading_says_so():
+    """Six marks a day: 5 bps a bar is +30 bps a day, and a table that called it 5 is a lie.
+
+    This is the reading that flatters a fast book the most. ``mean_bps`` is the number a person
+    compares with the floor, so on a 4-hour panel the per-bar mean understates the day by six
+    times — the exact failure mode of "our first PASS on 4-hour bars". ``days`` is calendar days
+    for the same reason: 1998 four-hour marks are 333 days, not 1998, and every count derived
+    from it (the resolution band, the "tail too short" rule) inherits the error.
+    """
+    equities = [1000.0]
+    for index in range(1, 601):
+        equities.append(equities[-1] * (1.0 + 0.0005))
+
+    window = read(crafted(equities, step=4 * 3600.0, period="4hour"))
+
+    assert window.days == 100
+    assert window.mean_bps == pytest.approx(1e4 * ((1.0005**6) - 1.0), rel=1e-6)
+    assert window.mean_bps == pytest.approx(30.04, abs=0.05)
+    assert window.sigma_bps == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_daily_conversion_compounds_instead_of_multiplying():
+    """``per_day`` bars of ``r`` is ``(1 + r) ** per_day - 1``; at six per cent they differ."""
+    assert _per_day_bps(0.01, 6.0) == pytest.approx(1e4 * (1.01**6 - 1.0))
+    assert _per_day_bps(0.01, 6.0) > 1e4 * 0.06
+    assert _per_day_bps(0.0005, 1.0) == pytest.approx(5.0)
+    assert _per_day_bps(-1.0, 6.0) == -1e4
+    assert _per_day_bps(float("nan"), 6.0) == 0.0
+
+
+def test_the_t_stat_and_the_reading_survive_a_change_of_bar_width():
+    """The same curve read on 4-hour marks has the same t and six times the daily mean."""
+    equities = [1000.0]
+    for index in range(1, 200):
+        noise = 0.004 if index % 2 else -0.0035
+        equities.append(equities[-1] * (1.0 + 0.0005 + noise))
+
+    daily = read(crafted(equities))
+    fast = read(crafted(equities, step=4 * 3600.0, period="4hour"))
+
+    assert fast.t_stat == pytest.approx(daily.t_stat)
+    assert fast.mean_bps == pytest.approx(
+        1e4 * ((1.0 + daily.mean_bps / 1e4) ** 6 - 1.0), rel=1e-9
+    )
+    assert fast.mean_bps > 6.0 * daily.mean_bps
+    assert fast.sigma_bps == pytest.approx(6.0**0.5 * daily.sigma_bps, rel=1e-6)
+    assert fast.days == 33 and daily.days == 199
 
 
 def test_the_benchmark_is_the_equal_weight_universe_and_a_book_that_holds_nothing_is_flat():
@@ -661,6 +919,10 @@ def test_the_cli_writes_the_table_the_json_and_the_criteria_and_replays_identica
     assert document["run"]["grid"]["rebalances"] == [7]
     assert document["run"]["panel"]["symbols"] == len(NAMES)
     assert document["run"]["panel"]["bars"] == 120
+    # The window the run was read on is in the artifact, not only in the log.
+    assert document["run"]["window"]["until_days"] == 0.0
+    assert document["run"]["window"]["skip"] == 0
+    assert document["run"]["window"]["note"] == ""
     # The printed table is the whole declared grid, verdict column included.
     printed = capsys.readouterr().out
     assert "verdict" in printed
@@ -733,4 +995,71 @@ def test_the_cli_reads_a_universe_from_the_symbols_flag(tmp_path, monkeypatch):
     # The universe is normalised where it enters, so the feed is asked for lower-case pairs
     # in the order the operator wrote them.
     assert calls == [["aaa", "bbb", "ccc", "ddd", "eee", "fff"]]
+
+
+def test_skip_reads_the_ranks_after_the_head_and_says_so(tmp_path, monkeypatch, capsys):
+    """``--top 3 --skip 2`` is rank 3 to rank 5: a universe the previous run did not see."""
+    from agent.backtest import crosssection as module
+    from agent.backtest import data as venue
+
+    ranked = [
+        venue.Pair(symbol=name, turnover=float(100 - index))
+        for index, name in enumerate(["aaausdt", "bbbusdt", "cccusdt", "dddusdt", "eeeusdt"])
+    ]
+    asked = []
+
+    def fake_universe(quote, limit, **kwargs):
+        asked.append(int(limit))
+        return list(ranked[: int(limit)])
+
+    calls = []
+
+    def fake_fetch(symbols, **kwargs):
+        calls.append(list(symbols))
+        series = [chart(name, walk(51, [name], 60)[name]) for name in symbols]
+        return build_panel(series, period="1day"), []
+
+    monkeypatch.setattr(venue, "universe", fake_universe)
+    monkeypatch.setattr(module, "fetch_panel", fake_fetch)
+
+    code = main(
+        ["--top", "3", "--skip", "2", "--out", str(tmp_path)] + ONE_CONFIG
+    )
+
+    assert code == 0
+    # The venue is asked for the head it must skip plus the head it wants, and the panel is
+    # built from the ranks after the skip — never from the ranks the earlier run already read.
+    assert asked == [5]
+    assert calls == [["cccusdt", "dddusdt", "eeeusdt"]]
+    document = json.loads((tmp_path / "crosssection.json").read_text(encoding="utf-8"))
+    assert document["run"]["window"]["skip"] == 2
+    assert document["run"]["window"]["top"] == 3
+    assert "ranks 3-5" in document["run"]["window"]["note"]
+    assert "ranks 3-5" in capsys.readouterr().out
+
+
+def test_the_cli_says_when_until_could_not_be_applied(tmp_path, capsys):
+    """A frozen panel is already the window it is; cutting it would make a replay disagree."""
+    write_panel(panel_of(walk(41, NAMES, 120)), tmp_path / "candles")
+
+    code = main(
+        [
+            "--candles",
+            str(tmp_path / "candles"),
+            "--until",
+            "30",
+            "--out",
+            str(tmp_path / "out"),
+        ]
+        + ONE_CONFIG
+    )
+
+    assert code == 0
+    document = json.loads((tmp_path / "out" / "crosssection.json").read_text(encoding="utf-8"))
+    assert document["run"]["window"]["until_days"] == 30.0
+    assert "was not applied" in document["run"]["window"]["note"]
+    # The panel itself is untouched: the same bars the file held, not the ones --until asked for.
+    assert document["run"]["panel"]["bars"] == 120
+    assert "window: --until 30 was not applied" in capsys.readouterr().out
+
 

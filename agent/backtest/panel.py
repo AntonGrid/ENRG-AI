@@ -34,7 +34,7 @@ over a hundred pairs can be frozen and replayed exactly as the single-pair runs 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -406,6 +406,7 @@ def fetch_panel(
     *,
     period: str = DEFAULT_PERIOD,
     days: float = 365.0,
+    until: float = 0.0,
     loader: Optional[Callable[..., CandleSeries]] = None,
     timeout: float = DEFAULT_TIMEOUT,
     endpoint: str = HTX_ENDPOINT,
@@ -417,6 +418,12 @@ def fetch_panel(
     ninety-nine-column panel with one apology answers ninety-nine questions. What it must not
     do is *silently* drop the pair, so every failure comes back as ``(symbol, sentence)`` and
     the caller prints it.
+
+    ``until`` asks for a window that *ended* that many days ago, by downloading the extra days
+    and cutting the newest bars off the series before the panel is built. This is the only
+    cheap way to test a config on a period that did not exist when it was chosen, which is what
+    "out of sample" has to mean if it is to mean anything: the same hundred names, the same
+    widths, and a window the reader had no say in.
 
     The venue's own ceiling applies per symbol (:data:`agent.backtest.data.MAX_BARS`), which is
     the honest reason a four-hour panel cannot reach back years: the panel is as long as the
@@ -434,7 +441,7 @@ def fetch_panel(
             item = fetch(
                 symbol,
                 period=str(period),
-                days=float(days),
+                days=float(days) + max(float(until), 0.0),
                 timeout=float(timeout),
                 endpoint=str(endpoint),
             )
@@ -450,5 +457,34 @@ def fetch_panel(
             "not one symbol in the universe could be read"
             + (f"; the first failure was: {failures[0][1]}" if failures else "")
         )
-    return build_panel(series, period=str(period)), failures
+    cut = float(until)
+    if cut > 0.0:
+        newest = max(float(item.rows[-1].at) for item in series)
+        cutoff = newest - cut * 86400.0
+        kept: List[CandleSeries] = []
+        for item in series:
+            rows = [row for row in item.rows if float(row.at) <= cutoff]
+            if not rows:
+                failures.append(
+                    (item.symbol, f"nothing was left of it {cut:.0f} day(s) before the newest bar")
+                )
+                continue
+            # The panel's calendar, indices and close lists are all derived in ``build_panel``,
+            # so the window is cut on the *series* and rebuilt, never edited into a panel that
+            # nothing had a chance to re-derive.
+            kept.append(replace(item, rows=rows))
+        if not kept:
+            raise PanelError(
+                f"--until {cut:g} days before the newest bar left no bar in any of the "
+                f"{len(series)} symbol(s) that were read"
+            )
+        series = kept
+    panel = build_panel(series, period=str(period))
+    if cut > 0.0:
+        panel.warnings.append(
+            f"the window was cut to end {cut:g} day(s) before the venue's newest bar: this is "
+            "the same universe read on an earlier period, which is the cheapest out-of-sample "
+            "test that exists, and it is still not a period nobody had seen"
+        )
+    return panel, failures
 

@@ -222,6 +222,36 @@ def test_a_universe_where_nothing_answered_refuses_rather_than_returning_nothing
     assert "aaausdt is not a pair" in str(failed.value)
 
 
+def test_until_cuts_the_window_off_the_newest_end_and_asks_for_the_extra_days():
+    """The out-of-sample window: the same names, an earlier period, no bar a reader has seen."""
+    asked = {}
+
+    def loader(symbol, period="1day", days=1.0, timeout=1.0, endpoint=""):
+        asked[symbol] = days
+        return chart(symbol, [100.0 + index for index in range(20)])
+
+    panel, failures = fetch_panel(
+        ["aaausdt"], period="1day", days=5.0, until=10.0, loader=loader
+    )
+
+    assert asked["aaausdt"] == 15.0
+    assert failures == []
+    assert len(panel) == 10
+    assert panel.ats[-1] == 9 * DAY
+    assert panel.interval == DAY
+    assert any("cut to end 10 day(s)" in line for line in panel.warnings)
+
+
+def test_until_past_the_whole_record_is_a_refusal_and_not_an_empty_panel():
+    def loader(symbol, period="1day", days=1.0, timeout=1.0, endpoint=""):
+        return chart(symbol, [100.0, 101.0])
+
+    with pytest.raises(PanelError) as failed:
+        fetch_panel(["aaausdt"], days=2.0, until=30.0, loader=loader)
+
+    assert "left no bar" in str(failed.value)
+
+
 def test_an_empty_panel_has_no_calendar_and_says_so():
     panel = Panel()
     assert len(panel) == 0

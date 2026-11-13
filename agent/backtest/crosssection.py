@@ -94,8 +94,10 @@ __all__ = [
     "DEFAULT_CAPITAL",
     "DEFAULT_OUT",
     "DOES_NOT_SHOW",
+    "FILLS",
     "GATE",
     "LOOKBACKS",
+    "MAKER_FEE",
     "Mark",
     "REBALANCES",
     "SIGNS",
@@ -115,6 +117,17 @@ __all__ = [
 LOOKBACKS: Tuple[int, ...] = (3, 7, 14, 30)
 REBALANCES: Tuple[int, ...] = (1, 7)
 SIGNS: Tuple[str, ...] = ("reversal", "momentum")
+
+#: How an order becomes a position. ``taker`` crosses the spread at the bar's open and pays
+#: slippage; ``maker`` posts a limit at the price the decision was made on and is filled only if
+#: the fill bar trades *through* it, at that limit. They are not two fee schedules on the same
+#: trade — they are two different trades, and the difference is *which* moves you end up holding.
+FILLS: Tuple[str, ...] = ("taker", "maker")
+
+#: The maker rate a passive fill pays. 0.02 % is HTX's *fee-tier* rate and not its list price:
+#: a VIP-0 spot account pays 0.2 % on both sides, which is the same as :data:`FEE_RATE`, and a
+#: maker run quoted at 2 bps is an assumption about the account, not about the venue.
+MAKER_FEE = 0.0002
 
 #: What a book starts with when nobody says otherwise — the single-pair engine's own default
 #: capital, so the two books are read on the same notional.
@@ -152,8 +165,18 @@ DOES_NOT_SHOW: Tuple[str, ...] = (
     "thin alt is a market event the venue would price differently from a percentage",
     "anything about live slippage on rebalance day: every name here is assumed fillable at the "
     "bar's own open, which is exactly what a crowded rebalance is not",
+    "the queue: a maker order fills here whenever the bar trades through its price, which is "
+    "the fill a one-lot order gets and not the fill a book competing for the same touch gets — "
+    "a maker run's whole saving is the spread it never crosses, and nothing here measures how "
+    "much of a real queue it would have to wait behind to earn it",
     "that the grid was not chosen after the fact: every declared config is printed, and the "
     "multiple-comparison problem is shown rather than corrected",
+    "an independent t: the ranking window is re-read every rebalance and overlaps itself, so "
+    "the marks are not independent observations and the t-stat is inflated by up to the square "
+    "root of the lookback — the table says by how much, and the gate does not correct for it",
+    "a book that a real venue would fill at these prices: an open is a print, not a size, and a "
+    "hundred-name rebalance every four hours is exactly the flow a thin alt's open does not "
+    "absorb",
     "profit on a real account: a book that clears this gate on daily marks borrows, hedges and "
     "rebalances in a way no code here has ever placed an order for",
 )
@@ -164,6 +187,8 @@ ACCEPTANCE: Tuple[str, ...] = (
     "net notional is zero to within a fee",
     "no lookahead: a decision for a fill at bar i reads closes up to bar i - latency and "
     "nothing later, and a name without a contiguous window is not scored",
+    "the book is sized off the equity the decision could see — the marks of the decision bar, "
+    "never the close of the bar the order is filled in",
     "costs on turnover: every unit bought or sold pays the declared fee and slippage, "
     "including the exit of a name that left the universe",
     "a hole is a hole: a symbol with no bar on a timestamp is not ranked, not filled, and not "
@@ -198,6 +223,8 @@ class BasketSettings:
     min_names: int = 8
     gross: float = 1.0
     max_weight: float = 0.05
+    fill: str = "taker"
+    maker_fee: float = MAKER_FEE
 
     def __post_init__(self) -> None:
         if int(self.lookback) < 1:
@@ -238,11 +265,22 @@ class BasketSettings:
             raise ValueError(
                 f"max_weight {self.max_weight!r} is not a limit: it must lie in (0, 0.5]"
             )
+        if str(self.fill) not in FILLS:
+            raise ValueError(
+                f"fill {self.fill!r} is not a way to fill an order; one of {list(FILLS)} was "
+                "expected, because a book that paid neither the taker's slippage nor the "
+                "maker's missed fills would be paying nothing"
+            )
+        if not 0.0 <= float(self.maker_fee) < 0.05:
+            raise ValueError(
+                f"maker_fee {self.maker_fee!r} is not a rate: it must lie in [0, 0.05)"
+            )
 
     @property
     def config(self) -> str:
         """The name a table prints — short enough for a column, precise enough to re-run."""
-        return f"{self.sign}-l{int(self.lookback)}-r{int(self.rebalance_bars)}"
+        name = f"{self.sign}-l{int(self.lookback)}-r{int(self.rebalance_bars)}"
+        return name if str(self.fill) == "taker" else f"{name}-{self.fill}"
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -258,6 +296,8 @@ class BasketSettings:
             "min_names": int(self.min_names),
             "gross": float(self.gross),
             "max_weight": float(self.max_weight),
+            "fill": str(self.fill),
+            "maker_fee": float(self.maker_fee),
         }
 
 
@@ -310,6 +350,7 @@ class BasketResult:
     panel: Panel
     marks: List[Mark] = field(default_factory=list)
     fills: int = 0
+    unfilled: int = 0
     rebalances: int = 0
     traded: float = 0.0
     fees: float = 0.0
@@ -344,6 +385,7 @@ class BasketResult:
             "marks": len(self.marks),
             "rebalances": int(self.rebalances),
             "fills": int(self.fills),
+            "unfilled": int(self.unfilled),
             "traded": round(float(self.traded), 6),
             "fees": round(float(self.fees), 6),
             "turnover": round(self.turnover(), 6),
@@ -426,8 +468,17 @@ def book(panel: Panel, settings: Optional[BasketSettings] = None) -> BasketResul
        bar today cannot be held today, and leaving it is a fact rather than an assumption;
     2. **decide** from closes up to ``i - latency``, never from the fill bar's own close;
     3. **fill** at the fill bar's *open*, with slippage against the book and the fee on the
-       notional;
+       notional — or, in ``fill='maker'`` mode, **post** a limit at the decision's own close and
+       be filled only if the bar trades through it, at that limit, at the maker rate and with
+       no slippage;
     4. **mark** at the fill bar's close.
+
+    The maker mode is not the taker mode with a smaller number in it. A taker buys what the bar
+    opened at; a maker buys only if the bar comes to *him*, and the trades that come to him are
+    exactly the ones already moving against him. Modelling the fee and not the fill would be the
+    most flattering thing this file could do, so the fill is modelled, the missed ones are
+    counted in :attr:`BasketResult.unfilled`, and the filled ones pay their own limit and never
+    the better of it and the open.
 
     Steps 3 and 4 in that order are what make a bar's P&L a real holding period instead of the
     same close counted twice: a book bought at the open earns the open-to-close move and pays
@@ -449,22 +500,60 @@ def book(panel: Panel, settings: Optional[BasketSettings] = None) -> BasketResul
     saw_negative_cash = False
     seen_thin = False
 
-    def trade(name: str, target: float, price: float) -> Tuple[float, float]:
-        """Move one name toward its target, paying slippage and the fee on the notional."""
+    def settle(name: str, target: float, price: float, fee_rate: float) -> Tuple[float, float]:
+        """Move one name to ``target`` at ``price``, paying ``fee_rate`` on what moved."""
         nonlocal cash
         held = float(units.get(name, 0.0))
         delta = float(target) - held
         if delta == 0.0:
             return 0.0, 0.0
-        fill = _fill_price(price, delta, float(config.slippage))
-        notional = delta * fill
-        fee = abs(notional) * float(config.fee)
+        notional = delta * float(price)
+        fee = abs(notional) * float(fee_rate)
         cash -= notional + fee
         if abs(float(target)) <= 1e-15:
             units.pop(name, None)
         else:
             units[name] = float(target)
         return abs(notional), fee
+
+    def trade(name: str, target: float, price: float) -> Tuple[float, float]:
+        """Taker: cross the spread at the bar's open, paying slippage and the declared fee.
+
+        The delisting exit goes through here in *both* modes, because an order for a name the
+        venue stopped quoting is not an order that can rest: it is a position that has to be
+        got out of at whatever the last print allows.
+        """
+        held = float(units.get(name, 0.0))
+        fill = _fill_price(price, float(target) - held, float(config.slippage))
+        return settle(name, target, fill, float(config.fee))
+
+    def post(name: str, target: float, bar: Any, limit: float) -> Tuple[float, float, bool]:
+        """Maker: rest at ``limit`` and be filled only if the bar trades through it.
+
+        ``limit`` is the close the decision was made on — the price the book actually saw, and
+        the price it is filled at. The reach test is *strict*: a bar whose low merely equals a
+        buy limit proves the price was available, not that this book's place in the queue was
+        reached, so the order needs the bar to trade below it. An order the bar never reaches is
+        not filled *at all*, and that is the whole honest content of the maker idea: the cheaper
+        fee is not a discount on the same trade, it is payment for standing in the queue and
+        being handed exactly the trades that are going against you.
+
+        The fill is at the limit and never at the better of the limit and the open. A resting
+        bid that the market gaps through is filled at its own price — the improvement in a gap
+        belongs to whoever crossed into it — so crediting the book ``min(open, limit)`` would
+        hand it the gap for free on precisely the bars it was about to be wrong on.
+        """
+        delta = float(target) - float(units.get(name, 0.0))
+        if delta == 0.0:
+            return 0.0, 0.0, True
+        if delta > 0.0:
+            if float(bar.low) >= float(limit):
+                return 0.0, 0.0, False
+        else:
+            if float(bar.high) <= float(limit):
+                return 0.0, 0.0, False
+        traded, fee = settle(name, target, float(limit), float(config.maker_fee))
+        return traded, fee, True
 
     for index in range(first, len(panel.ats)):
         at = float(panel.ats[index])
@@ -497,12 +586,19 @@ def book(panel: Panel, settings: Optional[BasketSettings] = None) -> BasketResul
 
         # 2. decide on closes up to i - latency, and 3. fill at this bar's open
         if index - last_fill >= int(config.rebalance_bars) or not units:
+            decision_at = panel.at(index - int(config.latency_bars))
+            # Size the book off the equity the decision could see: the marks of the *decision*
+            # bar. This bar's close is the future the fill is about to be marked into, and
+            # sizing an order sent at this bar's open off this bar's close pays the book for
+            # knowing the bar it is trading in -- a leak of the same kind as trading on the
+            # decision's own close, only quieter.
             equity_now = cash
             for name in sorted(units):
-                price = _mark_price(panel, name, at)
+                price = _mark_price(
+                    panel, name, float(decision_at) if decision_at is not None else at
+                )
                 if price is not None:
                     equity_now += units[name] * float(price)
-            decision_at = panel.at(index - int(config.latency_bars))
             target_weights: Dict[str, float] = {}
             if decision_at is not None and equity_now > 0.0:
                 sign = -1.0 if str(config.sign) == "reversal" else 1.0
@@ -522,27 +618,53 @@ def book(panel: Panel, settings: Optional[BasketSettings] = None) -> BasketResul
                         )
                 else:
                     target_weights = _target_weights(scores, config)
+            maker = str(config.fill) == "maker"
             wanted: Dict[str, float] = {}
+            limits: Dict[str, float] = {}
             for name, weight in sorted(target_weights.items()):
-                price = panel.open(name, at)
-                if price is None or price <= 0.0:
+                # A taker sizes off the open it is about to cross; a maker sizes off the close it
+                # is about to post at, because the open does not exist yet when the order is sent.
+                seen = panel.close(name, decision_at) if decision_at is not None else None
+                price = float(seen) if (maker and seen is not None) else panel.open(name, at)
+                if price is None or float(price) <= 0.0:
                     _note(
                         result.warnings,
                         f"{name} was ranked for the book at {int(at)} and had no bar to fill "
                         "in; it was skipped rather than filled at a price from another day",
                     )
                     continue
+                if maker:
+                    limits[name] = float(price)
                 wanted[name] = float(weight) * float(equity_now) / float(price)
             for name in sorted(units):
                 wanted.setdefault(name, 0.0)
+            if maker:
+                # A name the ranking dropped is still sold, and it is sold the same way: at a
+                # limit posted on the close the decision saw, and only if the bar reaches it.
+                for name in sorted(wanted):
+                    if name in limits:
+                        continue
+                    seen = panel.close(name, decision_at) if decision_at is not None else None
+                    if seen is not None and float(seen) > 0.0:
+                        limits[name] = float(seen)
             dust = 1e-9 * max(abs(equity_now), 1.0)
             for name in sorted(wanted):
                 price = panel.open(name, at)
-                if price is None or price <= 0.0:
+                bar = panel.bar(name, at)
+                if price is None or price <= 0.0 or bar is None:
                     continue
                 if abs(wanted[name] - float(units.get(name, 0.0))) * float(price) <= dust:
                     continue
-                traded, fee = trade(name, wanted[name], float(price))
+                if maker:
+                    limit = limits.get(name)
+                    if limit is None:
+                        result.unfilled += 1
+                        continue
+                    traded, fee, filled = post(name, wanted[name], bar, float(limit))
+                    if not filled:
+                        result.unfilled += 1
+                else:
+                    traded, fee = trade(name, wanted[name], float(price))
                 traded_here += traded
                 fees_here += fee
                 if traded > 0.0:
@@ -593,6 +715,13 @@ def book(panel: Panel, settings: Optional[BasketSettings] = None) -> BasketResul
                 "curve below zero is not a loss, it is a margin call nobody in this model sent",
             )
             break
+    if str(config.fill) == "maker" and result.unfilled:
+        _note(
+            result.warnings,
+            f"{result.unfilled} maker order(s) were never traded through on the fill bar, "
+            f"against {result.fills} that were: the cheaper fee is paid for in cash that never "
+            "got put to work, and that is a cost the fee column does not contain",
+        )
     return result
 
 
@@ -603,10 +732,11 @@ def book(panel: Panel, settings: Optional[BasketSettings] = None) -> BasketResul
 class Window:
     """One slice of a book's marks, read the way the gate reads it.
 
-    ``days`` is the count of *marks minus one* — the number of returns, which is the number of
-    independent bets a daily book actually made, and therefore the number the t test and the
-    resolution are computed on. Everything else is in percent-of-equity or bps-of-equity per
-    day, so two windows over two different panels are comparable.
+    ``days`` is the number of *calendar days* the window covers, not the number of marks: a
+    4-hour panel marks six times a day, and a table that called six marks a day would make every
+    per-day reading a lie by a factor of six. ``mean_bps``, ``sigma_bps`` and ``min_edge_bps``
+    are all per day too, so two windows over two different bar widths are comparable; ``t_stat``
+    is scale-free and stays on the marks, where the returns actually live.
     """
 
     days: int
@@ -650,6 +780,25 @@ class Window:
             "passed": bool(self.passed),
             "failures": list(self.failures),
         }
+
+
+def _per_day_bps(bar_return: float, per_day: float) -> float:
+    """A per-bar mean return expressed per day — by compounding, not by multiplying.
+
+    ``per_day`` bars of ``r`` each is ``(1 + r) ** per_day - 1``, and not ``r * per_day``. At
+    four bps a bar the two agree to the fourth decimal, so the simpler arithmetic would look
+    identical on every run that passes; they differ exactly where a run is big enough to be
+    doubted, which is where the reading has to be right. A bar that lost everything has no
+    daily equivalent: ``-100 %`` is returned and the book's equity curve shows the rest.
+    """
+    value = float(bar_return)
+    if not math.isfinite(value):
+        return 0.0
+    if value <= -1.0:
+        return -1e4
+    if float(per_day) <= 0.0:
+        return float(1e4 * value)
+    return float(1e4 * ((1.0 + value) ** float(per_day) - 1.0))
 
 
 def _t_stat(values: Sequence[float]) -> float:
@@ -802,15 +951,22 @@ def read(
         for earlier, later in zip(equities, equities[1:])
         if float(earlier) > 0.0
     ]
-    sigma_bps = spread_bps(returns)
-    mean_bps = 1e4 * float(statistics.fmean(returns)) if returns else 0.0
+    # The gate is written per *day*; the marks are per *bar*. On a daily panel those are the same
+    # number, which is exactly why this hid: a 4-hour panel marks six times a day, so a mean of
+    # 6.9 bps a bar is +41 bps a day, and reading one as the other mis-states the book by the
+    # width of its own bar. The conversion happens once, here, and it is a compounding one.
     step = float(result.panel.interval)
-    per_year = (365.25 * 86400.0 / step) if step > 0.0 else 365.0
+    per_day = (86400.0 / step) if step > 0.0 else 1.0
+    days = int(round(len(returns) / per_day)) if per_day > 0.0 else len(returns)
+    sigma_bps = spread_bps(returns) * math.sqrt(per_day) if per_day > 0.0 else 0.0
+    mean_bps = _per_day_bps(statistics.fmean(returns), per_day) if returns else 0.0
+    per_year = 365.25 * per_day
     beta, correlation = _beta(returns, _market_returns(result.panel, window))
     drawdown = _drawdown(equities)
-    heard = resolution(
-        len(returns), sigma_bps, floor, alpha=DECLARED_ALPHA, power=DECLARED_POWER
-    )
+    # ``_t_stat`` is deliberately *not* converted: mean and standard error are both per bar, so
+    # the ratio is the same number at any bar width. Only the count of independent bets changes,
+    # and that is what ``days`` is for.
+    heard = resolution(days, sigma_bps, floor, alpha=DECLARED_ALPHA, power=DECLARED_POWER)
     mean_equity = statistics.fmean([abs(value) for value in equities]) or 1.0
     traded = sum(float(mark.traded) for mark in window)
     failures: List[str] = []
@@ -848,12 +1004,12 @@ def read(
             )
         )
         failures.append(
-            f"unresolvable: {len(returns)} day(s) at {sigma_bps:.0f} bps of daily spread "
+            f"unresolvable: {days} day(s) at {sigma_bps:.0f} bps of daily spread "
             f"resolve {band}, and the measured {mean_bps:+.1f} bps/day is inside that band — "
             "raise the count, not the claim"
         )
     return Window(
-        days=len(returns),
+        days=days,
         mean_bps=float(mean_bps),
         t_stat=float(_t_stat(returns)),
         sharpe=float(sharpe),
@@ -890,6 +1046,7 @@ class BasketReading:
     outside: Window
     rebalances: int = 0
     fills: int = 0
+    unfilled: int = 0
     traded: float = 0.0
     fees: float = 0.0
     warnings: Tuple[str, ...] = ()
@@ -905,6 +1062,7 @@ class BasketReading:
             "settings": self.settings.as_dict(),
             "rebalances": int(self.rebalances),
             "fills": int(self.fills),
+            "unfilled": int(self.unfilled),
             "traded": float(self.traded),
             "fees": float(self.fees),
             "passed": bool(self.passed),
@@ -922,6 +1080,9 @@ class BasketReading:
             "sign": str(self.settings.sign),
             "lookback": int(self.settings.lookback),
             "rebalance_bars": int(self.settings.rebalance_bars),
+            "fill": str(self.settings.fill),
+            "fills": int(self.fills),
+            "unfilled": int(self.unfilled),
             "days": int(self.full.days),
             "mean_bps": round(float(self.full.mean_bps), 4),
             "t_stat": round(float(self.full.t_stat), 4),
@@ -981,6 +1142,32 @@ def configs(
     return out
 
 
+def _overlap_note(settings: "BasketSettings", window: "Window") -> str:
+    """The sentence a t-stat needs whenever the ranking windows overlap themselves.
+
+    ``Window.t_stat`` divides one mean by one standard error over the marks, so it counts every
+    mark as an observation. A 14-bar ranking window rebalanced every bar is not 14 independent
+    observations per 14 bars: it is one, restated. The adjustment here is the blunt one —
+    ``t / sqrt(lookback)`` — and it is disclosed rather than applied to the gate, because a gate
+    that quietly rewrote its own arithmetic after seeing the number would not be a gate.
+    """
+    lookback = int(settings.lookback)
+    if lookback <= 1:
+        return (
+            "the ranking window is a single bar, so the marks are as independent as the bars "
+            "are and no overlap adjustment applies"
+        )
+    raw = float(window.t_stat)
+    scaled = raw / math.sqrt(float(lookback)) if math.isfinite(raw) else raw
+    return (
+        f"the {lookback}-bar ranking window is re-read every "
+        f"{int(settings.rebalance_bars)} bar(s) and overlaps itself: the t of {raw:+.2f} counts "
+        f"every mark as an independent observation, and if the windows were independent the "
+        f"honest t would be nearer {scaled:+.2f} (t/sqrt({lookback})) — read the gate's t>=2 "
+        "with that in hand"
+    )
+
+
 def grid(
     panel: Panel,
     *,
@@ -1029,9 +1216,10 @@ def grid(
                 outside=outside,
                 rebalances=int(result.rebalances),
                 fills=int(result.fills),
+                unfilled=int(result.unfilled),
                 traded=float(result.traded),
                 fees=float(result.fees),
-                warnings=tuple(result.warnings),
+                warnings=tuple(result.warnings) + (_overlap_note(settings, full),),
                 failures=tuple(failures),
             )
         )
@@ -1194,6 +1382,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--quote", default="usdt", help="the quote currency of the universe")
     parser.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        help=(
+            "skip this many of the venue's top pairs by turnover, so --top 100 --skip 100 is "
+            "ranks 101-200: a universe that is not the one a previous run already looked at"
+        ),
+    )
+    parser.add_argument(
+        "--until",
+        type=float,
+        default=0.0,
+        help=(
+            "end the window this many days before the venue's newest bar; the same universe "
+            "read on an earlier period, which is the cheapest out-of-sample test there is"
+        ),
+    )
+    parser.add_argument(
         "--period",
         default="",
         help=(
@@ -1246,6 +1452,22 @@ def _parser() -> argparse.ArgumentParser:
         help="slippage per fill, against the book",
     )
     parser.add_argument(
+        "--fill",
+        default="taker",
+        choices=list(FILLS),
+        help=(
+            "taker crosses the open and pays the fee plus slippage; maker posts a limit at the "
+            "decision's close, is filled at that limit only if the bar trades through it, pays "
+            "--maker-fee, and is not filled at all otherwise"
+        ),
+    )
+    parser.add_argument(
+        "--maker-fee",
+        type=float,
+        default=MAKER_FEE,
+        help="the rate a passive fill pays; 0.0002 is a fee tier, 0.002 is a VIP-0 account",
+    )
+    parser.add_argument(
         "--latency", type=int, default=1, help="bars between the decision close and the fill"
     )
     parser.add_argument(
@@ -1285,6 +1507,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_names=int(args.min_names),
             gross=float(args.gross),
             max_weight=float(args.max_weight),
+            fill=str(args.fill),
+            maker_fee=float(args.maker_fee),
         )
     except (ValueError, IndexError) as exc:
         print(f"crosssection: {exc}", file=sys.stderr)
@@ -1294,11 +1518,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_USAGE
 
     failures: List[Tuple[str, str]] = []
+    window_note = ""
     try:
         if str(args.candles).strip():
             panel = load_panel(
                 args.candles, period=str(args.period), delimiter=str(args.delimiter)
             )
+            if float(args.until) > 0.0:
+                window_note = (
+                    f"--until {float(args.until):g} was not applied: a frozen panel is already "
+                    "the window it is, and cutting it here would make the replay of a run "
+                    "disagree with the run"
+                )
         else:
             symbols: List[str] = []
             if str(args.symbols).strip():
@@ -1310,12 +1541,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elif int(args.top) > 0:
                 from agent.backtest.data import universe
 
-                symbols = [
-                    pair.symbol
-                    for pair in universe(
-                        str(args.quote), int(args.top), timeout=float(args.timeout)
+                skip = max(0, int(args.skip))
+                ranked = universe(
+                    str(args.quote), skip + int(args.top), timeout=float(args.timeout)
+                )
+                symbols = [pair.symbol for pair in ranked[skip:]]
+                if skip > 0:
+                    window_note = (
+                        f"ranks {skip + 1}-{skip + len(symbols)} of the {str(args.quote).upper()} "
+                        "board by 24h turnover: a universe chosen before this run read anything"
                     )
-                ]
             if not symbols:
                 print(
                     "crosssection: name a universe with --symbols, --top N or --candles DIR — "
@@ -1327,9 +1562,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 symbols,
                 period=str(args.period).strip() or DEFAULT_PERIOD,
                 days=float(args.days),
+                until=max(float(args.until), 0.0),
                 timeout=float(args.timeout),
                 endpoint=str(args.endpoint),
             )
+            if float(args.until) > 0.0:
+                window_note = (
+                    f"this window ends {float(args.until):g} day(s) before the venue's newest "
+                    f"bar{'; ' + window_note if window_note else ''}"
+                )
     except (PanelError, HtxError) as exc:
         print(f"crosssection: {exc}", file=sys.stderr)
         return EXIT_FEED
@@ -1340,18 +1581,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if len(failures) > 8:
             print(f"   ! and {len(failures) - 8} more pair(s) that could not be read")
         shape = panel.as_dict()
+        cost = (
+            f"maker {float(args.maker_fee) * 1e4:.1f} bps"
+            if str(args.fill) == "maker"
+            else f"fee {float(args.fee) * 1e4:.1f} + slip {float(args.slippage) * 1e4:.1f} bps"
+        )
         print(
             f"── crosssection · {shape['symbols']} symbols · {shape['period']} · "
             f"{shape['bars']} bars · {shape['coverage']:.1%} filled · "
             f"{int(args.legs)} a side · gross {float(args.gross):.2f} · "
-            f"${float(args.capital):,.2f}"
+            f"${float(args.capital):,.2f} · {str(args.fill)} ({cost})"
         )
+        if window_note:
+            print(f"   window: {window_note}")
+        if panel.interval and abs(float(panel.interval) - 86400.0) > 1.0:
+            print(
+                f"   {86400.0 / float(panel.interval):.0f} bar(s) a day: the marks are per bar "
+                "and every bps in the table is per day, because a 5 bps floor per bar is a "
+                f"{5.0 * 86400.0 / float(panel.interval):.0f} bps floor per day"
+            )
         print(
             f"   gate: {GATE['edge_bps']:.0f} bps/day · t {GATE['t_stat']:.1f} · "
             f"sharpe {GATE['sharpe']:.1f} · dd <= {GATE['max_drawdown']:.0%} · "
             f"|beta| <= {GATE['beta']:.2f} · split {float(args.split):.0%}/"
             f"{1.0 - float(args.split):.0%}"
         )
+        # The panel's own warnings are the ones a reader cannot get anywhere else: which
+        # symbols arrived short, and what an ``--until`` cut does and does not prove.
+        for line in list(panel.warnings)[:4]:
+            print(f"   ! {line}")
+        if len(panel.warnings) > 4:
+            print(f"   ! and {len(panel.warnings) - 4} more panel warning(s), in the JSON")
 
     try:
         readings = grid(
@@ -1383,6 +1643,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     document = criteria.document(
         {
             "panel": panel.as_dict(),
+            "window": {
+                "until_days": max(float(args.until), 0.0),
+                "skip": max(0, int(args.skip)),
+                "top": int(args.top),
+                "quote": str(args.quote),
+                "days": float(args.days),
+                "note": window_note,
+            },
             "grid": {
                 "lookbacks": [int(value) for value in args.lookback],
                 "rebalances": [int(value) for value in args.rebalance],
@@ -1418,10 +1686,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for line in reading.warnings:
                 if line not in seen:
                     seen.append(line)
-        for line in seen[:6]:
+        # The last warning of every reading is always the one about how to read the number on
+        # it (the overlap of the ranking window), so those lines are never cut by the cap: a
+        # table whose t-stat came with its own caveat trimmed would be worse than no table.
+        tails = [reading.warnings[-1] for reading in readings if reading.warnings]
+        rest = [line for line in seen if line not in tails]
+        for line in rest[:6]:
             print(f"   ! {line}")
-        if len(seen) > 6:
-            print(f"   ! and {len(seen) - 6} more warning(s), in the JSON")
+        if len(rest) > 6:
+            print(f"   ! and {len(rest) - 6} more warning(s), in the JSON")
+        for line in list(dict.fromkeys(tails)):
+            print(f"   ! {line}")
         print(
             f"   wrote {written_csv} · {written_json} · {written_criteria} "
             f"· criteria {criteria.fingerprint()[:12]}"
