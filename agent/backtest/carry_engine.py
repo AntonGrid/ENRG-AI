@@ -661,7 +661,7 @@ def _mark_block(
         if window > 0.0 and float(record.at) - ordered[index][0] > window:
             continue
         rate = None if record.funding_rate is None else float(record.funding_rate)
-        covered.append((float(ordered[index][1]), rate))
+        covered.append((float(ordered[index][1]), rate, float(record.at)))
     period_count = int(run.periods)
     block: Dict[str, Any] = {
         "marked_periods": len(covered),
@@ -714,8 +714,8 @@ def _mark_block(
     block["funding_drawdown"] = funding_depth / capital
     block["basis_drawdown"] = basis_depth / capital
     block["worst_window"] = {
-        "from": covered[peak_at][0],
-        "to": covered[trough_at][0],
+        "from": covered[peak_at][2],
+        "to": covered[trough_at][2],
         "funding_negative_periods": flips,
     }
     total_drop = funding_drop + basis_drop

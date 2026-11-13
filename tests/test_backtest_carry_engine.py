@@ -354,6 +354,19 @@ def test_a_drawdown_from_the_rate_flipping_is_named_funding():
     assert marks["drawdown_driver"] == "funding"
     assert marks["drawdown_split"]["funding_share"] == pytest.approx(1.0)
     assert marks["worst_window"]["funding_negative_periods"] == 3
+    # The window is named in the series' own clock, not in basis points, and it must span
+    # every settlement that flipped: a peak before the first and a trough after the last.
+    flips_at = [
+        record.at
+        for record in series.records
+        if record.funding_rate is not None and record.funding_rate < 0
+    ]
+    window = marks["worst_window"]
+    assert window["from"] in {record.at for record in series.records}
+    assert window["to"] in {record.at for record in series.records}
+    assert window["from"] <= flips_at[0]
+    assert window["to"] >= flips_at[-1]
+    assert window["to"] > window["from"]
     assert "funding-driven" in E.format_summary(run)
 
 
